@@ -1,0 +1,5 @@
+#pragma once
+
+#cmakedefine01 SEETHIS_HAS_MACOS_BACKEND
+#cmakedefine01 SEETHIS_HAS_WINDOWS_BACKEND
+#cmakedefine01 SEETHIS_HAS_LINUX_BACKEND

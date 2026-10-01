@@ -1,0 +1,52 @@
+name: macOS build and development package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-development:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check development toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          cmake --version
+          ninja --version
+          node --version
+          xcrun --find clang++
+      - name: Configure Release with selected Apple tools
+        run: cmake --preset macos-release
+      - name: Build and test
+        run: |
+          cmake --build --preset macos-release --parallel 3
+          ctest --preset macos-release
+          bash tests/package_macos_test.sh
+      - name: Verify a source archive builds without Git metadata
+        run: |
+          mkdir -p "$RUNNER_TEMP/seethis-source-archive"
+          git archive HEAD | tar -xf - -C "$RUNNER_TEMP/seethis-source-archive"
+          cmake --preset macos-release -S "$RUNNER_TEMP/seethis-source-archive" -B "$RUNNER_TEMP/seethis-archive-build"
+          cmake --build "$RUNNER_TEMP/seethis-archive-build" --parallel 3
+          ctest --test-dir "$RUNNER_TEMP/seethis-archive-build" --output-on-failure
+          bash "$RUNNER_TEMP/seethis-source-archive/tests/package_macos_test.sh"
+      - name: Package exact clean commit (ad-hoc, unnotarized)
+        run: |
+          bash scripts/package_macos.sh package --source "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA" --configuration Release --mode development --output "$RUNNER_TEMP/seethis-beta"
+          cd "$RUNNER_TEMP/seethis-beta"
+          shasum -a 256 -c SHA256SUMS
+          codesign --verify --deep --strict SeeThis.app
+          xcrun lipo -archs SeeThis.app/Contents/MacOS/seethis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seethis-arm64-adhoc-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/seethis-beta/SeeThis.app.zip
+            ${{ runner.temp }}/seethis-beta/SHA256SUMS
+            ${{ runner.temp }}/seethis-beta/evidence.txt
+            ${{ runner.temp }}/seethis-beta/owned-artifacts.txt
+          retention-days: 14
+          if-no-files-found: error

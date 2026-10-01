@@ -1,0 +1,41 @@
+name: Beta bug report
+description: Share a privacy-safe SeeThis reproduction.
+title: "[beta] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please use a clean demo page. Do not attach a complete desktop screenshot, private tab title/URL, reference capability URL, settings access address, token, or full system log. Security-sensitive reports need a private channel: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Version and release attachment SHA-256
+      description: Use the release packet identity; never paste a reference URL.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS, hardware and Chrome versions
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps and guide step number
+      description: Include exact English status labels using only synthetic test content.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and observed result
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I checked that this report contains no private screenshot content, capability URLs or credentials.
+          required: true

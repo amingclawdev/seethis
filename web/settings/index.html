@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SeeThis settings</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+    body { max-width: 760px; margin: 3rem auto; padding: 0 1rem; }
+    fieldset { border: 1px solid #8886; border-radius: .75rem; margin: 1rem 0; padding: 1rem; }
+    label { display: block; margin: .7rem 0; }
+    input[type=number] { width: 10rem; margin-left: .5rem; }
+    .modifiers label { display: inline-block; margin-right: 1rem; }
+    button { font: inherit; padding: .55rem 1rem; }
+    #status { min-height: 1.5em; font-weight: 600; }
+    .readiness { border: 1px solid #8886; border-radius: .75rem; padding: 1rem; }
+    .readiness p { margin: .45rem 0; }
+    .ready { color: #187a31; }
+    .not-ready { color: #a23a2a; }
+    code { overflow-wrap: anywhere; }
+    .boundary { background: #7772; border-radius: .75rem; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>SeeThis settings</h1>
+  <p>These settings are applied by the running desktop overlay. Closing this browser tab does not stop SeeThis.</p>
+  <section class="readiness" aria-labelledby="readiness-heading">
+    <h2 id="readiness-heading">Current readiness</h2>
+    <p id="input_readiness">Input Monitoring: checking…</p>
+    <p id="input_guidance"></p>
+    <p id="screen_readiness">Screen Recording: checking…</p>
+    <p id="screen_guidance"></p>
+    <p id="delete_readiness">Delete shortcut: checking…</p>
+    <p id="delete_guidance"></p>
+    <p>App identity: <code id="app_identity">checking…</code></p>
+    <p>Exact app location: <code id="app_location">checking…</code></p>
+    <p id="update_policy"></p>
+    <button id="retry_input" type="button">Retry Input Monitoring</button>
+    <button id="refresh_readiness" type="button">Refresh readiness</button>
+  </section>
+  <form id="settings">
+    <fieldset>
+      <legend>Capture shortcut</legend>
+      <label>macOS key code <input id="shortcut_key_code" type="number" min="0" max="127" required></label>
+      <div class="modifiers" aria-label="Capture modifiers">
+        <label><input id="command" type="checkbox"> Command</label>
+        <label><input id="control" type="checkbox"> Control</label>
+        <label><input id="option" type="checkbox"> Option</label>
+        <label><input id="shift" type="checkbox"> Shift</label>
+      </div>
+      <label>Maximum hold (milliseconds) <input id="maximum_hold_ms" type="number" min="1000" max="120000" required></label>
+    </fieldset>
+    <fieldset>
+      <legend>Delete shortcut</legend>
+      <p>Hold this chord, hover the highlighted mark, then left-click once. Releasing either key exits delete mode.</p>
+      <label>macOS key code <input id="delete_shortcut_key_code" type="number" min="0" max="127" required></label>
+      <div class="modifiers" aria-label="Delete modifiers">
+        <label><input id="delete_command" type="checkbox"> Command</label>
+        <label><input id="delete_control" type="checkbox"> Control</label>
+        <label><input id="delete_option" type="checkbox"> Option</label>
+        <label><input id="delete_shift" type="checkbox"> Shift</label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Capture and marks</legend>
+      <label>Crop margin (points) <input id="crop_margin_points" type="number" min="0" max="128" step="0.5" required></label>
+      <label>Historical mark hit radius (points) <input id="mark_hit_radius_points" type="number" min="2" max="64" step="0.5" required></label>
+    </fieldset>
+    <fieldset>
+      <legend>Reference access</legend>
+      <label>Local link lifetime (seconds) <input id="reference_ttl_seconds" type="number" min="60" max="31536000" required></label>
+      <label>Maximum retrievable references <input id="maximum_visible_references" type="number" min="1" max="10000" required></label>
+    </fieldset>
+    <button type="submit">Save settings</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </form>
+  <p class="boundary"><strong>Agent transport boundary:</strong> a pasted 127.0.0.1 link works only for tools running on this Mac. For a remote agent, attach the PNG already placed on the clipboard or use an explicit bridge that can reach this machine.</p>
+  <script src="settings.js"></script>
+</body>
+</html>
