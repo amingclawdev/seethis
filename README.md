@@ -1,10 +1,33 @@
 # SeeThis
 
-SeeThis is a macOS menu bar tool: hold **Option+A**, mark one or more areas, and share a local reference or a marked image with your assistant.
+**Mark what you mean on your Mac, then share it with your assistant.**
 
-SeeThis 是 macOS 菜单栏工具：按住 **Option+A**，用鼠标圈出一个或多个区域，再把本机引用或带标记图像交给你的助手。默认 **Option+D** 可连续删除 mark；已修改快捷键时，以 Inspector 或设置中显示的配置为准。
+SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more areas of your screen. It copies a local reference immediately, and prepares a marked image you can paste into an AI conversation or any app that accepts images.
 
-**[下载 v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)** · Apple Silicon · macOS 14.2+ · Developer ID 签名和 Apple 公证 · [MIT](LICENSE)
+**[Download v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
+
+The release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
+
+## How it works
+
+- **Mark several areas at once.** Keep the capture shortcut held while drawing separate regions; release it to create one reference.
+- **Choose a reference in Inspector.** Its dropdown shows a name and time. New captures select the newest reference; deleting one selects the newest remaining item.
+- **Share a local reference or an image.** Copy JSON URL for a tool on the same Mac. Choose Copy marked image to copy the annotated image explicitly.
+- **Return to the right context.** Live marks belong to their original app/window and, in standalone Google Chrome, their tab/page.
+- **Delete with Option+D.** Hold the delete shortcut and click mark boundaries, or delete the selected reference in Inspector.
+
+Option+A and Option+D are the defaults. If you change them in Open Settings…, use the shortcuts shown in Inspector.
+
+## Quick start
+
+1. Download the DMG or ZIP and SHA256SUMS from the release page, and compare the downloaded file's SHA-256 with the published checksum. Put SeeThis.app in Applications and open it.
+2. Allow **Input Monitoring** and **Screen Recording** for that copy of SeeThis in System Settings → Privacy & Security. Use the menu's permission-settings shortcuts and Retry Input Monitoring as needed; quit and reopen the exact app if macOS requires it.
+3. On a screen with safe test content, hold **Option+A**, drag around an area with the left mouse button, then release the shortcut. A local JSON URL is copied immediately; the image finishes in the background.
+4. Open **Show Inspector…** from the menu. Once the image is ready, choose **Copy marked image**, inspect it, and paste or attach it to your conversation.
+
+For Chrome page context, activate standalone Google Chrome. When Automation is missing or denied, Inspector shows **Connect Chrome**, **Retry Chrome** and **Automation Settings…**. Connect Chrome requests access explicitly. Merely opening Inspector, starting in the background or using an already authorized Chrome session does not trigger that recovery flow.
+
+The app lives in the menu bar; there is no main window. Inspector is a movable panel with a fixed 470 × 430-point size. Feedback… opens an email draft; you decide whether to send it.
 
 ## Demo
 
@@ -12,21 +35,26 @@ SeeThis 是 macOS 菜单栏工具：按住 **Option+A**，用鼠标圈出一个�
 
 [Landscape demo (16:9, 76 seconds)](docs/demo/SeeThis-landscape-v3-public.mp4) · [Portrait alternative (3:4)](docs/demo/SeeThis-portrait-v3-public.mp4)
 
-The demo is edited for clarity. Private reference links, chat details, browser chrome, and personal Finder or desktop content are redacted. It illustrates an earlier recorded workflow; the current Inspector uses a reference dropdown with name and time. The footage does not certify the release build or another Mac. Narration and media attribution are recorded in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md).
+The demo is edited for clarity, with private links and personal content redacted. It shows an earlier recorded workflow; the current Inspector uses the reference dropdown described above. The footage does not certify the release build or another Mac. See [media attribution](THIRD_PARTY_NOTICES.md).
 
-## 开始使用
+## Sharing and privacy
 
-1. [下载、校验、安装与权限](docs/INSTALL.md)。
-2. [圈选、Inspector、复制与删除](docs/USAGE.md)。
-3. [Google Chrome 页面标记与 Automation](docs/CHROME.md)。
-4. [恢复、更新、卸载与反馈](docs/TROUBLESHOOTING.md)。
+A `127.0.0.1` reference URL works only for tools on the **same Mac**, while SeeThis is running and the reference is valid. Web chats, remote assistants and other computers need an explicitly pasted or attached image. SeeThis does not upload your screen to a cloud service.
 
-**立即复制的是 JSON URL；图像稍后就绪。** Inspector 的 **Copy marked image** 显式复制带 mark 的完整所选显示器图像。网页聊天或远程助手需要实际图片附件；`127.0.0.1` URL 只能由同一台 Mac 上的工具读取。
+**A capture includes the entire selected display. Marks are not a privacy crop.** Hide private windows and notifications before capturing, and inspect the whole image before sharing it. Deleting a reference cannot retract images already shared, clipboard copies or backups. Do not post capability URLs or settings access addresses in public issues. [Privacy details (中文)](PRIVACY.md) · [Security reports](SECURITY.md)
 
-圈选区域不是隐私裁剪边界：引用保存所选显示器的完整画面。截图前关闭私人窗口和通知，分享前检查整幅图像。见 [隐私](PRIVACY.md) 和 [安全报告](SECURITY.md)。
+## Guides and development
 
-## 构建与发布
+The detailed usage guides are currently available in Chinese:
 
-使用 C++20、Objective-C++、AppKit 和 ScreenCaptureKit；普通使用无需 Docker、Node、Aming Claw 或 Judgment Brain。Node 18+ 仅用于开发测试。构建步骤见 [CONTRIBUTING](CONTRIBUTING.md)。
+- [Installation and permissions (中文)](docs/INSTALL.md)
+- [Capture, Inspector, copying and deletion (中文)](docs/USAGE.md)
+- [Google Chrome and Automation (中文)](docs/CHROME.md)
+- [Recovery, manual updates, uninstalling and feedback (中文)](docs/TROUBLESHOOTING.md)
+- [Building and contributing (中文)](CONTRIBUTING.md)
 
-此 prerelease 保留已接受的运行时，公开源码的文档、许可和 CI 单独整理；公开 tag 与原始构建、签名、公证和附件摘要的关系见 [RELEASE](docs/RELEASE.md)。用户已在本机接受当前版本；完整跨系统、另一台 Mac、首次权限和 Finder 拖放安装矩阵尚未完成。Intel、自动更新与 App Store 分发不在此 beta 范围内。
+SeeThis uses C++20, Objective-C++, AppKit and ScreenCaptureKit. Running it requires no Docker, Node, Aming Claw or Judgment Brain. Node 18+ is used only in development tests.
+
+The public source snapshot preserves the accepted runtime and build inputs; documentation, licensing, CI and test setup are maintained separately. [Release provenance](docs/RELEASE.md) explains the source/tag/build relationship, signatures and verification limits. [Changelog](CHANGELOG.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
+
+The current version has been accepted by the user on the release Mac. Full first-download/first-permission, Finder drag installation, update/rollback/uninstall, another Mac and broader OS matrices remain unverified. Intel builds, automatic updating and App Store distribution are outside this beta.
