@@ -1,6 +1,6 @@
 # 开发与贡献
 
-SeeThis 使用 C++20、Objective-C++、AppKit 和 ScreenCaptureKit。Apple Silicon/macOS 14.2+ 是当前 beta 目标。普通运行不需要 Docker、Node、Aming Claw 或 Judgment Brain。
+SeeThis 使用 C++20、Objective-C++、AppKit 和 ScreenCaptureKit。Apple Silicon/macOS 14.2+ 是当前 beta 目标。
 
 ## 构建与测试
 
@@ -21,6 +21,6 @@ bash tests/package_macos_test.sh
 
 ## 提交
 
-通过 [GitHub](https://github.com/amingclawdev/seethis) 提交聚焦的 issue 或 pull request，说明行为变化、必要验证和已知限制。不要提交私人截图、读取 capability、密钥、个人绝对路径、构建缓存或私有控制记录。安全问题使用[私下通道](SECURITY.md)。
+通过 [GitHub](https://github.com/amingclawdev/seethis) 提交聚焦的 issue 或 pull request，说明行为变化、必要验证和已知限制。不要提交私人截图、读取 capability、密钥、个人绝对路径、构建缓存或本机配置。安全问题使用[私下通道](SECURITY.md)。
 
 本项目以 [MIT](LICENSE) 发布，Copyright (c) 2026 SeeThis contributors。提交者应有权提供所提交的代码或素材，并明确任何第三方许可。依赖和媒体说明见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。

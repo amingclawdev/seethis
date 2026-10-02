@@ -53,8 +53,6 @@ The detailed usage guides are currently available in Chinese:
 - [Recovery, manual updates, uninstalling and feedback (中文)](docs/TROUBLESHOOTING.md)
 - [Building and contributing (中文)](CONTRIBUTING.md)
 
-SeeThis uses C++20, Objective-C++, AppKit and ScreenCaptureKit. Running it requires no Docker, Node, Aming Claw or Judgment Brain. Node 18+ is used only in development tests.
+[Contributing (中文)](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
 
-The public source snapshot preserves the accepted runtime and build inputs; documentation, licensing, CI and test setup are maintained separately. [Release provenance](docs/RELEASE.md) explains the source/tag/build relationship, signatures and verification limits. [Changelog](CHANGELOG.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
-
-The current version has been accepted by the user on the release Mac. Full first-download/first-permission, Finder drag installation, update/rollback/uninstall, another Mac and broader OS matrices remain unverified. Intel builds, automatic updating and App Store distribution are outside this beta.
+This beta is for Apple Silicon on macOS 14.2 or later. Intel builds, automatic updates and App Store distribution are not available. See the release notes for known verification limits.

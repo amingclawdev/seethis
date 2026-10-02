@@ -23,7 +23,7 @@ shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64-release.zip
 3. 此版本以 **Developer ID Application: YING ZHANG (GLHUR8CC29)** 签名，App 和 DMG 已公证并 stapled。若系统报告 damaged、恶意软件或身份异常，检查下载来源和摘要并[反馈](TROUBLESHOOTING.md#反馈)，不要关闭系统安全保护。
 4. 展开 SeeThis 菜单，用 **Location:** 核对运行路径，避免同时打开下载目录、旧包和 Applications 中的多份 app。
 
-DMG 布局、签名、公证和挂载后 app 内容已经技术校验；此最终 DMG 的实际 Finder 拖放安装尚未复测。已有本机接受结果不替代该步骤；遇到拷贝错误可记录错误并尝试经过同样摘要校验的 ZIP 方式。
+DMG 布局、签名、公证和挂载后 app 内容已经技术校验；此最终 DMG 的实际 Finder 拖放安装尚未复测。遇到拷贝错误可记录错误并尝试经过同样摘要校验的 ZIP 方式。
 
 ## Input Monitoring 与 Screen Recording
 

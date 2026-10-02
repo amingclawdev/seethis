@@ -12,4 +12,4 @@ First public prerelease for Apple Silicon / macOS 14.2+.
 - Open a feedback email draft, with a copy-address fallback; the app does not send email.
 - Ship Developer ID signed, Apple-notarized DMG and ZIP, checksums, MIT license, installation and privacy guidance.
 
-The public source snapshot preserves the accepted runtime and build inputs. See [release provenance](docs/RELEASE.md) for the original build identity, source/tag distinction and remaining physical-test limits.
+See [release notes](docs/RELEASE.md) for source/build identities, distribution checksums and known verification limits.
