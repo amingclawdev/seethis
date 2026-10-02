@@ -160,8 +160,13 @@ static void TestProductionChromeView() {
     Check(NSHeight(scroll.frame)>0 && scroll.documentView==document &&
           !feedback.feedbackButton.hidden,"470 and narrower preserve Feedback/reference space");
   }
+  std::cerr << "Chrome action fixture before clicks: NSApp=" << (NSApp ? "present" : "nil") << '\n';
   [chrome.buttons[0] performClick:nil];[chrome.buttons[1] performClick:nil];
   [chrome.buttons[2] performClick:nil];[container layout];
+  std::cerr << "Chrome action fixture after clicks: NSApp=" << (NSApp ? "present" : "nil")
+            << " connects=" << fake.connects << " retries=" << fake.retries
+            << " settingsOpens=" << fake.settingsOpens
+            << " guidance=" << chrome.guidanceLabel.stringValue.UTF8String << '\n';
   Check(fake.connects==1 && fake.retries==1 && fake.settingsOpens==1 &&
         [chrome.guidanceLabel.stringValue containsString:@"Could not open Settings"],
         "production actions wire explicit fake adapters and truthful failure");
