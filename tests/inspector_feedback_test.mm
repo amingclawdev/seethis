@@ -179,6 +179,8 @@ static void TestProductionChromeView() {
 
 int main() {
   @autoreleasepool {
+    // Production initializes NSApplication before AppKit dispatches button actions.
+    (void)[NSApplication sharedApplication];
     TestProductionChromeView();
     CheckURL(STFeedbackMailURL());
     STFakeFeedbackAdapter* fake=[STFakeFeedbackAdapter new];
