@@ -4,6 +4,14 @@
 
 SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more areas of your screen. It copies a local reference immediately, and prepares a marked image you can paste into an AI conversation or any app that accepts images.
 
+## Demo
+
+[![Watch the SeeThis demo in landscape](docs/demo/SeeThis-landscape-v3-thumbnail.jpg)](https://amingclawdev.github.io/seethis/)
+
+**[▶ Watch the demo (16:9, 76 seconds)](https://amingclawdev.github.io/seethis/)** · [Download MP4](https://amingclawdev.github.io/seethis/demo/SeeThis-landscape-v3-public.mp4) · [Portrait alternative (3:4)](https://amingclawdev.github.io/seethis/demo/SeeThis-portrait-v3-public.mp4)
+
+The demo is edited for clarity, with private links and personal content redacted. It shows an earlier recorded workflow; the current Inspector uses the reference dropdown described below. The footage does not certify the release build or another Mac. See [media attribution](THIRD_PARTY_NOTICES.md).
+
 **[Download v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
 
 The release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
@@ -28,14 +36,6 @@ Option+A and Option+D are the defaults. If you change them in Open Settings…, 
 For Chrome page context, activate standalone Google Chrome. When Automation is missing or denied, Inspector shows **Connect Chrome**, **Retry Chrome** and **Automation Settings…**. Connect Chrome requests access explicitly. Merely opening Inspector, starting in the background or using an already authorized Chrome session does not trigger that recovery flow.
 
 The app lives in the menu bar; there is no main window. Inspector is a movable panel with a fixed 470 × 430-point size. Feedback… opens an email draft; you decide whether to send it.
-
-## Demo
-
-[![Watch the SeeThis demo in landscape](docs/demo/SeeThis-landscape-v3-thumbnail.jpg)](docs/demo/SeeThis-landscape-v3-public.mp4)
-
-[Landscape demo (16:9, 76 seconds)](docs/demo/SeeThis-landscape-v3-public.mp4) · [Portrait alternative (3:4)](docs/demo/SeeThis-portrait-v3-public.mp4)
-
-The demo is edited for clarity, with private links and personal content redacted. It shows an earlier recorded workflow; the current Inspector uses the reference dropdown described above. The footage does not certify the release build or another Mac. See [media attribution](THIRD_PARTY_NOTICES.md).
 
 ## Sharing and privacy
 

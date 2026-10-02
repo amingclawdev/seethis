@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Watch SeeThis mark areas of a Mac screen and share an annotated image with an assistant.">
+  <title>SeeThis demo</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #111318; color: #f4f5f7; }
+    main { max-width: 1040px; margin: auto; padding: 32px 20px; }
+    h1 { margin: 0 0 12px; font-size: clamp(28px, 5vw, 42px); }
+    p { line-height: 1.6; max-width: 76ch; }
+    a { color: #9dc9ff; text-underline-offset: 3px; }
+    a:focus-visible, video:focus-visible { outline: 3px solid #9dc9ff; outline-offset: 5px; }
+    video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 12px; margin: 24px 0; }
+    .note { color: #c6cbd4; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SeeThis demo</h1>
+    <p>Mark what you mean on your Mac, then share it with your assistant. Watch the 76-second landscape demo below.</p>
+    <video controls playsinline preload="metadata" poster="demo/SeeThis-landscape-v3-thumbnail.jpg" aria-label="SeeThis landscape demonstration">
+      <source src="demo/SeeThis-landscape-v3-public.mp4" type="video/mp4">
+      Your browser cannot play this video. <a href="demo/SeeThis-landscape-v3-public.mp4">Open the MP4</a> instead.
+    </video>
+    <p><a href="https://github.com/amingclawdev/seethis">SeeThis on GitHub</a> · <a href="https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1">Download SeeThis</a> · <a href="demo/SeeThis-landscape-v3-public.mp4" download>Download MP4</a> · <a href="demo/SeeThis-portrait-v3-public.mp4">Portrait alternative</a></p>
+    <p class="note">This edited demo has private links and personal content redacted. It shows an earlier recorded workflow; the current Inspector uses a reference dropdown. The footage does not certify the release build or another Mac. <a href="https://github.com/amingclawdev/seethis/blob/main/THIRD_PARTY_NOTICES.md">Media attribution</a>.</p>
+  </main>
+</body>
+</html>
