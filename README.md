@@ -6,11 +6,9 @@ SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more 
 
 ## Demo
 
-[![Watch the SeeThis demo in landscape](docs/demo/SeeThis-landscape-v3-thumbnail.jpg)](https://amingclawdev.github.io/seethis/)
+https://github.com/user-attachments/assets/6f234100-88f8-467f-9d94-f7d7fa90f464
 
-**[▶ Watch the demo (16:9, 76 seconds)](https://amingclawdev.github.io/seethis/)** · [Download MP4](https://amingclawdev.github.io/seethis/demo/SeeThis-landscape-v3-public.mp4) · [Portrait alternative (3:4)](https://amingclawdev.github.io/seethis/demo/SeeThis-portrait-v3-public.mp4)
-
-The demo is edited for clarity, with private links and personal content redacted. It shows an earlier recorded workflow; the current Inspector uses the reference dropdown described below. The footage does not certify the release build or another Mac. See [media attribution](THIRD_PARTY_NOTICES.md).
+A 76-second walkthrough of marking screen areas and sharing a visual reference.
 
 **[Download v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
 
