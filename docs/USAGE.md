@@ -1,40 +1,40 @@
-# 圈选与分享
+# Mark and share
 
-先完成[安装和权限](INSTALL.md)。默认 Capture 是 **Option+A**，Delete 是 **Option+D**；已在 **Open Settings…** 改过配置时，使用 Inspector 显示的实际快捷键。关闭设置浏览器页不会退出 app。
+Complete [installation and permissions](INSTALL.md) first. The default Capture shortcut is **Option+A** and Delete is **Option+D**. If you changed them in **Open Settings…**, use the actual shortcuts shown in Inspector. Closing the settings browser page does not quit the app.
 
-## 一次按住，画多个区域
+## Hold once to mark several regions
 
-1. 隐藏私人窗口、通知和账号，把鼠标放在目标显示器上的安全内容附近。
-2. 按住 **Option+A**，保持两键按下。按下鼠标左键、拖动圈出第一块区域，再松开左键。
-3. 继续按住快捷键，移动到第二块内容，再左键按下、拖动、松开。未按鼠标的移动不画线，区域之间不应连线。
-4. 松开 A 或 Option，提交这次按住中的所有区域，生成一条引用。鼠标松开结束一个区域，快捷键松开结束一次引用。
-5. **Link copied — paste into chat** 表示剪贴板已得到纯文本 JSON URL；图像继续在后台准备，完成不会自动把剪贴板改成图片。
+1. Hide private windows, notifications and account information. Place the pointer near safe content on the target display.
+2. Hold **Option+A**, keeping both keys pressed. Press the left mouse button, drag around the first region, then release the mouse button.
+3. Keep holding the shortcut. Move to another area and press, drag and release the left mouse button again. Moving without pressing the mouse does not draw, and separate regions should not be connected by lines.
+4. Release A or Option to submit all regions from that hold as one reference. Releasing the mouse ends a region; releasing the shortcut ends a reference.
+5. **Link copied — paste into chat** means the clipboard contains a plain-text JSON URL. The image continues preparing in the background. Completion does not automatically replace the clipboard with an image.
 
-空移动、退化路径、Escape、切换 app/显示器、监听中断或达到最长按住时间可能取消本次采集。先松开所有键再重试。所选显示器的完整画面是引用上下文，圈选区域不是隐私裁剪边界。
+Empty movement, degenerate paths, Escape, switching apps/displays, an input interruption or reaching the maximum hold time can cancel capture. Release all keys before retrying. The entire selected display provides the reference context; marked regions are not a privacy crop.
 
-## Inspector 与历史引用
+## Inspector and reference history
 
-从菜单选择 **Show Inspector…**。Inspector 固定为 **470 × 430 points**，可拖动位置。顶部引用下拉菜单显示名称和时间；名称可能截短，时间保留。新圈选会选中最新引用；删除当前项后会选择最新的剩余引用。隐藏或关闭 Inspector 后，新圈选和 mark 点击不会自动重开它。
+Choose **Show Inspector…** from the menu. Inspector has a fixed **470 × 430-point** size and can be moved. The reference dropdown shows a name and time; a long name may be shortened while the time stays visible. A new capture selects the newest reference. Deleting the selected reference selects the newest remaining item. After hiding or closing Inspector, capturing or clicking a mark does not automatically reopen it.
 
-- **Copy JSON URL**：复制选中引用的同机读取地址。
-- **Copy marked image**：图像就绪后，显式复制带 mark 的完整所选显示器图像。先检查整幅图像的私人内容。
-- **View details**：在浏览器打开本机详情和图像预览，不改变剪贴板。
-- **Delete**：删除当前引用及其全部区域，撤销本机读取并清理资产；清理失败时查看状态。
+- **Copy JSON URL** copies the selected reference's local read-access address.
+- **Copy marked image** explicitly copies the annotated image of the entire selected display once it is ready. Inspect the whole image for private content first.
+- **View details** opens local details and an image preview in the browser without changing the clipboard.
+- **Delete** deletes the selected reference and all its regions, revokes local read access and removes assets. Check the status if cleanup fails.
 
-未就绪、失败、已过期或已删除的引用可能没有可用图像。等待 ready，或重新采集。普通点击可见 mark 会重新复制同一 JSON URL，不重新截图。悬停命中的 mark 边界会加粗。历史操作不要求当前页面显示对应 mark。
+Pending, failed, expired or deleted references may have no usable image. Wait for ready, or capture again. A normal click on a visible mark copies the same JSON URL again without taking a new screenshot. Hovering over a mark boundary makes it thicker. History operations do not require the corresponding mark to be visible on the current page.
 
-## 把结果交给助手
+## Share with an assistant
 
-1. **同一台 Mac 的本地工具/agent**：粘贴 JSON URL，并说明要看哪些 mark。本机 SeeThis 必须运行，引用仍有效。
-2. **网页聊天、远程 agent 或另一台电脑**：点 **Copy marked image**，粘贴实际图片；若目标不接受图片粘贴，可在 Preview 使用 **File > New from Clipboard**，检查图像后保存为 PNG，再通过聊天的图片附件入口附加。
-3. 发送前确认真正的图片附件/预览。`127.0.0.1` URL 不能被远程服务读取；不要用改公网 IP、端口转发或公开设置服务来分享。
+1. **A local tool or agent on the same Mac:** paste the JSON URL and explain which marks to inspect. SeeThis must be running and the reference must still be valid.
+2. **A web chat, remote agent or another computer:** choose **Copy marked image** and paste the actual image. If the destination does not accept image pasting, use **File > New from Clipboard** in Preview, inspect the image, save it as PNG and attach it through the chat's image attachment control.
+3. Before sending, confirm that an actual image attachment or preview is present. Remote services cannot read a `127.0.0.1` URL. Do not replace it with a public IP, use port forwarding or expose the settings service to share a reference.
 
-远程附件和剪贴板副本不受 SeeThis 删除/过期控制。
+SeeThis deletion and expiration cannot revoke remote attachments or clipboard copies.
 
-## 连续删除
+## Delete several references
 
-回到原 app/window；Chrome 还需原 tab/page，等待 mark 可见。按住 **Option+D**，移到 mark 边界并左键点击一次，删除命中的整条引用。保持快捷键按住，可继续点击其他 mark。松开 D 或 Option 退出删除模式。重叠线每次最多删除一条，优先最新命中的线。
+Return to the original app/window and, for Chrome, the original tab/page. Wait for the marks to appear. Hold **Option+D**, move to a mark boundary and click once with the left mouse button to delete the entire matching reference. Keep holding the shortcut to click other marks. Release D or Option to leave delete mode. At overlapping boundaries, each click deletes at most one reference, preferring the newest matching mark.
 
-默认本地保留期 7 天、最多 500 条可检索引用，可在 **Open Settings… > Reference access** 修改。重开后可在 Inspector 取用有效历史引用，本机端口可能变化；删除/过期链接不会恢复原图。见[隐私](../PRIVACY.md)。
+Local retention defaults to seven days and at most 500 searchable references. Change this in **Open Settings… > Reference access**. After reopening the app, valid history remains available in Inspector; the local port may change. Deleted or expired links do not restore the original image. See [privacy details](../PRIVACY.md).
 
-**Feedback…** 打开默认邮件 app 的草稿，收件人为 `z5866318@gmail.com`；由你编辑、附加和发送。无法打开邮件 app 时可 **Copy email address**。SeeThis 不自动发送反馈。
+**Feedback…** opens a draft in the default email app, addressed to `z5866318@gmail.com`. You edit, attach and send it. If the email app cannot open, use **Copy email address**. SeeThis does not automatically send feedback.

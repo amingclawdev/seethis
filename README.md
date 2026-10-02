@@ -41,18 +41,18 @@ The app lives in the menu bar; there is no main window. Inspector is a movable p
 
 A `127.0.0.1` reference URL works only for tools on the **same Mac**, while SeeThis is running and the reference is valid. Web chats, remote assistants and other computers need an explicitly pasted or attached image. SeeThis does not upload your screen to a cloud service.
 
-**A capture includes the entire selected display. Marks are not a privacy crop.** Hide private windows and notifications before capturing, and inspect the whole image before sharing it. Deleting a reference cannot retract images already shared, clipboard copies or backups. Do not post capability URLs or settings access addresses in public issues. [Privacy details (中文)](PRIVACY.md) · [Security reports](SECURITY.md)
+**A capture includes the entire selected display. Marks are not a privacy crop.** Hide private windows and notifications before capturing, and inspect the whole image before sharing it. Deleting a reference cannot retract images already shared, clipboard copies or backups. Do not post capability URLs or settings access addresses in public issues. [Privacy details](PRIVACY.md) · [Security reports](SECURITY.md)
 
 ## Guides and development
 
-The detailed usage guides are currently available in Chinese:
+See the guides for detailed instructions:
 
-- [Installation and permissions (中文)](docs/INSTALL.md)
-- [Capture, Inspector, copying and deletion (中文)](docs/USAGE.md)
-- [Google Chrome and Automation (中文)](docs/CHROME.md)
-- [Recovery, manual updates, uninstalling and feedback (中文)](docs/TROUBLESHOOTING.md)
-- [Building and contributing (中文)](CONTRIBUTING.md)
+- [Installation and permissions](docs/INSTALL.md)
+- [Capture, Inspector, copying and deletion](docs/USAGE.md)
+- [Google Chrome and Automation](docs/CHROME.md)
+- [Recovery, manual updates, uninstalling and feedback](docs/TROUBLESHOOTING.md)
+- [Building and contributing](CONTRIBUTING.md)
 
-[Contributing (中文)](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
+[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
 
 This beta is for Apple Silicon on macOS 14.2 or later. Intel builds, automatic updates and App Store distribution are not available. See the release notes for known verification limits.

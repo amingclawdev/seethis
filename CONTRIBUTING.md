@@ -1,12 +1,12 @@
-# 开发与贡献
+# Contributing
 
-SeeThis 使用 C++20、Objective-C++、AppKit 和 ScreenCaptureKit。Apple Silicon/macOS 14.2+ 是当前 beta 目标。
+SeeThis uses C++20, Objective-C++, AppKit and ScreenCaptureKit. The current beta targets Apple Silicon and macOS 14.2 or later.
 
-## 构建与测试
+## Build and test
 
-安装 CMake 3.25+、Ninja、Apple 支持的 Xcode/Command Line Tools，以及 Node 18+（仅 JavaScript viewer 测试）。确认 `xcrun --find clang++`、`xcrun --sdk macosx --show-sdk-path` 和 `ninja --version` 可用。
+Install CMake 3.25+, Ninja, an Apple-supported Xcode or Command Line Tools installation, and Node 18+ for the JavaScript viewer tests. Check that `xcrun --find clang++`, `xcrun --sdk macosx --show-sdk-path` and `ninja --version` work.
 
-在源码根目录选择独立输出目录：
+From the source root, use a separate output directory:
 
 ```sh
 cmake -S . -B /tmp/seethis-release-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.2
@@ -15,12 +15,12 @@ ctest --test-dir /tmp/seethis-release-build --output-on-failure
 bash tests/package_macos_test.sh
 ```
 
-源码 archive 可直接 configure/build/test，无需 Git 元数据。`scripts/package_macos.sh package` 则要求干净的确切 Git commit；它从源码新构建包，不接收预编译 app 作为新的构建 provenance。见 [RELEASE](docs/RELEASE.md)。
+A source archive can be configured, built and tested without Git metadata. `scripts/package_macos.sh package` requires a clean, exact Git commit. It builds a new package from source; it does not accept a prebuilt app as evidence of a new source build. See [release provenance](docs/RELEASE.md).
 
-自动测试使用 disposable fixtures。不要重置 TCC、修改真实用户数据或系统设置来运行测试。状态机和 mock 测试不证明 Gatekeeper、TCC、Chrome 或真实粘贴行为。
+Automated tests use disposable fixtures. Do not reset TCC or change real user data or system settings to run tests. State-machine and mock tests do not establish real Gatekeeper, TCC, Chrome or paste behavior.
 
-## 提交
+## Submit a change
 
-通过 [GitHub](https://github.com/amingclawdev/seethis) 提交聚焦的 issue 或 pull request，说明行为变化、必要验证和已知限制。不要提交私人截图、读取 capability、密钥、个人绝对路径、构建缓存或本机配置。安全问题使用[私下通道](SECURITY.md)。
+Open a focused issue or pull request on [GitHub](https://github.com/amingclawdev/seethis). Describe the behavior change, relevant verification and known limits. Do not submit private screenshots, read-access capability URLs, keys, personal absolute paths, build caches or local configuration. Report security issues through the [private channel](SECURITY.md).
 
-本项目以 [MIT](LICENSE) 发布，Copyright (c) 2026 SeeThis contributors。提交者应有权提供所提交的代码或素材，并明确任何第三方许可。依赖和媒体说明见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。
+This project is released under [MIT](LICENSE), Copyright (c) 2026 SeeThis contributors. Contributors must have the right to provide their code or media and identify any third-party licenses. See [dependency and media notices](THIRD_PARTY_NOTICES.md).
