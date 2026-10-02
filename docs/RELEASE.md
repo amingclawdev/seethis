@@ -20,13 +20,13 @@ The embedded `seethis-delivery-provenance.v1` records the initial packaging stag
 | Item | Value |
 | --- | --- |
 | Signature | Developer ID Application: YING ZHANG (GLHUR8CC29), hardened runtime, secure timestamp |
-| Current Apple submission | `bee3ff1d-4699-4cb6-9706-a370bf3c85dc`, Accepted |
-| Stapling | ZIP contains the stapled app; final DMG and embedded-app ticket validation is required before publication |
+| Accepted app submission | `bee3ff1d-4699-4cb6-9706-a370bf3c85dc`, Accepted |
+| Stapling | Final App, ZIP-extracted App, DMG and embedded-App ticket checks are recorded in RELEASE-MANIFEST.json; all must pass before publication |
 | Gatekeeper | App, DMG and ZIP-extracted app accepted as Notarized Developer ID on release host |
 | DMG | `SeeThis-0.1.0-beta.1-macos-arm64.dmg` |
 | DMG SHA-256 | See the final Release attachment SHA256SUMS |
 | ZIP | `SeeThis-0.1.0-beta.1-macos-arm64.app.zip` |
-| ZIP SHA-256 | `d821a2bdf4f8d164618e6e5431012e2c08969148327056f69fbcafc3aaa027d0` |
+| ZIP SHA-256 | See the final Release attachment SHA256SUMS |
 
 Check SHA256SUMS against the downloaded file. The DMG mounts with SeeThis.app and an Applications symlink. Publication requires its embedded app and the ZIP-extracted app to preserve the frozen executable and valid signature/ticket. No custom Finder background is used.
 
