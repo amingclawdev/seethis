@@ -23,15 +23,15 @@ No vendored third-party source or package manager runtime dependency is included
 
 ## Demo media
 
-The project owner explicitly authorized public reuse of their original v3 demonstration videos. The sanitized versions retain the original English subtitles, scene order, animated zoom and narration. The recorded narration voice is Microsoft Andrew Multilingual Neural. Recorded app interfaces, browser UI and webpage imagery retain their respective ownership; this notice does not claim ownership of those interfaces or endorsement by their vendors.
+The project owner explicitly authorized public reuse of their original v3 demonstration videos without added privacy masks. The MP4 files below are byte-identical copies of the original landscape and portrait exports, including their English subtitles, scene order, animated zoom and narration. The thumbnails are frames extracted at 0.5 seconds from those exports. The recorded narration voice is Microsoft Andrew Multilingual Neural. Recorded app interfaces, browser UI and webpage imagery retain their respective ownership; this notice does not claim ownership of those interfaces or endorsement by their vendors.
 
-The accepted public files are:
+The public files are:
 
 | File | SHA-256 |
 | --- | --- |
-| `docs/demo/SeeThis-landscape-v3-public.mp4` | `e7c3a9a5824f8c1046c15b99052f308b35463010d5d63a802bffb57d2a6d9806` |
-| `docs/demo/SeeThis-landscape-v3-thumbnail.jpg` | `be428127187caa5409d1ff2f8ffbe9eb4aa9f60bba2ba8392b51f21c2e71a72f` |
-| `docs/demo/SeeThis-portrait-v3-public.mp4` | `4f64198de0712b729caddeef3cde249c8d285b8c7407b3d361f31b574a8be879` |
-| `docs/demo/SeeThis-portrait-v3-thumbnail.jpg` | `a026049076a8198e28e387cbdee895011f283d6fdc89abd731af8f7cf0dfce71` |
+| `docs/demo/SeeThis-landscape-v3-public.mp4` | `e91003bda6ff3f92bb3877a5503089e1ff18665a0f5c31ee25fa890e45449e9a` |
+| `docs/demo/SeeThis-landscape-v3-thumbnail.jpg` | `958ce9b0f8d8fb9785e95b6e3c5f816becd77ed7f3bfd95636d9a47777ed8c5e` |
+| `docs/demo/SeeThis-portrait-v3-public.mp4` | `91a4e08cdb889415f1b7634701b2fe0781ff611f7c0b13cde9aea2f5348ed043` |
+| `docs/demo/SeeThis-portrait-v3-thumbnail.jpg` | `ca4b72cd5686d5961f0ac95d8e967c127eb7d2c34f1d3db6db334892e1226aed` |
 
-Privacy review applies to these exact sanitized files. It does not certify the current release app, another Mac, or every frame by subjective interpretation. The recording shows an earlier Inspector workflow; current behavior is documented in [USAGE](docs/USAGE.md). Private originals, editing projects and review records are excluded from the repository.
+The recording shows an earlier Inspector workflow; current behavior is documented in [USAGE](docs/USAGE.md). Editing projects, longer source recordings and private review records are excluded from the repository.

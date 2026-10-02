@@ -6,7 +6,7 @@ SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more 
 
 ## Demo
 
-https://github.com/user-attachments/assets/6f234100-88f8-467f-9d94-f7d7fa90f464
+https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba
 
 A 76-second walkthrough of marking screen areas and sharing a visual reference.
 
