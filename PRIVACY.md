@@ -10,7 +10,7 @@ SeeThis processes screen references locally. This version has no cloud sync, tel
 
 ## Storage, deletion and expiration
 
-Data lives in `~/Library/Application Support/SeeThis`: `settings-v1.json` stores settings, and `references-v1` stores references and images. The defaults are a seven-day retention period and at most 500 searchable references. Change them in **Open Settings… > Reference access**. Retention starts when a reference is accepted. The app's pruning process performs cleanup; it does not keep running on a schedule after the app quits.
+For the GitHub distribution, data lives in `~/Library/Application Support/SeeThis`: `settings-v1.json` stores settings, and `references-v1` stores references and images. A sandboxed distribution, when available, uses the system-resolved Application Support directory inside its registered app container (`~/Library/Containers/<bundle-id>/Data/Library/Application Support/SeeThis`); a sandboxed distribution does not automatically import the GitHub app’s settings or references. The defaults are a seven-day retention period and at most 500 searchable references. Change them in **Open Settings… > Reference access**. Retention starts when a reference is accepted. The app's pruning process performs cleanup; it does not keep running on a schedule after the app quits.
 
 Deletion first records a tombstone, revokes local read access and removes assets. Image-free deleted or expired status records may remain. Cleanup failures can leave files behind, and the app reports the failure. This is not secure erasure and cannot retract backups, clipboard copies or attachments already sent. Removing the app keeps Application Support data; see [uninstalling and keeping data](docs/TROUBLESHOOTING.md#uninstalling-and-keeping-data) for manual removal. The complete uninstall and residual-data matrix has not been retested.
 
@@ -19,3 +19,11 @@ Deletion first records a tombstone, revokes local read access and removes assets
 A reference URL grants read access: a program on the same Mac that knows the complete link can read the authorized content. The service binds to loopback `127.0.0.1`; remote assistants need an image you explicitly attach. Do not publish complete reference URLs, detail fragments or settings access addresses, or expose the local service through port forwarding.
 
 The service has authentication, expiration/deletion handling and no-store/no-referrer policies. You still need to inspect screen content and consider the recipient. **Feedback…** only opens an email draft addressed to `z5866318@gmail.com`; it does not automatically send it or attach screenshots. You choose the content and whether to send it. See [security reporting](SECURITY.md).
+
+## Support information and retention
+
+For support cases opened after this policy is published, maintainers use information you send only to provide support and diagnose/fix product issues, not for advertising, model training or data brokering. Email may contain your address/name, issue description and attachments you choose. Maintainers manually delete private support email from their controlled mailbox 90 days after the support case closes; this is not automatic cleanup or a claim about historical mailbox practices. To request deletion earlier, contact `z5866318@gmail.com`.
+
+Public GitHub technical issue and fix records may be retained. You can request removal of personal information from maintainer-controlled content through the same email. Provider backups/caches and copies made by other people or search engines may remain; maintainers cannot promise their erasure. Share only the minimum necessary safe content.
+
+The public [privacy policy](https://github.com/amingclawdev/seethis/blob/main/PRIVACY.md) applies to the documented support practices above. App versions that provide **Privacy Policy…** in the menu open this same page. The current GitHub release is v0.1.1-beta.1; App Store distribution is not yet available. This policy does not assert App Store approval or completed privacy-label declarations.
