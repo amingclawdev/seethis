@@ -4,14 +4,14 @@
 
 ## 下载与校验
 
-1. 打开 [v0.1.0-beta.1 Release](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)。下载 **SeeThis-0.1.0-beta.1-macos-arm64.dmg** 和 **SHA256SUMS**；也可选择 **SeeThis-0.1.0-beta.1-macos-arm64.app.zip**。
+1. 打开 [v0.1.0-beta.1 Release](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)。下载 **SeeThis-0.1.0-beta.1-macos-arm64-release.dmg** 和 **SHA256SUMS**；也可选择 **SeeThis-0.1.0-beta.1-macos-arm64-release.zip**。
 2. 在 Terminal 进入下载目录，对下载的附件核对摘要：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64.dmg
+shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64-release.dmg
 # ZIP 替代包：
-shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64.app.zip
+shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64-release.zip
 ```
 
 3. 将结果与同一 Release 的 SHA256SUMS 比较。下载了两份附件时，也可运行 `shasum -a 256 -c SHA256SUMS`，两项都应为 **OK**。只下载其中一份时，另一项缺失不代表已下载文件损坏；逐项核对自己下载的文件。摘要不同就重新下载，暂停安装。
