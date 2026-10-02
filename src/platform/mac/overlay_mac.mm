@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <os/log.h>
+#include <algorithm>
 #include "platform/platform.h"
 
 static NSString* STFeedbackEmailAddress() {return @"z5866318@gmail.com";}
@@ -364,6 +365,7 @@ static NSString* STShortcutText(seethis::platform::EffectiveShortcutBinding bind
   self.stateLabel.hidden=!recovery;self.guidanceLabel.hidden=!recovery;
   self.shortcutLabel.hidden=NO;
   for(NSButton* button in self.buttons)button.hidden=!recovery;
+  self.buttons[0].enabled=!state.consent_pending;
   {
     const auto bindings=[self.adapter shortcuts];
     NSString* capture=STShortcutText(bindings.capture,
@@ -377,8 +379,11 @@ static NSString* STShortcutText(seethis::platform::EffectiveShortcutBinding bind
   }
   if(recovery) {
     self.stateLabel.stringValue=[NSString stringWithFormat:@"Chrome Automation: %@",
-        text(seethis::platform::ChromeConsentName(state.permission.consent))];
-    self.guidanceLabel.stringValue=state.permission.consent==seethis::platform::ChromeConsent::kDenied
+        state.consent_pending?@"request in progress":
+            text(seethis::platform::ChromeConsentName(state.permission.consent))];
+    self.guidanceLabel.stringValue=state.consent_pending
+        ?@"Respond to the macOS Automation dialog. Connect will be available after it returns."
+        :state.permission.consent==seethis::platform::ChromeConsent::kDenied
         ?@"Allow SeeThis → Google Chrome in Automation, then retry."
         :@"Choose Connect Chrome to request Automation access.";
     self.guidanceLabel.toolTip=text(seethis::platform::ChromeRecoveryGuidance(state));
@@ -422,8 +427,25 @@ static NSString* STShortcutText(seethis::platform::EffectiveShortcutBinding bind
 }
 @end
 
+static std::vector<std::uint64_t> STCaptureExcludedWindowIDs(
+    NSArray<NSWindow*>* drawingPanels, NSWindow* inspector) {
+  std::vector<std::uint64_t> excluded;
+  const auto append = [&excluded](NSWindow* window) {
+    if(!window)return;
+    const NSInteger number=window.windowNumber;
+    if(number<=0)return;
+    const auto id=static_cast<std::uint64_t>(number);
+    if(std::find(excluded.begin(),excluded.end(),id)==excluded.end())
+      excluded.push_back(id);
+  };
+  for(NSWindow* panel in drawingPanels)append(panel);
+  // Include the current Inspector even while hidden: it may become visible
+  // before asynchronous capture completes. Never cache a window number.
+  append(inspector);
+  return excluded;
+}
+
 #if !defined(SEETHIS_INSPECTOR_FEEDBACK_TESTING)
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -1699,7 +1721,7 @@ bool SameWindowIdentity(const seethis::core::WindowObservation& first,
         break;
       }
     }
-    std::vector<std::uint64_t> excluded;for(STOverlayPanel* panel in self.panels)excluded.push_back(panel.windowNumber);
+    const auto excluded=STCaptureExcludedWindowIDs(self.panels,_inspectorPanel);
     std::string error;auto context=seethis::platform::SnapshotContext(snapshot.session_origin,excluded,error);
     if(!context)_marks->Abort(error);
     else {

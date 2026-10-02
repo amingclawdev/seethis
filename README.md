@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba
 
 A 76-second walkthrough of marking screen areas and sharing a visual reference.
 
-**[Download v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
+**[Download v0.1.1-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
 
 The release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
 
@@ -31,7 +31,7 @@ Option+A and Option+D are the defaults. If you change them in Open Settings…, 
 3. On a screen with safe test content, hold **Option+A**, drag around an area with the left mouse button, then release the shortcut. A local JSON URL is copied immediately; the image finishes in the background.
 4. Open **Show Inspector…** from the menu. Once the image is ready, choose **Copy marked image**, inspect it, and paste or attach it to your conversation.
 
-For Chrome page context, activate standalone Google Chrome. When Automation is missing or denied, Inspector shows **Connect Chrome**, **Retry Chrome** and **Automation Settings…**. Connect Chrome requests access explicitly. Merely opening Inspector, starting in the background or using an already authorized Chrome session does not trigger that recovery flow.
+For Chrome page context, activate standalone Google Chrome. When Automation is missing, pressing the configured capture shortcut (default **Option+A**) requests permission to control Chrome without blocking SeeThis’s main UI. Allow access in the system dialog, then release the original capture key and make a fresh gesture; granting permission does not resume the interrupted capture. **Connect Chrome**, **Retry Chrome** and **Automation Settings…** remain available for recovery. Background observation and opening Inspector do not request Automation.
 
 The app lives in the menu bar; there is no main window. Inspector is a movable panel with a fixed 470 × 430-point size. Feedback… opens an email draft; you decide whether to send it.
 

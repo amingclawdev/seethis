@@ -529,6 +529,14 @@ void TestWatchdog() {
             eligibility.AcceptPress(true, true, {2'020, 2'030, true}),
         "adapter eligibility rejects stale or physically incomplete Carbon presses");
 
+  seethis::platform::CaptureShortcutHold hold;
+  Check(hold.Begin(0) && !hold.Begin(8) && hold.key() == 0,
+        "one original physical hold survives a configured binding change");
+  Check(!hold.ObserveRelease(true) && hold.key() == 0,
+        "held original key cannot be rearmed by focus/permission/modifier changes");
+  Check(hold.ObserveRelease(false) && !hold.key() && hold.Begin(8),
+        "only original key release permits a fresh configured physical hold");
+
   const auto input_source = std::filesystem::path(__FILE__).parent_path()
                                 .parent_path() / "src/platform/mac/input_mac.mm";
   std::ifstream input(input_source);
@@ -2029,10 +2037,20 @@ void TestIndependentChromeConnectionRecovery() {
       if(ask) {++requests;return requested;}
       ++preflights;return preflight;
     }};
-  connection.Connect(adapters);
+  // This fake reducer test completes immediately. Native queue responsiveness
+  // is exercised separately through the production menu/Inspector actions.
+  auto connect=[&] {
+    const auto request=connection.BeginConsent(adapters);
+    if(!request.valid())return;
+    const auto result=adapters.permission(request.target.pid,true);
+    preflight=result;
+    connection.Refresh(adapters);
+    Check(connection.CompleteConsent(request,result),"current fake consent completes on owner thread");
+  };
+  connect();
   Check(requests==0 && preflights==0 && !connection.BeginProbe().generation,
         "Chrome not running cannot request consent, probe, or launch Chrome");
-  running={123,0};connection.Connect(adapters);
+  running={123,0};connect();
   Check(requests==0 && preflights==0 &&
             ChromeRunningName(connection.snapshot().target)=="identity unavailable",
         "a running process without launch identity is unknown, not falsely reported absent");
@@ -2041,7 +2059,7 @@ void TestIndependentChromeConnectionRecovery() {
   Check(requests==0 && preflights==5 &&
             connection.snapshot().permission.consent==ChromeConsent::kNotRequested,
         "startup and repeated refresh use only prompt-free preflight");
-  connection.Connect(adapters);
+  connect();
   Check(requests==1 && connection.snapshot().permission.consent==ChromeConsent::kDenied &&
             !connection.BeginProbe().generation &&
             ChromeRecoveryGuidance(connection.snapshot()).find("not guaranteed")!=std::string_view::npos,
@@ -2053,7 +2071,7 @@ void TestIndependentChromeConnectionRecovery() {
         "retry preflight after denial preserves settings guidance without requesting consent");
   requested={ChromeConsent::kGranted,0};
   const auto before_consent=connection.snapshot().authorization_generation;
-  connection.Connect(adapters);
+  connect();
   Check(requests==2 && connection.snapshot().permission.consent==ChromeConsent::kGranted,
         "only an explicit Connect action requests normal consent from denied state");
   Check(before_consent!=connection.snapshot().authorization_generation,
@@ -2122,6 +2140,52 @@ void TestIndependentChromeConnectionRecovery() {
   Check(!connection.snapshot().target.valid() &&
             connection.snapshot().provider==ChromeProviderState::kUnknown && requests==2,
         "Chrome quit clears cached provider without requesting consent");
+}
+
+void TestConsentRequestLifecycle() {
+  using namespace seethis::platform;
+  ChromeConnectionController connection;
+  ChromeRunningTarget target{123,1000};
+  ChromePermissionResult preflight{ChromeConsent::kNotRequested,-1744};
+  int asks=0;
+  ChromeConnectionAdapters adapters{[&]{return target;},[&](std::int64_t,bool ask) {
+    if(ask)++asks;
+    return preflight;
+  }};
+  const auto first=connection.BeginConsent(adapters);
+  Check(first.valid() && connection.snapshot().consent_pending &&
+            !connection.BeginConsent(adapters).valid() && asks==0,
+        "begin reserves a single request without synchronous native permission");
+  preflight={ChromeConsent::kDenied,-1743};connection.Refresh(adapters);
+  Check(connection.CompleteConsent(first,preflight),"current denied request completes");
+  const auto next=connection.BeginConsent(adapters);
+  Check(!connection.CompleteConsent(first,preflight) && connection.snapshot().consent_pending,
+        "duplicate completion cannot release a newer physical request slot");
+  target={123,2000};connection.Refresh(adapters);
+  target={123,1000};connection.Refresh(adapters);
+  Check(!next.native_entry_allowed->load() &&
+            !connection.CompleteConsent(next,ChromePermissionResult{ChromeConsent::kGranted,0}) &&
+            connection.snapshot().permission.consent==ChromeConsent::kDenied,
+        "target epoch rejects away-and-back stale consent, including same PID");
+  const auto before_stop=connection.BeginConsent(adapters);
+  connection.Stop();connection.Start();connection.Refresh(adapters);
+  Check(connection.snapshot().consent_pending &&
+            !connection.BeginConsent(adapters).valid() &&
+            !before_stop.native_entry_allowed->load(),
+        "restart keeps unresolved physical request, invalidating native entry/publication");
+  Check(!connection.CompleteConsent(before_stop,preflight) &&
+            !connection.snapshot().consent_pending,
+        "old lifecycle completion releases only its slot without publication");
+  const auto failed_entry=connection.BeginConsent(adapters);
+  Check(!connection.CompleteConsent(failed_entry,std::nullopt) &&
+            !connection.snapshot().consent_pending,
+        "abandoned queued request releases matching slot without a permission result");
+  const auto revoked=connection.BeginConsent(adapters);
+  connection.Refresh(adapters);
+  Check(connection.CompleteConsent(revoked,ChromePermissionResult{ChromeConsent::kGranted,0}) &&
+            connection.snapshot().permission.consent==ChromeConsent::kDenied &&
+            !connection.BeginProbe().generation && asks==0,
+        "fresh prompt-free denial defeats stale native grant without prompting");
 }
 
 void TestInspectorConnectionHealthAndEffectiveBindings() {
@@ -2332,6 +2396,7 @@ int main() {
   TestDisplayLeaveReentrySubpaths();
   TestChromeObservationLifecycle();
   TestIndependentChromeConnectionRecovery();
+  TestConsentRequestLifecycle();
   TestInspectorConnectionHealthAndEffectiveBindings();
   TestReferenceDropdownSelectionAfterRealDeletion();
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)

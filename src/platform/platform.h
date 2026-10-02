@@ -446,6 +446,26 @@ class CaptureShortcutEligibility {
   core::DeleteEventProvenance boundary_;
 };
 
+// A physical hold is one intent even if focus, binding, or consent changes.
+// Modifiers alone cannot rearm it; the original configured key must be released.
+class CaptureShortcutHold {
+ public:
+  bool Begin(std::uint16_t key) {
+    if (key_) return false;
+    key_ = key;
+    return true;
+  }
+  [[nodiscard]] std::optional<std::uint16_t> key() const { return key_; }
+  bool ObserveRelease(bool original_key_is_down) {
+    if (!key_ || original_key_is_down) return false;
+    key_.reset();
+    return true;
+  }
+
+ private:
+  std::optional<std::uint16_t> key_;
+};
+
 [[nodiscard]] inline std::optional<core::Point2D>
 AppKitGlobalPointFromQuartz(core::Point2D point, double appkit_primary_top) {
   if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
@@ -983,9 +1003,6 @@ void AcquireChromePageAsync(ChromePageAcquire acquire,
                             std::uint64_t generation,
                             ChromePageCompletion completion);
 bool ChromeAutomationPreflight(std::int64_t browser_pid);
-// Explicit user-triggered action only. Polling and tests must call the
-// prompt-free preflight above instead.
-bool RequestChromeAutomationPermission(std::int64_t browser_pid);
 // Connection readiness is separate from a mark's frozen foreground identity.
 // These adapters never publish a URL or a PageIdentity from a background probe.
 enum class ChromeConsent { kUnknown, kGranted, kDenied, kNotRequested, kUnavailable };
@@ -1020,6 +1037,7 @@ struct ChromeConnectionSnapshot {
   bool observation_active = false;
   core::PageAvailability page = core::PageAvailability::kUnavailable;
   bool settings_open_failed = false;
+  bool consent_pending = false;
 };
 [[nodiscard]] inline bool ChromeConnectionHealthy(const ChromeConnectionSnapshot& state) {
   return state.target.valid() && state.permission.consent==ChromeConsent::kGranted &&
@@ -1043,12 +1061,27 @@ struct ChromeConnectionProbe {
   std::uint64_t generation = 0;
   auto operator<=>(const ChromeConnectionProbe&) const = default;
 };
+// This token owns publication eligibility, not cancellation of the OS call.
+struct ChromeConsentRequest {
+  ChromeRunningTarget target;
+  std::uint64_t request_id = 0;
+  std::uint64_t target_epoch = 0;
+  std::uint64_t lifecycle_epoch = 0;
+  // Invalidation can prevent queued entry, never cancel an OS call in progress.
+  std::shared_ptr<std::atomic_bool> native_entry_allowed;
+  auto operator<=>(const ChromeConsentRequest&) const = default;
+  [[nodiscard]] bool valid() const { return request_id != 0 && target.valid(); }
+};
 class ChromeConnectionController {
  public:
   void Refresh(const ChromeConnectionAdapters& adapters) {
+    if (stopped_) return;
     const auto target = adapters.discover ? adapters.discover() : ChromeRunningTarget{};
     if (target != snapshot_.target) {
+      if (consent_.native_entry_allowed) consent_.native_entry_allowed->store(false);
+      ++target_epoch_;
       ++generation_; active_ = {}; snapshot_ = {}; snapshot_.target = target;
+      snapshot_.consent_pending = consent_.valid();
       snapshot_.authorization_generation = ++authorization_generation_;
     }
     const auto permission = target.valid() && adapters.permission
@@ -1062,22 +1095,60 @@ class ChromeConnectionController {
     }
     snapshot_.permission = permission;
   }
-  void Connect(const ChromeConnectionAdapters& adapters) {
+  [[nodiscard]] ChromeConsentRequest BeginConsent(
+      const ChromeConnectionAdapters& adapters,
+      std::optional<ChromeRunningTarget> required_target = {}) {
     Refresh(adapters);
+    if (stopped_ || consent_.valid() ||
+        (required_target && (!required_target->valid() ||
+                             *required_target != snapshot_.target)))
+      return {};
     snapshot_.settings_open_failed = false;
-    if (!snapshot_.target.valid() || !adapters.permission) return;
-    if (snapshot_.permission.consent != ChromeConsent::kGranted) {
-      ++generation_; active_ = {};
-      snapshot_.authorization_generation = ++authorization_generation_;
-      snapshot_.permission = adapters.permission(snapshot_.target.pid, true);
-      snapshot_.provider = ChromeProviderState::kUnknown;
-      snapshot_.page = core::PageAvailability::kUnavailable;
-      snapshot_.observation_active = false;
-    }
+    if (!snapshot_.target.valid() || !adapters.permission ||
+        snapshot_.permission.consent == ChromeConsent::kGranted) return {};
+    ++generation_; active_ = {};
+    snapshot_.authorization_generation = ++authorization_generation_;
+    snapshot_.provider = ChromeProviderState::kUnknown;
+    snapshot_.page = core::PageAvailability::kUnavailable;
+    snapshot_.observation_active = false;
+    consent_ = {snapshot_.target, ++consent_request_id_, target_epoch_, lifecycle_epoch_,
+                std::make_shared<std::atomic_bool>(true)};
+    snapshot_.consent_pending = true;
+    return consent_;
+  }
+  // Caller refreshes current target/permission on main before completion. Fresh
+  // preflight wins a conflicting native result (for example, grant then revoke).
+  bool CompleteConsent(ChromeConsentRequest request,
+                       std::optional<ChromePermissionResult> result) {
+    if (!request.valid() || request != consent_) return false;
+    consent_ = {};
+    snapshot_.consent_pending = false;
+    if (stopped_ || request.lifecycle_epoch != lifecycle_epoch_ ||
+        request.target_epoch != target_epoch_ || request.target != snapshot_.target ||
+        !result) return false;
+    if (result->consent == snapshot_.permission.consent)
+      snapshot_.permission = *result;
+    return true;
+  }
+  void Start() {
+    if (consent_.native_entry_allowed) consent_.native_entry_allowed->store(false);
+    stopped_ = false;
+    ++lifecycle_epoch_; ++target_epoch_; ++generation_; active_ = {};
+    snapshot_ = {};
+    snapshot_.authorization_generation = ++authorization_generation_;
+    snapshot_.consent_pending = consent_.valid();
+  }
+  void Stop() {
+    if (consent_.native_entry_allowed) consent_.native_entry_allowed->store(false);
+    stopped_ = true;
+    ++lifecycle_epoch_; ++target_epoch_; ++generation_; active_ = {};
+    snapshot_ = {};
+    snapshot_.authorization_generation = ++authorization_generation_;
+    // Keep consent_ until the actual native call returns, including across Start.
   }
   [[nodiscard]] ChromeConnectionProbe BeginProbe() {
     snapshot_.settings_open_failed = false;
-    if (!snapshot_.target.valid() ||
+    if (stopped_ || consent_.valid() || !snapshot_.target.valid() ||
         snapshot_.permission.consent != ChromeConsent::kGranted) return {};
     active_ = {snapshot_.target, ++generation_};
     snapshot_.provider = ChromeProviderState::kChecking;
@@ -1111,6 +1182,11 @@ class ChromeConnectionController {
   ChromeConnectionProbe active_;
   std::uint64_t generation_ = 0;
   std::uint64_t authorization_generation_ = 0;
+  ChromeConsentRequest consent_;
+  std::uint64_t consent_request_id_ = 0;
+  std::uint64_t target_epoch_ = 0;
+  std::uint64_t lifecycle_epoch_ = 1;
+  bool stopped_ = false;
 };
 [[nodiscard]] inline std::string_view ChromeConsentName(ChromeConsent state) {
   switch (state) {
@@ -1150,6 +1226,8 @@ class ChromeConnectionController {
   return "unknown";
 }
 [[nodiscard]] inline std::string_view ChromeRecoveryGuidance(const ChromeConnectionSnapshot& state) {
+  if (state.consent_pending)
+    return "An Automation request is in progress. Respond to the macOS permission dialog; another request will wait until it returns.";
   if (state.settings_open_failed)
     return "Could not open Settings. Open System Settings > Privacy & Security > Automation > SeeThis > Google Chrome, then choose Retry Chrome.";
   if (state.target.pid<=0) return "Open Google Chrome, then choose Connect Chrome.";
@@ -1168,10 +1246,25 @@ class ChromeConnectionController {
   return "Automation access alone does not identify a page. Choose Retry Chrome to check the provider; make Chrome frontmost to create a mark.";
 }
 // Main-thread connection state shared by the menu and Inspector. Refresh is
-// prompt-free; only ConnectChromeExplicit invokes askIfNeeded=true.
+// prompt-free; explicit Connect and eligible physical capture intents may ask.
 ChromeConnectionSnapshot RefreshChromeConnection();
 ChromeConnectionSnapshot ChromeConnectionStatus();
 void ConnectChromeExplicit();
+// Called only by an eligible physical capture press before drawing starts.
+// A returned target means interrupt this hold; invalid/nonmatching targets never ask.
+std::optional<ChromeRunningTarget> GetChromeCaptureConsentTarget();
+void ConnectChromeForCaptureExplicit(ChromeRunningTarget foreground_target);
+void StartChromeConnection();
+void StopChromeConnection();
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+// Only external inputs are injected; production native/main scheduling is used.
+struct ChromeConnectionTestAdapters {
+  ChromeConnectionAdapters connection;
+  std::function<ChromeProviderState(ChromeRunningTarget)> provider;
+  std::function<ChromeRunningTarget()> foreground_chrome;
+};
+void SetChromeConnectionTestAdapters(ChromeConnectionTestAdapters adapters);
+#endif
 void RetryChromeExplicit();
 bool OpenChromeAutomationSettingsExplicit();
 void PublishChromeObservation(std::int64_t pid, bool active,

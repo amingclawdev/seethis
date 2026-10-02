@@ -10,7 +10,9 @@ Complete [installation and permissions](INSTALL.md) first. The default Capture s
 4. Release A or Option to submit all regions from that hold as one reference. Releasing the mouse ends a region; releasing the shortcut ends a reference.
 5. **Link copied — paste into chat** means the clipboard contains a plain-text JSON URL. The image continues preparing in the background. Completion does not automatically replace the clipboard with an image.
 
-Empty movement, degenerate paths, Escape, switching apps/displays, an input interruption or reaching the maximum hold time can cancel capture. Release all keys before retrying. The entire selected display provides the reference context; marked regions are not a privacy crop.
+Empty movement, degenerate paths, Escape, switching apps/displays, an input interruption or reaching the maximum hold time can cancel capture. Release all keys before retrying. The entire selected display provides the reference context; marked regions are not a privacy crop. Drawing overlay panels and the current Inspector window are excluded from new captured images. Other windows and notifications can still be captured, so inspect the complete image before sharing.
+
+If the first gesture in standalone Chrome requests Automation, complete the system permission decision, release the original capture key and make a fresh gesture. That authorization hold is canceled rather than submitted as a partial reference. See [Chrome setup](CHROME.md).
 
 ## Inspector and reference history
 

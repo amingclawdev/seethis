@@ -174,6 +174,23 @@ static void TestProductionChromeView() {
   fake.connectionState=healthy;fake.bindingState=bindings;
   [chrome refreshChrome];[container layout];
   Check(chrome.stateLabel.hidden && chrome.buttons[0].hidden,"recovery-to-healthy transition collapses immediately");
+  healthy.consent_pending=true;fake.connectionState=healthy;
+  [chrome refreshChrome];
+  Check(chrome.stateLabel.hidden && chrome.guidanceLabel.hidden,
+        "pending backend does not broaden healthy/granted recovery UI");
+  for(NSButton* button in chrome.buttons)Check(button.hidden,"granted pending hides all recovery controls");
+  healthy.permission.consent=ChromeConsent::kNotRequested;
+  fake.connectionState=healthy;fake.activeChromePID=51;chrome.chromeContextActive=YES;
+  [chrome refreshChrome];
+  Check(!chrome.stateLabel.hidden && !chrome.buttons[0].enabled &&
+            [chrome.stateLabel.stringValue containsString:@"request in progress"] &&
+            !chrome.shortcutLabel.hidden,"actual recovery context shows truthful pending without losing hints");
+  fake.activeChromePID=0;[chrome refreshChrome];
+  Check(chrome.stateLabel.hidden && chrome.guidanceLabel.hidden,
+        "leaving Chrome hides pending recovery description");
+  for(NSButton* button in chrome.buttons)Check(button.hidden,"other-app context hides pending controls");
+  healthy={};healthy.consent_pending=true;fake.connectionState=healthy;
+  [chrome refreshChrome];Check(chrome.stateLabel.hidden,"startup unknown cannot broaden pending recovery");
   Check(mail.opens==0 && mail.copies==0,"Chrome view test never sends mail or copies");
 }
 

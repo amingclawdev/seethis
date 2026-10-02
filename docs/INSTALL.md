@@ -4,14 +4,14 @@ For Apple Silicon (M-series) Macs running **macOS 14.2 or later**. SeeThis has a
 
 ## Download and verify
 
-1. Open the [v0.1.0-beta.1 release](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1). Download **SeeThis-0.1.0-beta.1-macos-arm64-release.dmg** and **SHA256SUMS**, or choose **SeeThis-0.1.0-beta.1-macos-arm64-release.zip** instead.
+1. Open the [v0.1.1-beta.1 release](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1). Download **SeeThis-0.1.1-beta.1-macos-arm64-release.dmg** and **SHA256SUMS**, or choose **SeeThis-0.1.1-beta.1-macos-arm64-release.zip** instead.
 2. In Terminal, go to your download directory and calculate the downloaded file's checksum:
 
 ```sh
 cd ~/Downloads
-shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64-release.dmg
+shasum -a 256 SeeThis-0.1.1-beta.1-macos-arm64-release.dmg
 # ZIP alternative:
-shasum -a 256 SeeThis-0.1.0-beta.1-macos-arm64-release.zip
+shasum -a 256 SeeThis-0.1.1-beta.1-macos-arm64-release.zip
 ```
 
 3. Compare the result with SHA256SUMS from the same release. If you downloaded both packages and RELEASE-MANIFEST.json, you can run `shasum -a 256 -c SHA256SUMS`; all three entries should report **OK**. Missing entries for files you did not download do not mean your downloaded file is damaged; check the entries you downloaded individually. If a checksum differs, stop installation and download again.
@@ -32,4 +32,4 @@ The DMG layout, signature, notarization and mounted app contents have been techn
 3. Check Input Monitoring, Screen Recording, Capture shortcut and Delete shortcut readiness separately in the menu. One permission being ready does not establish that capture works.
 4. Try a [capture](USAGE.md) on safe test content and inspect the image and copying behavior in Inspector. If the app is still not ready after the system's **Quit & Reopen**, check the exact copy with **Location:** and reopen it manually.
 
-Chrome page identity also needs [Automation](CHROME.md). Accessibility permission and a browser extension are not required. System policy, signature changes or multiple copies can require permission again; continuity cannot be guaranteed. First-download, first-permission and additional macOS versions still need physical verification. See [release verification limits](RELEASE.md).
+Chrome page identity also needs [Automation](CHROME.md). With Chrome foreground, the configured capture shortcut can make the initial Chrome request. After allowing access, release the original capture key completely and use a fresh gesture; a screen/audio permission notice is not Chrome Automation. Accessibility permission and a browser extension are not required. System policy, signature changes or multiple copies can require permission again; continuity cannot be guaranteed. First-download, first-permission and additional macOS versions still need physical verification. See [release verification limits](RELEASE.md).

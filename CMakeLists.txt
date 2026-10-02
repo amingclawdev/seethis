@@ -22,7 +22,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{CMAKE_TOOLCHAIN_FILE}
   endif()
 endif()
 
-project(seethis VERSION 0.1.0 LANGUAGES CXX)
+project(seethis VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -121,6 +121,22 @@ if(BUILD_TESTING)
     target_compile_options(inspector_feedback_test PRIVATE -fobjc-arc)
     target_link_libraries(inspector_feedback_test PRIVATE seethis_core "-framework AppKit")
     add_test(NAME inspector_feedback_actions COMMAND inspector_feedback_test)
+    add_executable(capture_exclusion_test tests/capture_exclusion_test.mm)
+    target_compile_options(capture_exclusion_test PRIVATE -fobjc-arc)
+    target_link_libraries(capture_exclusion_test PRIVATE seethis_core "-framework AppKit")
+    add_test(NAME capture_window_exclusion COMMAND capture_exclusion_test)
+    add_executable(chrome_consent_async_test
+      tests/chrome_consent_async_test.mm
+      src/platform/mac/context_mac.mm
+      src/platform/mac/capture_mac.mm
+      src/platform/mac/clipboard_mac.mm)
+    target_compile_definitions(chrome_consent_async_test PRIVATE SEETHIS_CHROME_CONSENT_TESTING)
+    target_compile_options(chrome_consent_async_test PRIVATE -fobjc-arc)
+    target_link_libraries(chrome_consent_async_test PRIVATE seethis_service
+      "-framework AppKit" "-framework ApplicationServices" "-framework Carbon"
+      "-framework ScreenCaptureKit")
+    add_test(NAME chrome_consent_async COMMAND chrome_consent_async_test)
+    set_tests_properties(chrome_consent_async PROPERTIES TIMEOUT 30)
     add_executable(input_permission_test tests/input_permission_test.mm)
     target_link_libraries(input_permission_test PRIVATE seethis_core)
     add_test(NAME input_permission_states COMMAND input_permission_test)

@@ -72,6 +72,10 @@ AutomationCheck CheckChromeAutomation(std::int64_t browser_pid,bool ask) {
 }
 
 ChromeConnectionController connection;
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+std::optional<ChromeConnectionTestAdapters> test_adapters;
+#endif
+
 ChromeRunningTarget DiscoverRunningChrome() {
   NSArray<NSRunningApplication*>* apps=[NSRunningApplication
       runningApplicationsWithBundleIdentifier:@"com.google.Chrome"];
@@ -86,11 +90,18 @@ ChromeRunningTarget DiscoverRunningChrome() {
   return {candidate.processIdentifier,start.value_or(0)};
 }
 ChromeConnectionAdapters ConnectionAdapters() {
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+  if(test_adapters)return test_adapters->connection;
+#endif
   return {DiscoverRunningChrome,[](std::int64_t pid,bool ask) {
     return CheckChromeAutomation(pid,ask).permission;
   }};
 }
 ChromeProviderState ProbeChromeProvider(ChromeRunningTarget target) {
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+  if(test_adapters)return test_adapters->provider?test_adapters->provider(target):
+      ChromeProviderState::kFailed;
+#endif
   // This content-free check never supplies a mark's page identity. Only the
   // foreground acquisition below may bind window/tab/navigation identity.
   if(DiscoverRunningChrome()!=target)return ChromeProviderState::kFailed;
@@ -153,13 +164,76 @@ ChromeConnectionSnapshot RefreshChromeConnection() {
   connection.Refresh(ConnectionAdapters());return connection.snapshot();
 }
 ChromeConnectionSnapshot ChromeConnectionStatus() { return connection.snapshot(); }
-void ConnectChromeExplicit() {
-  connection.Connect(ConnectionAdapters());
-  const auto state=connection.snapshot();
-  os_log(OS_LOG_DEFAULT,"seethis chrome phase=connection action=explicit-connect pid=%{public}lld consent=%{public}s osstatus=%{public}d",
-      static_cast<long long>(state.target.pid),
-      std::string(ChromeConsentName(state.permission.consent)).c_str(),state.permission.os_status);
-  BeginConnectionProbe();
+void StartChromeConnection() { connection.Start(); }
+void StopChromeConnection() { connection.Stop(); }
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+void SetChromeConnectionTestAdapters(ChromeConnectionTestAdapters adapters) {
+  test_adapters=std::move(adapters);
+}
+#endif
+namespace {
+void BeginExplicitChromeConsent(std::optional<ChromeRunningTarget> required_target = {}) {
+  const auto adapters=ConnectionAdapters();
+  const auto request=connection.BeginConsent(adapters,required_target);
+  if(!request.valid()) {
+    // Already granted can probe; an unresolved OS request cannot start another.
+    if(!required_target || *required_target==connection.snapshot().target)
+      BeginConnectionProbe();
+    return;
+  }
+  static dispatch_queue_t consent_queue=dispatch_queue_create(
+      "local.seethis.chrome-consent",dispatch_queue_attr_make_with_qos_class(
+          DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
+  dispatch_async(consent_queue,^{
+    @autoreleasepool {
+      std::optional<ChromePermissionResult> result;
+      try {
+        // Chrome may have exited/relaunched while this request was queued.
+        // A stale PID must never trigger consent for its replacement process.
+        if(request.native_entry_allowed->load() && adapters.discover &&
+            adapters.discover()==request.target && request.native_entry_allowed->load())
+          result=adapters.permission(request.target.pid,true);
+      } catch(...) {
+        result=ChromePermissionResult{ChromeConsent::kUnknown,paramErr};
+      }
+      dispatch_async(dispatch_get_main_queue(),^{
+        connection.Refresh(ConnectionAdapters());
+        if(!connection.CompleteConsent(request,result))return;
+        const auto state=connection.snapshot();
+        os_log(OS_LOG_DEFAULT,"seethis chrome phase=connection action=explicit-connect pid=%{public}lld consent=%{public}s osstatus=%{public}d",
+            static_cast<long long>(state.target.pid),
+            std::string(ChromeConsentName(state.permission.consent)).c_str(),state.permission.os_status);
+        BeginConnectionProbe();
+      });
+    }
+  });
+}
+}  // namespace
+void ConnectChromeExplicit() { BeginExplicitChromeConsent(); }
+std::optional<ChromeRunningTarget> GetChromeCaptureConsentTarget() {
+  ChromeRunningTarget foreground;
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+  if(test_adapters) {
+    foreground=test_adapters->foreground_chrome?test_adapters->foreground_chrome():
+        ChromeRunningTarget{};
+  } else
+#endif
+  {
+    NSRunningApplication* app=NSWorkspace.sharedWorkspace.frontmostApplication;
+    if(![app.bundleIdentifier isEqualToString:@"com.google.Chrome"])return {};
+    foreground={app.processIdentifier,app.launchDate?
+        ChromeProcessStartIdentity(app.launchDate.timeIntervalSince1970).value_or(0):0};
+  }
+  if(foreground.pid<=0)return {};
+  // A foreground switch may have happened immediately before the physical press.
+  // Refresh live discovery/preflight rather than trusting a cached ready snapshot.
+  const auto state=RefreshChromeConnection();
+  if(state.target==foreground && state.permission.consent==ChromeConsent::kGranted &&
+      !state.consent_pending)return {};
+  return foreground;
+}
+void ConnectChromeForCaptureExplicit(ChromeRunningTarget foreground_target) {
+  if(foreground_target.valid())BeginExplicitChromeConsent(foreground_target);
 }
 void RetryChromeExplicit() {
   connection.Refresh(ConnectionAdapters());
@@ -323,11 +397,6 @@ bool ChromeAutomationPreflight(std::int64_t browser_pid) {
   // prompt-free. The user can grant SeeThis -> Google Chrome in System
   // Settings > Privacy & Security > Automation and retry the action.
   return CheckChromeAutomation(browser_pid,false).allowed;
-}
-bool RequestChromeAutomationPermission(std::int64_t browser_pid) {
-  // This function is reserved for an explicit user action in existing UI;
-  // no polling, startup path or automated test calls it.
-  return CheckChromeAutomation(browser_pid,true).allowed;
 }
 
 ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {

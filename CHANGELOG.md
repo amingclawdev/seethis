@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1-beta.1 — 2026-10-02
+
+- Request missing Chrome Automation from the configured physical capture shortcut while Chrome is foreground; keep consent work off the main UI thread and coalesce repeated holds.
+- Require release of the original capture key and a fresh gesture after consent; interrupted authorization holds do not create partial references.
+- Preserve explicit Connect Chrome and prompt-free retry/background observation, with stale target and lifecycle checks.
+- Exclude the current Inspector window as well as drawing panels from newly captured images, including when Inspector visibility changes.
+- Publish a fresh Release arm64/macOS 14.2+ build with internal version/build 0.1.1 and production Developer ID identity. Final notarization and checksum results accompany the release assets.
+
+The original demo and v0.1.0-beta.1 assets remain unchanged.
+
 ## v0.1.0-beta.1 — 2026-10-01
 
 First public prerelease for Apple Silicon / macOS 14.2+.

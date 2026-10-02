@@ -4,14 +4,15 @@ This path supports normal windows in the standalone **Google Chrome** app (`com.
 
 ## Automation and recovery
 
-1. Open a safe test page in standalone Chrome. Give Chrome a real foreground activation, for example by switching to another app and then back to Chrome.
-2. If SeeThis's Chrome Automation permission is missing or denied, Inspector shows a Chrome recovery section with **Connect Chrome**, **Retry Chrome** and **Automation Settings…**. It appears only when the current Chrome context needs permission recovery.
-3. Choose **Connect Chrome** to make an explicit Automation request. If macOS asks whether SeeThis may control Google Chrome, check the name and allow access. If access was denied, choose **Automation Settings…** to open **System Settings > Privacy & Security > Automation > SeeThis > Google Chrome**. Enable the switch yourself, then choose **Retry Chrome**.
-4. Return to the original Chrome test page, wait for page identity to be ready and capture with the configured shortcut. The recovery section disappears once permission is ready; a real capture is still needed to verify that marks work.
+1. Open a safe page in standalone Chrome and give Chrome a real foreground activation.
+2. When Chrome Automation is missing, press the configured physical capture shortcut (default **Option+A**). This explicit action requests consent asynchronously. The app’s main UI remains available while macOS decides whether to show a dialog.
+3. If macOS asks whether **SeeThis may control Google Chrome**, click **Allow**. Input Monitoring and Screen Recording are separate permissions; a screen/audio or bypass-window-picker notice is not the Chrome control dialog.
+4. Release the original capture key and modifiers completely, then use a **fresh capture gesture** on the safe page. Grant completion does not resume the interrupted hold or automatically create a reference. Repeats while the same key is held do not make additional requests.
+5. **Connect Chrome** remains an explicit recovery action in the menu and in Inspector when recovery is needed. **Retry Chrome** refreshes permission/page readiness without requesting consent. If access was denied, use **Automation Settings…** to open **System Settings > Privacy & Security > Automation > SeeThis > Google Chrome**, change the switch yourself, then retry. macOS policy may require this recovery instead of repeating a dialog.
 
-Starting in the background, merely opening Inspector, using a non-Chrome app or using already authorized Chrome does not trigger this recovery section. Background observation does not prompt for Automation. Opening system permission settings alone does not create a new request entry. If there is no entry, activate Chrome for real and then use Connect Chrome in the recovery section.
+Starting in the background, passive page observation, opening Inspector and using non-Chrome or already-authorized Chrome do not request Automation. Chrome targets are checked against their current process identity, so stale queued requests are abandoned after target replacement. Neither a browser extension nor Chrome’s “Allow JavaScript from Apple Events” setting is required.
 
-Denied/unavailable access, ambiguous page identity and a timeout are not success. That capture should not save a reference or copy a URL. Keep the correct standalone Chrome window in the foreground, check **Location:** for the authorized app copy, release the shortcut and retry. If the problem persists, quit duplicate copies, manually reopen the exact app and record the precise status. Neither a browser extension nor Chrome's “Allow JavaScript from Apple Events” setting is required.
+Denied/unavailable access, ambiguous page identity and a timeout are not success. That capture should not save a reference or copy a URL. Keep the correct standalone Chrome window in the foreground, check **Location:** for the authorized app copy, release the shortcut and retry. If the problem persists, quit duplicate copies, manually reopen the exact app and record the precise status.
 
 ## Page isolation
 

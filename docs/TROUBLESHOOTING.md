@@ -11,7 +11,7 @@ Open the SeeThis menu and check **App:** and **Location:** for the actual runnin
 | Link copied but no image | Wait for ready, then explicitly choose Copy marked image. Background completion does not change the clipboard. |
 | A remote chat cannot open the URL | Paste or attach the actual image. A same-Mac URL is not exposed remotely. |
 | Marks hide after switching Chrome tabs | Return to the original app/window/tab/page, wait for page observation and check Automation. |
-| Chrome has no permission entry or access is denied | Activate standalone Chrome for real, then choose Connect Chrome in the recovery section. Allow access in settings and choose Retry Chrome. See [Chrome](CHROME.md). |
+| Chrome has no permission entry or access is denied | Activate standalone Chrome and press the configured capture shortcut, or choose Connect Chrome for recovery. After Allow, release the original capture key and use a fresh gesture. If denied, allow access in Automation settings and choose Retry Chrome. See [Chrome](CHROME.md). |
 | View details or copying is unavailable | Check pending/failed/expired/deleted status. Wait or capture safe content again. |
 | Finder copy fails | Record the exact error and recheck the checksum. Try the same release's ZIP alternative. Final DMG drag installation has not been fully retested. |
 | macOS reports damage, malware or an unexpected identity | Stop running the app, check official asset checksums and the source, and report a safe reproduction. Do not disable system protections. |
