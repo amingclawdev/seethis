@@ -150,6 +150,15 @@ StoredReference MakeReference(ReferenceStore& store, const std::string& id,
        {1,CoordinateUnit::kLogicalPoints,{40,40},1}},
       {observed.utc_us+30,observed.monotonic_us+30});
   store.WaitForIdleForTesting();
+  if (marks.phase() != ReferencePhase::kCommitted) {
+    const auto job = store.LookupMetadata(id);
+    std::cerr << "Reference fixture failure: id=" << id << " age_seconds=" << age_seconds
+              << " now_monotonic_us=" << now.monotonic_us
+              << " observed_monotonic_us=" << observed.monotonic_us
+              << " phase=" << static_cast<int>(marks.phase()) << " status=" << marks.status()
+              << " job_state=" << (job ? static_cast<int>(job->state) : -1)
+              << " code=" << (job ? job->code : "missing") << '\n';
+  }
   Check(marks.phase() == ReferencePhase::kCommitted, "fixture commits");
   return *store.Lookup(id)->ready;
 }
