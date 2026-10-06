@@ -1,4 +1,7 @@
 #include "service/reference_server.h"
+#ifdef SEETHIS_COMPILED_SETTINGS_ASSETS
+#include "seethis/settings_assets.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -973,6 +976,7 @@ std::string Bearer(const Request& request) {
   return found->second.substr(7);
 }
 
+#ifndef SEETHIS_COMPILED_SETTINGS_ASSETS
 std::optional<std::string> ReadAsset(const std::filesystem::path& path) {
   try {
     if (!std::filesystem::is_regular_file(path) ||
@@ -986,6 +990,20 @@ std::optional<std::string> ReadAsset(const std::filesystem::path& path) {
   } catch (...) {
     return {};
   }
+}
+#endif
+
+std::optional<std::string> SettingsAsset(const std::filesystem::path& root,
+                                       bool javascript) {
+#ifdef SEETHIS_COMPILED_SETTINGS_ASSETS
+  (void)root;
+  using namespace settings_assets;
+  return javascript
+      ? std::string(reinterpret_cast<const char*>(kSettingsJSBytes), kSettingsJSLength)
+      : std::string(reinterpret_cast<const char*>(kIndexHTMLBytes), kIndexHTMLLength);
+#else
+  return ReadAsset(root / (javascript ? "settings.js" : "index.html"));
+#endif
 }
 
 }  // namespace
@@ -1178,7 +1196,7 @@ void ReferenceServer::Handle(int client) {
       Error(client, 405, "Method Not Allowed", "method_not_allowed");
       return;
     }
-    auto asset = ReadAsset(settings_web_root_ / "index.html");
+    auto asset = SettingsAsset(settings_web_root_, false);
     if (!asset) {
       Error(client, 503, "Service Unavailable", "settings_asset_unavailable");
       return;
@@ -1194,7 +1212,7 @@ void ReferenceServer::Handle(int client) {
       Error(client, 405, "Method Not Allowed", "method_not_allowed");
       return;
     }
-    auto asset = ReadAsset(settings_web_root_ / "settings.js");
+    auto asset = SettingsAsset(settings_web_root_, true);
     if (!asset) {
       Error(client, 503, "Service Unavailable", "settings_asset_unavailable");
       return;

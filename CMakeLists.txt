@@ -24,6 +24,25 @@ endif()
 
 project(seethis VERSION 0.1.1 LANGUAGES CXX)
 
+option(SEETHIS_APP_STORE "Build the separate sandboxed Mac App Store candidate" OFF)
+set(SEETHIS_STORE_BUNDLE_ID "" CACHE STRING "Registered Store bundle ID (must be supplied explicitly)")
+set(SEETHIS_STORE_VERSION "" CACHE STRING "Store marketing version (ASC sequence must be verified)")
+set(SEETHIS_STORE_BUILD "" CACHE STRING "Store build number (ASC sequence must be verified)")
+if(SEETHIS_APP_STORE)
+  if(NOT APPLE)
+    message(FATAL_ERROR "The App Store candidate requires macOS")
+  endif()
+  string(TOLOWER "${SEETHIS_STORE_BUNDLE_ID}" store_id_lower)
+  if(NOT SEETHIS_STORE_BUNDLE_ID MATCHES "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$" OR
+      store_id_lower MATCHES "sandbox|probe")
+    message(FATAL_ERROR "Supply a production Store bundle ID, never a sandbox/probe identity")
+  endif()
+  if(NOT SEETHIS_STORE_VERSION MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$" OR
+      NOT SEETHIS_STORE_BUILD MATCHES "^[0-9]+(\\.[0-9]+)?(\\.[0-9]+)?$")
+    message(FATAL_ERROR "Supply numeric Store marketing version and build number")
+  endif()
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -63,6 +82,11 @@ if(APPLE)
   target_include_directories(seethis_service PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(seethis_service PUBLIC seethis_core Threads::Threads)
   target_compile_features(seethis_service PUBLIC cxx_std_20)
+  if(SEETHIS_APP_STORE)
+    include(cmake/CompileSettingsAssets.cmake)
+    target_compile_definitions(seethis_service PUBLIC SEETHIS_COMPILED_SETTINGS_ASSETS=1)
+    target_include_directories(seethis_service PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  endif()
   add_executable(seethis MACOSX_BUNDLE
     src/main_mac.mm
     src/platform/mac/input_mac.mm
@@ -93,6 +117,16 @@ if(APPLE)
     XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
       "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/seethis.entitlements"
   )
+  if(SEETHIS_APP_STORE)
+    target_sources(seethis PRIVATE src/platform/mac/PrivacyInfo.xcprivacy)
+    set_source_files_properties(src/platform/mac/PrivacyInfo.xcprivacy
+      PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+    set_target_properties(seethis PROPERTIES
+      MACOSX_BUNDLE_GUI_IDENTIFIER "${SEETHIS_STORE_BUNDLE_ID}"
+      MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/Info-app-store.plist.in"
+      XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/seethis-app-store.entitlements"
+      XCODE_ATTRIBUTE_ENABLE_APP_SANDBOX YES)
+  endif()
 else()
   message(STATUS
     "SeeThis native app backend is unavailable on this platform; building the shared core only")
@@ -117,6 +151,13 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME reference_flow COMMAND reference_store_test)
   if(APPLE)
+    add_executable(privacy_action_test tests/privacy_action_test.mm)
+    target_compile_options(privacy_action_test PRIVATE -fobjc-arc)
+    target_link_libraries(privacy_action_test PRIVATE "-framework AppKit")
+    add_test(NAME privacy_policy_action COMMAND privacy_action_test)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME app_store_package_guards COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_store_package_test.py")
     add_executable(inspector_feedback_test tests/inspector_feedback_test.mm)
     target_compile_options(inspector_feedback_test PRIVATE -fobjc-arc)
     target_link_libraries(inspector_feedback_test PRIVATE seethis_core "-framework AppKit")
@@ -142,6 +183,11 @@ if(BUILD_TESTING)
     add_test(NAME input_permission_states COMMAND input_permission_test)
     add_executable(reference_server_test tests/reference_server_test.cc)
     target_link_libraries(reference_server_test PRIVATE seethis_service)
+    target_compile_definitions(reference_server_test PRIVATE
+      SEETHIS_TEST_SETTINGS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web/settings")
+    add_test(NAME settings_asset_generation COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_compile_settings_assets.py")
+    set_tests_properties(settings_asset_generation PROPERTIES TIMEOUT 180)
     add_test(NAME reference_server_security COMMAND reference_server_test)
   endif()
 endif()

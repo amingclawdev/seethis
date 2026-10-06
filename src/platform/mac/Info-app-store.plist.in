@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>SeeThis</string>
+<key>CFBundleName</key><string>SeeThis</string>
+<key>CFBundleExecutable</key><string>seethis</string>
+<key>CFBundleIconFile</key><string>SeeThis.icns</string>
+<key>CFBundleIdentifier</key><string>@SEETHIS_STORE_BUNDLE_ID@</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>@SEETHIS_STORE_VERSION@</string>
+<key>CFBundleVersion</key><string>@SEETHIS_STORE_BUILD@</string>
+<key>LSMinimumSystemVersion</key><string>14.2</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+<key>NSHumanReadableCopyright</key><string>Copyright © 2026 SeeThis contributors</string>
+<key>NSAppleEventsUsageDescription</key><string>With your permission, SeeThis reads the current Chrome tab to associate marks with their page.</string>
+</dict></plist>

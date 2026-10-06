@@ -1,3 +1,4 @@
+#import "privacy_action_mac.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
@@ -1078,6 +1079,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   std::unique_ptr<seethis::platform::InputAdapter> _input;
   std::shared_ptr<seethis::platform::PermissionReadinessState> _readiness;
   __strong NSStatusItem* _statusItem;
+  __strong STPrivacyPolicyAction* _privacyPolicyAction;
   __strong NSMenuItem* _startupStateItem;
   __strong NSMenuItem* _inputStateItem;
   __strong NSMenuItem* _screenStateItem;
@@ -1165,12 +1167,16 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       _statusItem!=nil,static_cast<double>(_statusItem.length),
       _statusItem.isVisible,_statusItem.button!=nil);
   NSMenu* menu=[NSMenu new];
+  _privacyPolicyAction=[[STPrivacyPolicyAction alloc] initWithOpener:^BOOL(NSURL* url) {
+    return [NSWorkspace.sharedWorkspace openURL:url];
+  }];
   _startupStateItem=[[NSMenuItem alloc] initWithTitle:@"SeeThis"
       action:nil keyEquivalent:@""];
   [menu addItem:_startupStateItem];
   NSMenuItem* entryItem=[[NSMenuItem alloc] initWithTitle:@"Show SeeThis…"
       action:@selector(showPermissionEntry:) keyEquivalent:@""];
   entryItem.target=self;[menu addItem:entryItem];
+  [menu addItem:[_privacyPolicyAction menuItem]];
   [menu addItem:NSMenuItem.separatorItem];
   _inputStateItem=[[NSMenuItem alloc] initWithTitle:@"Input Monitoring: checking…"
       action:nil keyEquivalent:@""];

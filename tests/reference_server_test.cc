@@ -821,10 +821,78 @@ void TestAnnotatedInterleaving() {
   run(reopened,true);
 }
 
+void TestSettingsAssets() {
+  TempDirectory temp;
+  const auto web=temp.path/"web";
+  std::filesystem::create_directories(web);
+  {std::ofstream(web/"index.html",std::ios::binary)<<"fixture html";}
+  {std::ofstream(web/"settings.js",std::ios::binary)<<"fixture js";}
+  ReferenceStore references(temp.path/"references");
+  SettingsStore settings(temp.path/"settings.json");
+  auto readiness=std::make_shared<seethis::platform::PermissionReadinessState>();
+  seethis::service::ReferenceServer server(references,settings,web,readiness);
+  Check(server.Start(),"focused settings server starts");
+#ifdef SEETHIS_COMPILED_SETTINGS_ASSETS
+  const auto html_bytes=FileBytes(std::filesystem::path(SEETHIS_TEST_SETTINGS_SOURCE_DIR)/"index.html");
+  const auto js_bytes=FileBytes(std::filesystem::path(SEETHIS_TEST_SETTINGS_SOURCE_DIR)/"settings.js");
+  const std::string html(html_bytes.begin(),html_bytes.end());
+  const std::string javascript(js_bytes.begin(),js_bytes.end());
+#else
+  const std::string html="fixture html", javascript="fixture js";
+#endif
+  auto response=Request(server.port(),Get("/settings/"));
+  Check(response.status==200&&response.body==html,"actual HTML route preserves exact bytes");
+  Check(Header(response,"Content-Type")=="text/html; charset=utf-8"&&
+      Header(response,"Content-Security-Policy").find("frame-ancestors 'none'")!=std::string::npos,
+      "HTML content type and CSP preserved");
+  Check(Request(server.port(),Get("/settings")).body==html,"existing HTML alias preserved");
+  response=Request(server.port(),Get("/settings/settings.js"));
+  Check(response.status==200&&response.body==javascript&&
+      Header(response,"Content-Type")=="text/javascript; charset=utf-8",
+      "actual JS route preserves exact bytes and type");
+  Check(response.bytes.find(server.settings_capability_for_testing())==std::string::npos,
+      "compiled or fixture assets do not embed settings capability");
+  Check(Request(server.port(),Get("/settings/index.html")).status==404,
+      "unknown settings filename does not become a file route");
+  Check(Request(server.port(),Get("/settings/../index.html")).status==400,
+      "traversal remains rejected");
+  Check(Request(server.port(),"POST /settings/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").status==405,
+      "settings route method guard preserved");
+  std::filesystem::remove(web/"index.html");
+#ifdef SEETHIS_COMPILED_SETTINGS_ASSETS
+  Check(Request(server.port(),Get("/settings/")).body==html,
+      "Store route ignores missing bundle disk asset without fallback");
+  Check(mkfifo((web/"index.html").c_str(),0600)==0,"fixture FIFO created");
+  Check(Request(server.port(),Get("/settings/")).body==html,
+      "Store route ignores nonregular disk asset without reading it");
+#else
+  Check(Request(server.port(),Get("/settings/")).status==503,"default missing asset rejected");
+  std::filesystem::create_directory(web/"index.html");
+  Check(Request(server.port(),Get("/settings/")).status==503,"default directory rejected");
+  std::filesystem::remove(web/"index.html");
+  Check(mkfifo((web/"index.html").c_str(),0600)==0,"fixture FIFO created");
+  Check(Request(server.port(),Get("/settings/")).status==503,"default FIFO rejected without blocking");
+  std::filesystem::remove(web/"index.html");
+  std::filesystem::create_symlink("/dev/null",web/"index.html");
+  Check(Request(server.port(),Get("/settings/")).status==503,"default device rejected without blocking");
+  std::filesystem::remove(web/"index.html");
+  const std::string boundary(256*1024,'x');
+  {std::ofstream(web/"index.html",std::ios::binary).write(boundary.data(),boundary.size());}
+  Check(Request(server.port(),Get("/settings/")).body==boundary,"default maximum size boundary accepted");
+  {std::ofstream(web/"index.html",std::ios::binary|std::ios::app)<<"x";}
+  Check(Request(server.port(),Get("/settings/")).status==503,"default oversized asset rejected");
+#endif
+  server.Stop();
+}
+
 }  // namespace
 
-int main() {
+int main(int argc,char** argv) {
   try {
+    TestSettingsAssets();
+    if(argc==2&&std::string_view(argv[1])=="--settings-assets-only") {
+      std::cout<<checks<<" focused settings HTTP checks passed\n";return 0;
+    }
     TestUrlOnlyControllerCompletion();
     TestChromeTransactionIdentityFreeze();
     TestAnnotatedInterleaving();

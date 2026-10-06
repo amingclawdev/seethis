@@ -50,6 +50,7 @@ See the guides for detailed instructions:
 - [Google Chrome and Automation](docs/CHROME.md)
 - [Recovery, manual updates, uninstalling and feedback](docs/TROUBLESHOOTING.md)
 - [Building and contributing](CONTRIBUTING.md)
+- [Building the sandboxed Mac App Store variant](docs/APP_STORE_BUILD.md)
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
 
