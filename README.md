@@ -2,6 +2,8 @@
 
 **Mark what you mean on your Mac, then share it with your assistant.**
 
+Website: **[seethis.dev](https://seethis.dev)**
+
 SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more areas of your screen. It copies a local reference immediately, and prepares a marked image you can paste into an AI conversation or any app that accepts images.
 
 ## Demo
