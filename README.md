@@ -16,7 +16,7 @@ A 76-second walkthrough of marking screen areas and sharing a visual reference.
 
 The GitHub release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
 
-Mac App Store review has been approved, and the release is being prepared. See [seethis.dev](https://seethis.dev) for current download channels and availability.
+Mac App Store review has been approved and the release has been submitted for distribution. See [seethis.dev](https://seethis.dev) for current download channels and availability.
 
 ## How it works
 
