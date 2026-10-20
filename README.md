@@ -12,9 +12,11 @@ https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba
 
 A 76-second walkthrough of marking screen areas and sharing a visual reference.
 
-**[Download v0.1.1-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
+**[Download GitHub beta v0.1.1-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
 
-The release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
+The GitHub release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
+
+Mac App Store review has been approved, and the release is being prepared. See [seethis.dev](https://seethis.dev) for current download channels and availability.
 
 ## How it works
 
@@ -27,6 +29,8 @@ The release app is Developer ID signed and Apple notarized. Choose the DMG or ZI
 Option+A and Option+D are the defaults. If you change them in Open Settings…, use the shortcuts shown in Inspector.
 
 ## Quick start
+
+These installation steps apply to the GitHub release.
 
 1. Download the DMG or ZIP and SHA256SUMS from the release page, and compare the downloaded file's SHA-256 with the published checksum. Put SeeThis.app in Applications and open it.
 2. Allow **Input Monitoring** and **Screen Recording** for that copy of SeeThis in System Settings → Privacy & Security. Use the menu's permission-settings shortcuts and Retry Input Monitoring as needed; quit and reopen the exact app if macOS requires it.
@@ -56,4 +60,4 @@ See the guides for detailed instructions:
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
 
-This beta is for Apple Silicon on macOS 14.2 or later. Intel builds, automatic updates and App Store distribution are not available. See the release notes for known verification limits.
+This GitHub beta is for Apple Silicon on macOS 14.2 or later. Intel builds are not available, and the GitHub app has no automatic updater. See the release notes for known verification limits.
