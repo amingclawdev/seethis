@@ -44,4 +44,4 @@ The sandboxed Mac App Store variant keeps its own container Application Support/
 
 Use the existing support email `z5866318@gmail.com` for deletion requests. For support cases opened after this policy is published, maintainers use support information only for help and product fixes, never advertising, model training or data brokering; they manually delete private email 90 days after case closure. Public technical issue/fix records may remain with personal-information removal requests. Provider backups/caches and third-party copies may persist. Historical practices and automatic cleanup are not claimed. See [privacy](../PRIVACY.md).
 
-The current GitHub release is v0.1.1-beta.1. Mac App Store review has been approved and the release has been submitted for distribution. See [seethis.dev](https://seethis.dev) for current download channels and availability.
+The current GitHub release is v0.1.1-beta.1. SeeThis 0.1.1 is now available on the [Mac App Store](https://apps.apple.com/us/app/seethis-visual-context/id6818581322). See [seethis.dev](https://seethis.dev) to choose between the Store release and the GitHub beta.

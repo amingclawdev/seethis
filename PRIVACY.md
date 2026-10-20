@@ -28,4 +28,4 @@ Public GitHub technical issue and fix records may be retained. You can request r
 
 The public [privacy policy](https://github.com/amingclawdev/seethis/blob/main/PRIVACY.md) applies to the documented support practices above. App versions that provide **Privacy Policy…** in the menu open this same page. App Store privacy-label declarations are separate from this policy.
 
-The current GitHub release is v0.1.1-beta.1. Mac App Store review has been approved and the release has been submitted for distribution. See [seethis.dev](https://seethis.dev) for current download channels and availability.
+The current GitHub release is v0.1.1-beta.1. SeeThis 0.1.1 is now available on the [Mac App Store](https://apps.apple.com/us/app/seethis-visual-context/id6818581322). See [seethis.dev](https://seethis.dev) to choose between the Store release and the GitHub beta.
