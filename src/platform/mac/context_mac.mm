@@ -4,6 +4,7 @@
 #import <os/log.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include "core/reference.h"
 #include "platform/platform.h"
@@ -11,6 +12,108 @@
 namespace seethis::platform {
 namespace {
 std::string String(NSString* s) {return s.UTF8String?s.UTF8String:"";}
+core::NativeWindowLifetimeTracker& WindowLifetimes() {
+  static core::NativeWindowLifetimeTracker tracker(String(NSUUID.UUID.UUIDString));
+  return tracker;
+}
+std::optional<std::vector<std::uint64_t>> ParseWindowInventory(NSArray* all,std::int64_t pid) {
+  if(!all || ![all isKindOfClass:NSArray.class])return std::nullopt;
+  std::vector<std::uint64_t> ids,seen;
+  for(id entry in all) {
+    if(![entry isKindOfClass:NSDictionary.class])return std::nullopt;
+    NSDictionary* info=entry;
+    id owner=info[(__bridge NSString*)kCGWindowOwnerPID];
+    id number=info[(__bridge NSString*)kCGWindowNumber];
+    if(![owner isKindOfClass:NSNumber.class] || ![number isKindOfClass:NSNumber.class] ||
+       [owner longLongValue]<=0 || [number longLongValue]<=0 ||
+       [owner doubleValue]!=[owner longLongValue] ||
+       [number doubleValue]!=[number longLongValue])return std::nullopt;
+    const auto identifier=[number unsignedLongLongValue];
+    if(std::find(seen.begin(),seen.end(),identifier)!=seen.end())return std::nullopt;
+    seen.push_back(identifier);
+    if([owner longLongValue]==pid)ids.push_back(identifier);
+  }
+  return ids;
+}
+core::NativeWindowIdentity NativeIdentity(NSRunningApplication* app,std::uint64_t window_id,NSArray* visible) {
+  const auto start=app.launchDate?
+      ChromeProcessStartIdentity(app.launchDate.timeIntervalSince1970).value_or(0):0;
+  // The complete CGWindow inventory includes minimized, hidden and other-Space
+  // windows. Onscreen-only absence is never lifecycle evidence. Nil, denied or
+  // unparseable results do not retire previously observed windows.
+  if(!app || !start || !ScreenRecordingReady())return {1,start,{},0};
+  NSArray* all=CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionAll,kCGNullWindowID));
+  const auto ids=ParseWindowInventory(all,app.processIdentifier);
+  const auto visible_ids=ParseWindowInventory(visible,app.processIdentifier);
+  if(!ids || !visible_ids || std::any_of(visible_ids->begin(),visible_ids->end(),
+      [&](const auto id){return std::find(ids->begin(),ids->end(),id)==ids->end();}))
+    return {1,start,{},0};
+  static std::uint64_t inventory_generation=0;
+  WindowLifetimes().Observe(app.processIdentifier,start,*ids,++inventory_generation);
+  return WindowLifetimes().Identity(app.processIdentifier,start,window_id);
+}
+bool StillForeground(NSRunningApplication* captured) {
+  NSRunningApplication* current=NSWorkspace.sharedWorkspace.frontmostApplication;
+  return current && captured && !captured.terminated &&
+      current.processIdentifier==captured.processIdentifier &&
+      String(current.bundleIdentifier)==String(captured.bundleIdentifier) &&
+      ((!current.launchDate && !captured.launchDate) ||
+       (current.launchDate && captured.launchDate &&
+        [current.launchDate isEqualToDate:captured.launchDate]));
+}
+// Read twice from the selected native ID, rather than an unrelated focused AX
+// title. A well-formed silently truncated CGWindowName cannot be detected by
+// this provider; completeness of that case remains unknown.
+std::pair<std::string,core::TitleEvidence> ObserveBoundTitle(NSDictionary* first,
+    std::int64_t pid,std::uint64_t identifier,NSArray* second) {
+  using A=core::TitleAvailability;
+  if(![first isKindOfClass:NSDictionary.class] || pid<=0 || !identifier ||
+     ![first[(__bridge NSString*)kCGWindowOwnerPID] isKindOfClass:NSNumber.class] ||
+     ![first[(__bridge NSString*)kCGWindowNumber] isKindOfClass:NSNumber.class] ||
+     [first[(__bridge NSString*)kCGWindowOwnerPID] longLongValue]!=pid ||
+     [first[(__bridge NSString*)kCGWindowNumber] unsignedLongLongValue]!=identifier)
+    return {{},{1,A::kInconsistent}};
+  const auto decode=[](id value)->std::optional<std::string> {
+    if(![value isKindOfClass:NSString.class])return {};
+    NSData* bytes=[value dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
+    if(!bytes)return {};
+    return std::string(static_cast<const char*>(bytes.bytes),bytes.length);
+  };
+  const auto title=decode(first[(__bridge NSString*)kCGWindowName]);
+  if(!title)return {{},{1,A::kUnavailable}};
+  if(!core::ValidSourceContextText(*title,1024))return {{},{1,A::kInvalidOrOverLimit}};
+  if(![second isKindOfClass:NSArray.class])return {{},{1,A::kUnavailable}};
+  NSDictionary* matched=nil;
+  for(id entry in second) {
+    if(![entry isKindOfClass:NSDictionary.class])return {{},{1,A::kInconsistent}};
+    NSDictionary* info=entry;
+    if(
+      [info[(__bridge NSString*)kCGWindowNumber] unsignedLongLongValue]==identifier) {
+    if(matched)return {{},{1,A::kAmbiguous}};
+    matched=info;
+    }
+  }
+  if(!matched)return {{},{1,A::kUnavailable}};
+  if([matched[(__bridge NSString*)kCGWindowOwnerPID] longLongValue]!=pid ||
+     ![matched[(__bridge NSString*)kCGWindowBounds] isEqual:
+         first[(__bridge NSString*)kCGWindowBounds]])return {{},{1,A::kInconsistent}};
+  CGRect frame;
+  id bounds=first[(__bridge NSString*)kCGWindowBounds];
+  if(![bounds isKindOfClass:NSDictionary.class] ||
+     !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds,&frame) ||
+     !std::isfinite(frame.origin.x) || !std::isfinite(frame.origin.y) ||
+     !std::isfinite(frame.size.width) || !std::isfinite(frame.size.height) ||
+     frame.size.width<=0 || frame.size.height<=0)return {{},{1,A::kInconsistent}};
+  const auto confirmed=decode(matched[(__bridge NSString*)kCGWindowName]);
+  if(!confirmed || *confirmed!=*title)return {{},{1,A::kInconsistent}};
+  return {*title,{1,A::kReady}};
+}
+std::pair<std::string,core::TitleEvidence> ObserveBoundTitle(NSDictionary* first,
+    std::int64_t pid,std::uint64_t identifier) {
+  NSArray* second=CFBridgingRelease(CGWindowListCopyWindowInfo(
+      kCGWindowListOptionIncludingWindow,static_cast<CGWindowID>(identifier)));
+  return ObserveBoundTitle(first,pid,identifier,second);
+}
 double PrimaryTop() {
   return NSScreen.screens.count == 0 ? 0.0 :
       NSMaxY(NSScreen.screens.firstObject.frame);
@@ -253,6 +356,17 @@ void PublishChromeObservation(std::int64_t pid,bool active,core::PageAvailabilit
   connection.Observe(pid,active,page,provider_result);
 }
 
+#if defined(SEETHIS_CAPTURE_TESTING)
+std::pair<std::string,core::TitleEvidence> ObserveBoundTitleForTest(
+    CFDictionaryRef first,CFArrayRef second,std::int64_t pid,std::uint64_t identifier) {
+  return ObserveBoundTitle((__bridge NSDictionary*)first,pid,identifier,(__bridge NSArray*)second);
+}
+std::optional<std::vector<std::uint64_t>> ParseNativeWindowInventoryForTest(
+    CFArrayRef inventory,std::int64_t pid) {
+  return ParseWindowInventory((__bridge NSArray*)inventory,pid);
+}
+#endif
+
 std::vector<core::FrozenDisplay> SnapshotDisplays() {
   std::vector<core::FrozenDisplay> displays;
   for(NSScreen* screen in NSScreen.screens) {
@@ -273,6 +387,7 @@ std::optional<core::Context> SnapshotContext(core::DisplayPoint initial,
   // First Refresh calls here synchronously, before stroke rendering/pointer capture.
   NSRunningApplication* app=NSWorkspace.sharedWorkspace.frontmostApplication;
   core::Context context;context.observed=core::Now();
+  context.title={1,core::TitleAvailability::kUnavailable};
   context.pid=app.processIdentifier;context.self_pid=NSProcessInfo.processInfo.processIdentifier;
   context.app_name=String(app.localizedName);context.bundle_id=String(app.bundleIdentifier);
   context.executable=String(app.executableURL.path);context.displays=SnapshotDisplays();
@@ -297,23 +412,70 @@ std::optional<core::Context> SnapshotContext(core::DisplayPoint initial,
        !CGRectContainsPoint(frame,point) || frame.size.width<=0 || frame.size.height<=0)continue;
     context.window_id=[info[(__bridge NSString*)kCGWindowNumber] unsignedLongLongValue];
     context.window_pid=context.pid;context.window_layer=0;
-    context.window_title=context.bundle_id=="com.google.Chrome"?"":
-        String(info[(__bridge NSString*)kCGWindowName]);
+    if(context.bundle_id=="com.google.Chrome")context.title={};
+    else {
+      const auto title=ObserveBoundTitle(info,context.pid,context.window_id);
+      context.window_title=title.first;context.title=title.second;
+    }
     context.window={frame.origin.x,primaryTop-CGRectGetMaxY(frame),frame.size.width,frame.size.height};
     context.selection_method="frontmost-pid/topmost-normal-containing-initial-point";
+    context.native_window=NativeIdentity(app,context.window_id,windows);
+    if(!StillForeground(app)){error="Foreground application changed during context capture";return {};}
     return context;
   }
   error="No eligible foreground window contains the starting point";return {};
 }
 
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
+core::WindowObservation ObserveOwnUIPresentationSource(
+    const core::Context& source,std::uint64_t generation) {
+  core::WindowObservation unavailable;unavailable.generation=generation;unavailable.observed=core::Now();
+  const auto front=NSWorkspace.sharedWorkspace.frontmostApplication;
+  if(!front||front.processIdentifier!=NSProcessInfo.processInfo.processIdentifier||
+     !ScreenRecordingReady()||source.native_window.version!=1||
+     !core::DisplayTopologyMatches(source.displays,SnapshotDisplays()))return unavailable;
+  const auto app=[NSRunningApplication runningApplicationWithProcessIdentifier:static_cast<pid_t>(source.pid)];
+  if(!app||app.terminated||String(app.bundleIdentifier)!=source.bundle_id)return unavailable;
+  NSArray* windows=CFBridgingRelease(CGWindowListCopyWindowInfo(
+      kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements,kCGNullWindowID));
+  if(!ParseWindowInventory(windows,source.pid))return unavailable;
+  NSDictionary* matched=nil;
+  for(NSDictionary* info in windows) {
+    if([info[(__bridge NSString*)kCGWindowNumber] unsignedLongLongValue]!=source.window_id)continue;
+    if(matched||[info[(__bridge NSString*)kCGWindowOwnerPID] longLongValue]!=source.pid||
+       [info[(__bridge NSString*)kCGWindowLayer] intValue]!=0||
+       [info[(__bridge NSString*)kCGWindowAlpha] doubleValue]<=0)return unavailable;
+    matched=info;
+  }
+  if(!matched)return unavailable;
+  CGRect frame;
+  if(!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)matched[(__bridge NSString*)kCGWindowBounds],&frame))return unavailable;
+  core::WindowObservation observation;
+  observation.availability=core::WindowAvailability::kReady;observation.generation=generation;
+  observation.pid=source.pid;observation.bundle_id=source.bundle_id;observation.window_id=source.window_id;
+  observation.bounds={frame.origin.x,PrimaryTop()-CGRectGetMaxY(frame),frame.size.width,frame.size.height};
+  observation.native_window=NativeIdentity(app,source.window_id,windows);
+  if(source.bundle_id!="com.google.Chrome") {
+    const auto title=ObserveBoundTitle(matched,source.pid,source.window_id);
+    observation.window_title=title.first;observation.title=title.second;
+  }
+  observation.observed=core::Now();
+  if(!StillForeground(front)||!core::WindowObservationMatchesContext(source,observation)||
+     observation.native_window.observation_session!=source.native_window.observation_session||
+     observation.native_window.incarnation!=source.native_window.incarnation||
+     (source.bundle_id!="com.google.Chrome"&&!core::TitleContextVisible(source,observation)))return unavailable;
+  return observation;
+}
 core::WindowObservation ObserveForegroundWindow(std::uint64_t generation) {
   core::WindowObservation observation;
   observation.generation=generation;observation.observed=core::Now();
   NSRunningApplication* app=NSWorkspace.sharedWorkspace.frontmostApplication;
   const auto self_pid=NSProcessInfo.processInfo.processIdentifier;
   if(!app || app.processIdentifier<=0 || app.processIdentifier==self_pid ||
-     !ScreenRecordingReady())return observation;
+     !ScreenRecordingReady()) {
+    if(app && !ScreenRecordingReady())observation.title.availability=core::TitleAvailability::kDenied;
+    return observation;
+  }
   NSArray* windows=CFBridgingRelease(CGWindowListCopyWindowInfo(
       kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements,
       kCGNullWindowID));
@@ -332,10 +494,21 @@ core::WindowObservation ObserveForegroundWindow(std::uint64_t generation) {
     observation.bundle_id=String(app.bundleIdentifier);
     observation.window_id=
         [info[(__bridge NSString*)kCGWindowNumber] unsignedLongLongValue];
+    observation.native_window=NativeIdentity(app,observation.window_id,windows);
+    if(observation.bundle_id!="com.google.Chrome") {
+      const auto title=ObserveBoundTitle(info,observation.pid,observation.window_id);
+      observation.window_title=title.first;observation.title=title.second;
+    }
     observation.bounds={frame.origin.x,
       primary_top-CGRectGetMaxY(frame),frame.size.width,frame.size.height};
+    if(!StillForeground(app)) {
+      core::WindowObservation unavailable;unavailable.generation=generation;
+      unavailable.observed=core::Now();return unavailable;
+    }
     return observation;
   }
+  // A valid full inventory can observe disappearance even with no normal window.
+  (void)NativeIdentity(app,0,windows);
   return observation;
 }
 #endif
@@ -369,6 +542,8 @@ void AcquireChromePageAsync(ChromePageAcquire acquire,
     observation.observed=core::Now();observation.availability=sample.availability;
     if(sample.availability==core::PageAvailability::kReady) {
       observation.identity=MakeChromePageIdentity(sample);
+      if(observation.identity)
+        observation.captured_page=MakeChromeCapturedPageMetadata(sample,observation.observed);
       if(!observation.identity) {
         observation.availability=core::PageAvailability::kUnavailable;
         os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_INFO,
@@ -399,7 +574,7 @@ bool ChromeAutomationPreflight(std::int64_t browser_pid) {
   return CheckChromeAutomation(browser_pid,false).allowed;
 }
 
-ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {
+static ChromePageSample AcquireChromePage(const core::Context& captured,bool own_ui) {
   ChromePageSample unavailable;unavailable.browser_pid=captured.pid;
   unavailable.window_id=captured.window_id;unavailable.window_bounds=captured.window;
   unavailable.availability=core::PageAvailability::kUnavailable;
@@ -415,8 +590,10 @@ ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {
     unavailable.availability=permission.failure;return unavailable;
   }
   NSRunningApplication* foreground=NSWorkspace.sharedWorkspace.frontmostApplication;
-  if(!foreground || foreground.processIdentifier!=captured.window_pid ||
-     ![foreground.bundleIdentifier isEqualToString:@"com.google.Chrome"]) {
+  if(!foreground || (own_ui?
+      foreground.processIdentifier!=NSProcessInfo.processInfo.processIdentifier:
+      (foreground.processIdentifier!=captured.window_pid ||
+       ![foreground.bundleIdentifier isEqualToString:@"com.google.Chrome"]))) {
     os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_INFO,
         "seethis chrome phase=target-validation cause=foreground-mismatch pid=%{public}lld window=%{public}llu",
         static_cast<long long>(captured.pid),
@@ -511,6 +688,8 @@ ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {
         static_cast<long long>(captured.pid));
     return unavailable;
   }
+  if(!StillForeground(foreground)||!CheckChromeAutomation(captured.pid,false).allowed||
+     (own_ui&&*start_identity!=captured.native_window.process_start_identity_us))return unavailable;
   ChromePageSample ready;ready.availability=core::PageAvailability::kReady;
   ready.browser_pid=captured.pid;ready.window_id=correlated->window_id;
   ready.window_bounds=correlated->bounds;
@@ -520,7 +699,13 @@ ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {
   return ready;
 }
 
+ChromePageSample AcquireCurrentChromePage(const core::Context& captured) {
+  return AcquireChromePage(captured,false);
+}
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
+ChromePageSample AcquireOwnUIPresentationChromePage(const core::Context& source) {
+  return AcquireChromePage(source,true);
+}
 ChromePageSample AcquireCurrentChromePage(
     const core::WindowObservation& foreground) {
   core::Context context;

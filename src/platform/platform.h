@@ -49,6 +49,14 @@ enum class ScreenRecordingState {
   kReady,
 };
 
+// This records the nonprompting system permission preflight independently of
+// the event tap. A granted permission does not imply that a tap is healthy.
+enum class InputMonitoringPermissionState {
+  kUnknown,
+  kDenied,
+  kGranted,
+};
+
 enum class DeleteShortcutState {
   kUnknown,
   kInputUnavailable,
@@ -247,14 +255,49 @@ class InputReadinessLatch {
   return state == ScreenRecordingState::kReady;
 }
 
+[[nodiscard]] constexpr bool BasePermissionReady(
+    InputMonitoringPermissionState input, ScreenRecordingState screen) {
+  return input == InputMonitoringPermissionState::kGranted &&
+         ScreenRecordingReady(screen);
+}
+
+[[nodiscard]] constexpr std::string_view InputMonitoringPermissionStateName(
+    InputMonitoringPermissionState state) {
+  switch (state) {
+    case InputMonitoringPermissionState::kUnknown: return "unknown";
+    case InputMonitoringPermissionState::kDenied: return "denied";
+    case InputMonitoringPermissionState::kGranted: return "granted";
+  }
+  return "unknown";
+}
+
+// This is an optional, prompt-free menu observation. Automation consent alone
+// does not verify the current page or provider identity.
+enum class ChromeCompactStatus {
+  kUnchecked,
+  kNotRunning,
+  kAutomationUnavailable,
+  kAutomationAllowedPageUnchecked,
+  kReady,
+};
+
+[[nodiscard]] constexpr std::string_view ChromeCompactStatusLabel(
+    ChromeCompactStatus status) {
+  switch (status) {
+    case ChromeCompactStatus::kReady: return "Chrome — Ready";
+    case ChromeCompactStatus::kUnchecked:
+    case ChromeCompactStatus::kNotRunning:
+    case ChromeCompactStatus::kAutomationUnavailable:
+    case ChromeCompactStatus::kAutomationAllowedPageUnchecked:
+      return "Chrome — Not ready";
+  }
+  return "Chrome — Not ready";
+}
+
 [[nodiscard]] constexpr std::string_view PermissionStartupStatus(
-    InputMonitorState input, ScreenRecordingState screen) {
-  const bool input_ready = InputMonitorReady(input);
-  const bool screen_ready = ScreenRecordingReady(screen);
-  if (input_ready && screen_ready) return "SeeThis";
-  if (!input_ready && !screen_ready) return "SeeThis — permissions not ready";
-  if (!input_ready) return "SeeThis — Input Monitoring not ready";
-  return "SeeThis — Screen Recording not ready";
+    InputMonitoringPermissionState input, ScreenRecordingState screen) {
+  return BasePermissionReady(input, screen) ? "SeeThis — Ready"
+                                            : "SeeThis — Not ready";
 }
 
 enum class PermissionEntryTrigger {
@@ -266,11 +309,11 @@ enum class PermissionEntryTrigger {
 // Permission polling must never reopen a dismissed entry window. Opening the
 // app again is an explicit request even when capture permissions are ready.
 [[nodiscard]] constexpr bool PermissionEntryShouldPresent(
-    PermissionEntryTrigger trigger, InputMonitorState input,
+    PermissionEntryTrigger trigger, InputMonitoringPermissionState input,
     ScreenRecordingState screen) {
   if (trigger == PermissionEntryTrigger::kExplicitOpen) return true;
   if (trigger == PermissionEntryTrigger::kPermissionRefresh) return false;
-  return !InputMonitorReady(input) || !ScreenRecordingReady(screen);
+  return !BasePermissionReady(input, screen);
 }
 
 [[nodiscard]] constexpr std::string_view InputMonitorStateName(
@@ -412,6 +455,8 @@ class EffectiveShortcutPublication {
 EffectiveShortcutSnapshot InputShortcutStatus();
 
 struct PermissionReadinessState {
+  std::atomic<InputMonitoringPermissionState> input_monitor_permission{
+      InputMonitoringPermissionState::kUnknown};
   std::atomic<InputMonitorState> input_monitor{InputMonitorState::kUnknown};
   std::atomic<ScreenRecordingState> screen_recording{
       ScreenRecordingState::kUnknown};
@@ -545,6 +590,23 @@ struct InspectorLifecycleState {
   std::string selected_id;
   std::uint64_t selection_generation = 0;
 };
+
+// Session-only ownership. Selection/editor/presentation state cannot enable it.
+struct AppendCaptureMode {
+  std::string root;
+  std::uint64_t generation=0;
+  [[nodiscard]] bool enabled() const {return !root.empty();}
+  bool Enable(std::string reference,bool ready) {
+    if(!ready||reference.empty())return false;
+    root=std::move(reference);++generation;return true;
+  }
+  void Disable() {if(enabled()){root.clear();++generation;}}
+  void ReferenceSelected(std::string_view selected) {if(enabled()&&root!=selected)Disable();}
+};
+inline void CancelCaptureAttempt(core::InteractionController& interaction,
+    core::MarkController& marks,std::string reason) {
+  (void)interaction.Cancel(core::CancelReason::kUser);marks.Abort(std::move(reason));
+}
 
 // The native panel calls this same reducer for selection, close, background
 // completion, and explicit reopen. It keeps hidden suppression and historical
@@ -839,10 +901,179 @@ void CopyAnnotatedPng(std::shared_ptr<const core::Bytes> png,
   return {};
 }
 
+// Passive input observations provide continuity only for events we actually see.
+enum class ViewportInput { kHealthy, kInterrupted, kScroll, kPointer, kKeyboard, kPrimaryDown };
+// Tracks the physical release tail independently of the drawing state. Carbon
+// may finish the transaction before the listen-only tap sees either release.
+class CaptureReleaseContinuity {
+ public:
+  void Begin(std::uint64_t modifiers) {active_=true;key_pending_=true;required_=last_=modifiers;}
+  bool Observe(bool capture_key,bool key_up,bool flags_changed,std::uint64_t modifiers) {
+    if(!active_)return false;
+    if(flags_changed) {
+      if((modifiers&~last_)!=0){active_=false;return false;}
+      last_=modifiers;
+      if(!key_pending_&&last_==0)active_=false;
+      return true;
+    }
+    if(capture_key&&key_up&&key_pending_) {
+      key_pending_=false;
+      if(modifiers==0)active_=false;
+      return true;
+    }
+    if(capture_key&&!key_up&&key_pending_&&modifiers==required_)return true;
+    active_=false;return false;
+  }
+ private:
+  bool active_=false,key_pending_=false;
+  std::uint64_t required_=0,last_=0;
+};
+struct CapturePrefixReadiness {
+  bool running=false,settings_usable=false,registered=false,handler_ready=false;
+  bool monitor_ready=false,screen_ready=false,shortcut_ready=false,conflict=false,secure_input=false;
+  bool native_binding_matches=false,pending=false;
+  std::uint16_t configured_key=0,registered_key=0;
+  std::uint32_t configured_modifiers=0,registered_modifiers=0;
+  std::uint64_t registration_generation=0,prefix_generation=0;
+};
+[[nodiscard]] inline bool CapturePrefixReady(const CapturePrefixReadiness& state) {
+  return state.running&&state.settings_usable&&state.registered&&state.handler_ready&&
+      state.monitor_ready&&state.screen_ready&&state.shortcut_ready&&!state.conflict&&!state.secure_input&&
+      state.native_binding_matches&&state.configured_key==state.registered_key&&
+      state.configured_modifiers==state.registered_modifiers&&state.registration_generation!=0&&
+      (!state.pending||state.prefix_generation==state.registration_generation);
+}
+class CapturePrefixReadinessLatch {
+ public:
+  // The caller publishes epoch invalidation immediately on loss, without waiting
+  // for another input or the presentation deadline.
+  bool Observe(bool ready,bool pending) {
+    const bool retire=!ready&&(ready_||pending);ready_=ready;return retire;
+  }
+ private:
+  bool ready_=false;
+};
+enum class CapturePrefixAction { kNone,kStarted,kPending,kConfirmed,kRetired };
+// This deadline controls presentation carry only, never physical hotkey entry.
+class CapturePrefixContinuity {
+ public:
+  static constexpr std::int64_t kDeadlineMs=500;
+  CapturePrefixAction Modifiers(std::uint64_t modifiers,std::uint64_t required,std::int64_t now,
+      bool ready=true) {
+    if(!ready)return Retire();
+    if(pending_) {
+      if(now<began_||now-began_>=kDeadlineMs||required!=required_||
+         modifiers==0||(modifiers&~required_)!=0||(modifiers&last_)!=last_)return Retire();
+      last_=modifiers;return CapturePrefixAction::kPending;
+    }
+    if(modifiers==0){blocked_=false;return CapturePrefixAction::kNone;}
+    if(blocked_||required==0||(modifiers&~required)!=0)return CapturePrefixAction::kNone;
+    pending_=true;required_=required;last_=modifiers;began_=now;return CapturePrefixAction::kStarted;
+  }
+  CapturePrefixAction Confirm(std::int64_t now) {
+    if(!pending_)return CapturePrefixAction::kNone;
+    if(now<began_||now-began_>=kDeadlineMs)return Retire();
+    pending_=false;blocked_=true;return CapturePrefixAction::kConfirmed;
+  }
+  CapturePrefixAction Tick(std::int64_t now) {
+    return pending_&&(now<began_||now-began_>=kDeadlineMs)?Retire():CapturePrefixAction::kNone;
+  }
+  CapturePrefixAction Retire() {
+    const bool active=pending_;pending_=false;blocked_=true;
+    return active?CapturePrefixAction::kRetired:CapturePrefixAction::kNone;
+  }
+  void Released(std::uint64_t modifiers) {if(!pending_&&modifiers==0)blocked_=false;}
+  [[nodiscard]] bool PhysicalModifiersValid(std::uint64_t modifiers) const {
+    return pending_&&modifiers!=0&&(modifiers&~required_)==0&&(modifiers&last_)==last_;
+  }
+  [[nodiscard]] bool pending() const {return pending_;}
+ private:
+  bool pending_=false,blocked_=false;
+  std::uint64_t required_=0,last_=0;
+  std::int64_t began_=0;
+};
+// Source-bound passive ingress: native callbacks and the owned component
+// selector execute this same readiness/order/action composition.
+class CapturePrefixIngress {
+ public:
+  struct Actions {
+    std::function<bool()> begin;
+    std::function<void()> confirm,cancel,retire_epoch,started;
+  };
+  void SetActions(Actions actions) {actions_=std::move(actions);}
+  bool Readiness(CapturePrefixReadiness state) {
+    state.pending=prefix_.pending();state.prefix_generation=generation_;
+    const bool ready=CapturePrefixReady(state);
+    if(readiness_.Observe(ready,state.pending)) {
+      Invalidate();if(actions_.retire_epoch)actions_.retire_epoch();
+    }
+    return ready;
+  }
+  void LoseReadiness() {
+    const bool retire=readiness_.Observe(false,prefix_.pending());
+    Invalidate();if(retire&&actions_.retire_epoch)actions_.retire_epoch();
+  }
+  bool ModifierEvent(CapturePrefixReadiness state,std::uint64_t modifiers,
+      std::uint64_t required,std::int64_t now) {
+    const bool ready=Readiness(state);
+    const auto action=prefix_.Modifiers(modifiers,required,now,ready);
+    if(action==CapturePrefixAction::kStarted) {
+      generation_=state.registration_generation;
+      if(actions_.begin&&actions_.begin()) {
+        if(actions_.started)actions_.started();return true;
+      }
+      Invalidate();return false;
+    }
+    if(action==CapturePrefixAction::kRetired&&actions_.cancel)actions_.cancel();
+    return action==CapturePrefixAction::kPending;
+  }
+  void Confirm(CapturePrefixReadiness state,std::int64_t now) {
+    if(!Readiness(state))return;
+    const auto action=prefix_.Confirm(now);
+    if(action==CapturePrefixAction::kConfirmed&&actions_.confirm)actions_.confirm();
+    else if(action==CapturePrefixAction::kRetired&&actions_.cancel)actions_.cancel();
+  }
+  void Invalidate() {
+    if(prefix_.Retire()==CapturePrefixAction::kRetired&&actions_.cancel)actions_.cancel();
+  }
+  void Tick(std::int64_t now) {
+    if(prefix_.Tick(now)==CapturePrefixAction::kRetired&&actions_.cancel)actions_.cancel();
+  }
+  void Released(std::uint64_t modifiers) {prefix_.Released(modifiers);}
+  [[nodiscard]] bool pending() const {return prefix_.pending();}
+  [[nodiscard]] bool PhysicalModifiersValid(std::uint64_t modifiers) const {return prefix_.PhysicalModifiersValid(modifiers);}
+ private:
+  CapturePrefixContinuity prefix_;
+  CapturePrefixReadinessLatch readiness_;
+  std::uint64_t generation_=0;
+  Actions actions_;
+};
+class ViewportContinuity {
+ public:
+  void Observe(ViewportInput event,bool positively_owned=false) {
+    if(event==ViewportInput::kHealthy){healthy_=true;return;}
+    if(event==ViewportInput::kInterrupted){healthy_=false;++epoch_;return;}
+    if(!positively_owned)++epoch_;
+  }
+  [[nodiscard]] std::uint64_t epoch() const {return epoch_;}
+  [[nodiscard]] bool healthy() const {return healthy_;}
+ private:
+  std::uint64_t epoch_=1;bool healthy_=false;
+};
+inline core::MarkNotesSnapshot MarksForShot(core::MarkNotesSnapshot snapshot,
+                                           std::string_view shot) {
+  std::erase_if(snapshot.marks,[&](const auto& mark){return mark.shot_id!=shot;});
+  return snapshot;
+}
 class OverlayAdapter {
  public:
   virtual ~OverlayAdapter() = default;
 
+  virtual bool BeginCapturePrefix() {return false;}
+  virtual void ConfirmCapturePrefix() {}
+  virtual void CancelCapturePrefix() {}
+  virtual void ObserveViewportInput(ViewportInput,
+      const std::optional<core::DisplayPoint>& = {}) {}
   virtual void Refresh() = 0;
   virtual void RebuildDisplays() = 0;
   virtual void UpdatePointerPolicy(
@@ -893,7 +1124,7 @@ struct ChromePageSample {
   core::Rect window_bounds;
   std::int64_t process_start_identity_us = 0;
   std::string opaque_tab_id;
-  // Ephemeral input only. It is immediately reduced to navigation_digest.
+  // Provider input: identity uses its digest; bounded display metadata is separate.
   std::string url;
 };
 inline std::optional<std::int64_t> ChromeProcessStartIdentity(
@@ -934,6 +1165,17 @@ inline std::optional<core::PageIdentity> MakeChromePageIdentity(
   identity.navigation_digest=ChromeNavigationDigest(sample.url);
   if (!core::ValidPageIdentity(identity)) return {};
   return identity;
+}
+inline core::CapturedPageMetadata MakeChromeCapturedPageMetadata(
+    const ChromePageSample& sample, core::Stamp observed) {
+  core::CapturedPageMetadata metadata;
+  metadata.availability = core::SourceFieldAvailability::kInvalidOrOverLimit;
+  if (core::ValidSourceContextText(sample.url, 16384) && observed.utc_us > 0) {
+    metadata.url = sample.url;
+    metadata.availability = core::SourceFieldAvailability::kCaptured;
+    metadata.observed_utc_us = observed.utc_us;
+  }
+  return metadata;
 }
 inline bool ChromeWindowMatches(const core::Context& captured,
                                 const ChromeWindowCandidate& candidate) {
@@ -998,7 +1240,7 @@ class ChromeObservationLifecycle {
 };
 
 // Implemented by the macOS adapter with bounded background dispatch. The
-// callback is delivered on the main thread and receives no raw URL/title.
+// callback is delivered on the main thread with separate bounded URL metadata.
 void AcquireChromePageAsync(ChromePageAcquire acquire,
                             std::uint64_t generation,
                             ChromePageCompletion completion);
@@ -1273,6 +1515,11 @@ void PublishChromeObservation(std::int64_t pid, bool active,
 ChromePageSample AcquireCurrentChromePage(const core::Context& captured);
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
 core::WindowObservation ObserveForegroundWindow(std::uint64_t generation);
+// Presentation-only exact original-source observation. Caller proves positive
+// own Inspector/note ownership at request and completion; never a capture API.
+core::WindowObservation ObserveOwnUIPresentationSource(
+    const core::Context& source,std::uint64_t generation);
+ChromePageSample AcquireOwnUIPresentationChromePage(const core::Context& source);
 ChromePageSample AcquireCurrentChromePage(
     const core::WindowObservation& foreground);
 #endif

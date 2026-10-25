@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-script="$root/scripts/package_macos.sh"
+script=${SEETHIS_PACKAGE_SCRIPT_OVERRIDE:-$root/scripts/package_macos.sh}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/seethis-package-test.XXXXXX")
 tmp=$(cd "$tmp" && pwd -P)
 trap 'rm -rf "$tmp"' EXIT
@@ -38,6 +38,20 @@ measurement_selected() {
 }
 case " $* " in
   *" --verify "*)
+    if [[ "$last" == '/Library/Apple/System/Library/CoreServices/XProtect.app' &&
+          -n "${MOCK_XPROTECT_STATIC_ERROR:-}" ]]; then
+      [[ -z "${MOCK_XPROTECT_VERIFY_LOG:-}" ]] || printf '%s\n' "$last" >>"$MOCK_XPROTECT_VERIFY_LOG"
+      case "$MOCK_XPROTECT_STATIC_ERROR" in
+        obsolete) printf '%s: resource envelope is obsolete (custom omit rules)\n' "$last" >&2 ;;
+        other) printf '%s: code object is not signed at all\n' "$last" >&2 ;;
+        malformed) printf 'resource envelope is obsolete (custom omit rules)\n' >&2 ;;
+      esac
+      exit 1
+    fi
+    if [[ "${MOCK_FORGED_XPROTECT_STATIC_ERROR:-0}" == 1 && "$last" == *'/XProtect.app' ]]; then
+      printf '%s: resource envelope is obsolete (custom omit rules)\n' "$last" >&2
+      exit 1
+    fi
     if [[ -f "$last/.mock-signed" && ! -f "$last/.mock-invalid" ]]; then exit 0; fi
     [[ -f "$last.mock-signed" && ! -f "$last.mock-invalid" ]]
     ;;
@@ -124,8 +138,81 @@ MOCK
 cat >"$mockbin/lsregister" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "$1" == -dump ]]; then [[ -z "${MOCK_LS_DUMP:-}" ]] || /bin/cat "$MOCK_LS_DUMP"; exit; fi
-[[ "$1" == -f ]]; printf '%s\n' "$2" >>"${MOCK_LS_LOG:?}"; [[ "${MOCK_LS_FAIL:-0}" != 1 ]]
+state_has() { /usr/bin/awk -F '\t' -v p="$1" '$2 == p { found=1 } END { exit !found }' "$MOCK_LS_STATE"; }
+state_add() {
+  local id=$1 path=$2
+  state_has "$path" || printf '%s\t%s\n' "$id" "$path" >>"$MOCK_LS_STATE"
+}
+state_remove() {
+  /usr/bin/awk -F '\t' -v p="$1" '$2 != p { print }' "$MOCK_LS_STATE" >"$MOCK_LS_STATE.next"
+  /bin/mv "$MOCK_LS_STATE.next" "$MOCK_LS_STATE"
+}
+if [[ "$1" == -dump ]]; then
+  if [[ -z "${MOCK_LS_STATE:-}" ]]; then
+    [[ -z "${MOCK_LS_DUMP:-}" ]] || /bin/cat "$MOCK_LS_DUMP"
+    exit
+  fi
+  count=0; [[ ! -f "${MOCK_LS_DUMP_COUNT:?}" ]] || count=$(<"$MOCK_LS_DUMP_COUNT")
+  count=$((count + 1)); printf '%s\n' "$count" >"$MOCK_LS_DUMP_COUNT"
+  printf 'dump\n' >>"${MOCK_LS_OP_LOG:?}"
+  if [[ "${MOCK_LS_DISCOVER_STAGE:-0}" == 1 ]]; then
+    while IFS= read -r staged; do
+      state_add "${MOCK_LS_STAGE_ID:?}" "$staged"
+    done < <(/usr/bin/find "${MOCK_LS_STAGE_DEST:?}" -maxdepth 2 -type d -name candidate.app -path '*/.seethis-install.*/candidate.app' -print)
+  fi
+  if [[ -n "${MOCK_LS_STAGE_MUTATE:-}" && -s "${MOCK_LS_STAGE_PATH_LOG:?}" && ! -f "${MOCK_LS_STAGE_MUTATE_MARKER:?}" ]]; then
+    staged=$(<"$MOCK_LS_STAGE_PATH_LOG")
+    case "$MOCK_LS_STAGE_MUTATE" in
+      requirement) printf 'REQ_TAMPERED\n' >"$staged/.mock-requirement" ;;
+      executable) printf 'tampered\n' >>"$staged/Contents/MacOS/seethis" ;;
+      provenance) printf 'tampered\n' >>"$staged/Contents/Resources/seethis-delivery-provenance.v1" ;;
+      signature) : >"$staged/.mock-invalid" ;;
+      inode) /bin/mv "$staged" "$staged.old"; /bin/cp -a "$staged.old" "$staged" ;;
+      symlink) /bin/mv "$staged" "$staged.old"; /bin/ln -s "$staged.old" "$staged" ;;
+      *) exit 64 ;;
+    esac
+    : >"$MOCK_LS_STAGE_MUTATE_MARKER"
+  fi
+  if [[ "$count" == "${MOCK_LS_ADD_ON_DUMP:-0}" ]]; then
+    state_add "${MOCK_LS_STAGE_ID:?}" "${MOCK_LS_ADD_PATH:?}"
+  fi
+  if [[ "$count" == "${MOCK_LS_REMOVE_ON_DUMP:-0}" ]]; then
+    state_remove "${MOCK_LS_REMOVE_PATH:?}"
+  fi
+  /bin/cat "${MOCK_LS_DUMP:?}"
+  if [[ "$count" == "${MOCK_LS_MALFORM_ON_DUMP:-0}" ]]; then
+    printf 'identifier: %s\npath: relative/not-an-app\n\n' "${MOCK_LS_STAGE_ID:?}"
+  fi
+  if [[ "${MOCK_LS_MALFORM_AFTER_U:-0}" == 1 ]] &&
+     /usr/bin/awk -F '\t' '$1 == "-u" { found=1 } END { exit !found }' "${MOCK_LS_OP_LOG:?}"; then
+    printf 'identifier: %s\npath: relative/not-an-app\n\n' "${MOCK_LS_STAGE_ID:?}"
+  fi
+  while IFS=$'\t' read -r id path; do
+    [[ -n "$id" && -n "$path" ]] || continue
+    printf '%s\nidentifier: %s\npath: %s\nclass: kLSBundleClassApplication (0x2)\n\n' '--------------------------------------------------------------------------------' "$id" "$path"
+  done <"$MOCK_LS_STATE"
+  exit
+fi
+[[ "$1" == -f || "$1" == -u ]] || exit 64
+[[ "$#" == 2 ]] || exit 64
+if [[ -n "${MOCK_LS_STATE:-}" ]]; then printf '%s\t%s\n' "$1" "$2" >>"${MOCK_LS_OP_LOG:?}"; fi
+if [[ "$1" == -u ]]; then
+  [[ "${MOCK_LS_U_REQUIRE_ABSENT:-0}" != 1 || ( ! -e "$2" && ! -L "$2" ) ]] || exit 78
+  [[ "${MOCK_LS_U_FAIL:-0}" != 1 ]] || exit 77
+  [[ -z "${MOCK_LS_STATE:-}" ]] || {
+    state_remove "$2"
+    [[ "${MOCK_LS_U_ALIAS_CANONICAL:-0}" != 1 ]] || state_remove "${MOCK_LS_CANONICAL:?}"
+    [[ -z "${MOCK_LS_U_REMOVE_OTHER:-}" ]] || state_remove "$MOCK_LS_U_REMOVE_OTHER"
+    [[ "${MOCK_LS_U_READD_STAGE:-0}" != 1 ]] || state_add "${MOCK_LS_STAGE_ID:?}" "$2"
+    [[ "${MOCK_LS_U_MUTATE_CANONICAL:-0}" != 1 ]] || printf 'REQ_TAMPERED\n' >"${MOCK_LS_CANONICAL:?}/.mock-requirement"
+  }
+  exit
+fi
+printf '%s\n' "$2" >>"${MOCK_LS_LOG:?}"
+[[ "${MOCK_LS_FAIL:-0}" != 1 ]] || exit 77
+[[ "$2" != "${MOCK_LS_F_FAIL_PATH:-}" ]] || exit 77
+if [[ "${MOCK_LS_F_FAIL_AFTER_U:-0}" == 1 ]] && /usr/bin/awk -F '\t' '$1 == "-u" { found=1 } END { exit !found }' "${MOCK_LS_OP_LOG:?}"; then exit 77; fi
+[[ -z "${MOCK_LS_STATE:-}" ]] || state_add "${MOCK_LS_STAGE_ID:?}" "$2"
 MOCK
 cat >"$mockbin/ps" <<'MOCK'
 #!/usr/bin/env bash
@@ -175,6 +262,28 @@ cat >"$mockbin/cp" <<'MOCK'
 set -euo pipefail
 dest=''; for item in "$@"; do dest=$item; done
 if [[ "${MOCK_CP_FAIL:-0}" == 1 && "$dest" == *'/.seethis-install.'*'/candidate.app' ]]; then exit 77; fi
+if [[ "${MOCK_CP_PARTIAL_REGISTER:-0}" == 1 && "$dest" == *'/.seethis-install.'*'/candidate.app' ]]; then
+  mkdir -p "$dest"
+  printf '%s\t%s\n' "${MOCK_LS_STAGE_ID:?}" "$dest" >>"${MOCK_LS_STATE:?}"
+  printf '%s\n' "$dest" >"${MOCK_LS_STAGE_PATH_LOG:?}"
+  exit 77
+fi
+if [[ "${MOCK_CP_REGISTER_STAGE:-0}" == 1 && "$dest" == *'/.seethis-install.'*'/candidate.app' ]]; then
+  /bin/cp "$@"
+  printf '%s\t%s\n' "${MOCK_LS_STAGE_ID:?}" "$dest" >>"${MOCK_LS_STATE:?}"
+  printf '%s\n' "$dest" >"${MOCK_LS_STAGE_PATH_LOG:?}"
+  [[ "${MOCK_CP_MUTATE_STAGE:-0}" != 1 ]] || printf 'post-copy mutation\n' >>"$dest/Contents/Resources/resource"
+  if [[ -n "${MOCK_REAPPEAR_TARGET:-}" ]]; then
+    if [[ -n "${MOCK_REAPPEAR_SOURCE:-}" ]]; then /bin/cp -a "$MOCK_REAPPEAR_SOURCE" "$MOCK_REAPPEAR_TARGET"
+    else mkdir -p "$MOCK_REAPPEAR_TARGET"; fi
+  fi
+  exit 0
+fi
+if [[ "${MOCK_CP_MUTATE_STAGE:-0}" == 1 && "$dest" == *'/.seethis-install.'*'/candidate.app' ]]; then
+  /bin/cp "$@"
+  printf 'post-copy mutation\n' >>"$dest/Contents/Resources/resource"
+  exit 0
+fi
 if [[ -n "${MOCK_REAPPEAR_TARGET:-}" && "$dest" == *'/.seethis-install.'*'/candidate.app' ]]; then
   /bin/cp "$@"
   if [[ -n "${MOCK_REAPPEAR_SOURCE:-}" ]]; then
@@ -191,6 +300,7 @@ cat >"$mockbin/mv" <<'MOCK'
 set -euo pipefail
 source_path=$1
 destination=$2
+if [[ "${MOCK_MV_FAIL_STAGE:-0}" == 1 && "$source_path" == *'/.seethis-install.'*'/candidate.app' ]]; then exit 77; fi
 if [[ "${MOCK_MUTATE_SOURCE_TARGET_AFTER_SWAP:-0}" == 1 && "$source_path" == *'/.seethis-install.'*'/candidate.app' ]]; then
   /bin/mv "$source_path" "$destination"
   printf 'post-stage mutation\n' >>"${MOCK_MUTATE_SOURCE_APP:?}/Contents/Resources/resource"
@@ -315,10 +425,30 @@ EOF
   unset MOCK_PS_REPLACE_ON_CALL MOCK_PS_REPLACEMENT MOCK_LIVE_OVERRIDE_PID MOCK_LIVE_OVERRIDE_PATH
   unset MOCK_PS_MUTATE_APP MOCK_PS_MUTATE_ID MOCK_PS_MUTATE_MARKER MOCK_PS_MUTATE_INVALIDATE
   unset MOCK_PROC_PIDPATH_PID MOCK_PROC_PIDPATH_VALUE MOCK_PROC_PIDPATH_FAIL MOCK_PROC_PIDPATH_CALL_LOG
+  unset MOCK_XPROTECT_STATIC_ERROR MOCK_XPROTECT_VERIFY_LOG MOCK_FORGED_XPROTECT_STATIC_ERROR
   unset MOCK_RETARGET_ALIAS_ON_SNAPSHOT MOCK_RETARGET_ALIAS_ON_LIVE_PID MOCK_RETARGET_ALIAS_ON_LIVE MOCK_RETARGET_ALIAS_TARGET
   unset MOCK_MEASURE_KIND MOCK_MEASURE_MODE MOCK_MEASURE_TARGET MOCK_REQUIREMENT_FIXTURE MOCK_REQUIREMENT_VALUE
+  unset MOCK_LS_STATE MOCK_LS_DUMP_COUNT MOCK_LS_OP_LOG MOCK_LS_DISCOVER_STAGE MOCK_LS_STAGE_DEST MOCK_LS_STAGE_ID
+  unset MOCK_LS_STAGE_PATH_LOG MOCK_LS_STAGE_MUTATE MOCK_LS_STAGE_MUTATE_MARKER MOCK_LS_CANONICAL
+  unset MOCK_LS_ADD_ON_DUMP MOCK_LS_ADD_PATH MOCK_LS_REMOVE_ON_DUMP MOCK_LS_REMOVE_PATH MOCK_LS_MALFORM_ON_DUMP MOCK_LS_MALFORM_AFTER_U
+  unset MOCK_LS_U_FAIL MOCK_LS_U_REQUIRE_ABSENT MOCK_LS_U_ALIAS_CANONICAL MOCK_LS_U_REMOVE_OTHER MOCK_LS_U_READD_STAGE MOCK_LS_U_MUTATE_CANONICAL MOCK_LS_F_FAIL_PATH MOCK_LS_F_FAIL_AFTER_U
+  unset MOCK_CP_PARTIAL_REGISTER MOCK_CP_REGISTER_STAGE MOCK_CP_MUTATE_STAGE MOCK_MV_FAIL_STAGE
 }
 lsrow() { printf 'bundle id: %s\npath: %s\n\n' "$1" "$2" >>"$tmp/ls.dump"; }
+ls_state_row() { printf '%s\t%s\n' "$1" "$2" >>"${MOCK_LS_STATE:?}"; }
+ls_state_has() { /usr/bin/awk -F '\t' -v p="$1" '$2 == p { found=1 } END { exit !found }' "${MOCK_LS_STATE:?}"; }
+ls_state_paths() { /usr/bin/awk -F '\t' '{ print $2 }' "${MOCK_LS_STATE:?}" | LC_ALL=C sort; }
+stage_state() {
+  reset_state
+  export MOCK_LS_STATE="$tmp/stage-ls.state" MOCK_LS_DUMP_COUNT="$tmp/stage-ls.count"
+  export MOCK_LS_OP_LOG="$tmp/stage-ls.ops" MOCK_LS_STAGE_PATH_LOG="$tmp/stage-path"
+  export MOCK_LS_STAGE_MUTATE_MARKER="$tmp/stage-mutated"
+  : >"$MOCK_LS_STATE"; : >"$MOCK_LS_OP_LOG"
+  rm -f "$MOCK_LS_DUMP_COUNT" "$MOCK_LS_STAGE_PATH_LOG" "$MOCK_LS_STAGE_MUTATE_MARKER"
+  export MOCK_LS_STAGE_ID=local.seethis.fixture
+  export MOCK_LS_U_REQUIRE_ABSENT=1
+  export MOCK_CP_REGISTER_STAGE=1
+}
 ls_live_row() {
   printf '%s\n' '--------------------------------------------------------------------------------' >>"$tmp/ls.dump"
   printf 'bundle id: SeeThis (0x1930)\nidentifier: %s\npath: %s (0x1a2b)\nclass: kLSBundleClassApplication (0x2)\nitem flags: package  application  container  native-app (000000000000000e)\n' "$1" "$2" >>"$tmp/ls.dump"
@@ -773,6 +903,242 @@ if [[ "${SEETHIS_DI3_FOCUSED:-0}" == 1 ]]; then
   exit 0
 fi
 
+# Exercise the install-local stage lifecycle with a file-backed LS registry.  The
+# mock records the whole same-ID set, not just a successful -u exit status.
+if [[ "${SEETHIS_STAGE_FOCUSED:-0}" == 1 || "${SEETHIS_STAGE_SKIP:-0}" != 1 ]]; then
+  reset_state
+  success stage_bootstrap "$script" package --source "$FIXTURE_SOURCE" --output "$tmp/stage-bootstrap" --mode stable --identity 'Fixture Stable' --stable-action bootstrap
+  success stage_update "$script" package --source "$FIXTURE_SOURCE" --output "$tmp/stage-update" --mode stable --identity AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --stable-action update --prior-app "$tmp/stage-bootstrap/SeeThis.app"
+  stage_source="$tmp/stage-update/SeeThis.app"
+  stage_prepare() {
+    local name=$1
+    stage_state
+    stage_dest="$tmp/stage-$name"
+    mkdir -p "$stage_dest"
+    stage_source="$tmp/stage-source-$name/SeeThis.app"
+    mkdir -p "$(dirname "$stage_source")"
+    /bin/cp -a "$tmp/stage-update/SeeThis.app" "$stage_source"
+    /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$stage_dest/SeeThis.app"
+    printf 'preserve\n' >"$stage_dest/SeeThis.app/old"
+    stage_target="$stage_dest/SeeThis.app"
+    export MOCK_LS_STAGE_DEST="$stage_dest" MOCK_LS_CANONICAL="$stage_target"
+    ls_state_row local.seethis.fixture "$stage_target"
+  }
+  stage_run_success() {
+    local name=$1
+    success "$name" "$script" install --app "$stage_source" --destination "$stage_dest" --acknowledge
+  }
+  stage_run_failure() {
+    local name=$1 expected=${2:-} rc observed
+    shift 2
+    log="$tmp/$name.log"
+    set +e; "$script" install --app "$stage_source" --destination "$stage_dest" --acknowledge "$@" >"$log" 2>&1; rc=$?; set -e
+    if [[ $rc -eq 0 ]]; then echo "FAIL $name unexpectedly installed" >&2; exit 1; fi
+    observed=$(grep -m1 '^ERROR:' "$log" || true)
+    [[ -n "$observed" ]] || { echo "FAIL $name did not report an installer error" >&2; sed -n '1,80p' "$log" >&2; exit 1; }
+    if [[ -n "$expected" ]] && ! grep -F "$expected" "$log" >/dev/null; then
+      echo "FAIL $name expected diagnostic: $expected" >&2; sed -n '1,80p' "$log" >&2; exit 1
+    fi
+    printf 'CASE %s outcome=nonpass diagnostic=%s\n' "$name" "$observed"
+  }
+  stage_path() {
+    [[ -s "$MOCK_LS_STAGE_PATH_LOG" ]] || { echo "FAIL $1 did not stage a candidate" >&2; exit 1; }
+    stage_registered_path=$(<"$MOCK_LS_STAGE_PATH_LOG")
+    [[ "$stage_registered_path" == "$stage_dest"/.seethis-install.*/candidate.app ]] || {
+      echo "FAIL $1 staged path escaped destination: $stage_registered_path" >&2; exit 1;
+    }
+  }
+  stage_op_count() {
+    /usr/bin/awk -F '\t' -v op="$1" -v p="$2" '$1 == op && $2 == p { n++ } END { print n+0 }' "$MOCK_LS_OP_LOG"
+  }
+  stage_assert_clean() {
+    local name=$1 expected_set=$2
+    stage_path "$name"
+    [[ ! -e "$stage_registered_path" && ! -L "$stage_registered_path" ]] || {
+      echo "FAIL $name retained live stage" >&2; sed -n '1,80p' "$log" >&2; exit 1;
+    }
+    [[ $(stage_op_count -u "$stage_registered_path") == 1 ]] || {
+      echo "FAIL $name did not unregister only its exact stage once" >&2; exit 1;
+    }
+    [[ ! $(ls_state_paths) == *"$stage_registered_path"* ]] || {
+      echo "FAIL $name retained stage LS registration" >&2; exit 1;
+    }
+    [[ "$(ls_state_paths)" == "$expected_set" ]] || {
+      echo "FAIL $name LS set differs" >&2; ls_state_paths >&2; exit 1;
+    }
+  }
+  stage_assert_no_unrelated_u() {
+    local name=$1
+    stage_path "$name"
+    if /usr/bin/awk -F '\t' -v p="$stage_registered_path" '$1 == "-u" && $2 != p { bad=1 } END { exit !bad }' "$MOCK_LS_OP_LOG"; then
+      echo "FAIL $name unregistered unrelated path" >&2; exit 1
+    fi
+    return 0
+  }
+
+  stage_prepare ordinary_success
+  stage_run_success stage_ordinary_success
+  stage_assert_clean ordinary_success "$stage_target"
+  stage_assert_no_unrelated_u ordinary_success
+  [[ ! -e "$stage_target/old" && $(stage_op_count -f "$stage_target") == 1 ]] || {
+    echo 'FAIL ordinary_success did not install/register the new canonical app' >&2; exit 1;
+  }
+
+  stage_prepare first_preflight
+  first_sibling="$tmp/first-preflight-sibling/SeeThis.app"
+  mkdir -p "$(dirname "$first_sibling")"; /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$first_sibling"
+  ls_state_row local.seethis.fixture "$first_sibling"
+  stage_run_failure stage_first_preflight 'unresolved registered same-bundle app'
+  [[ ! -e "$MOCK_LS_STAGE_PATH_LOG" && $(/usr/bin/awk -F '\t' '$1 == "-u" { n++ } END { print n+0 }' "$MOCK_LS_OP_LOG") == 0 ]] || {
+    echo 'FAIL first preflight created or unregistered a stage' >&2; exit 1;
+  }
+  has "$stage_target/old" preserve
+
+  stage_prepare second_preflight_unknown_sibling
+  second_sibling="$tmp/second-preflight-sibling/SeeThis.app"
+  mkdir -p "$(dirname "$second_sibling")"; /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$second_sibling"
+  export MOCK_LS_ADD_ON_DUMP=3 MOCK_LS_ADD_PATH="$second_sibling"
+  stage_run_failure stage_second_preflight_unknown_sibling 'unresolved registered same-bundle app'
+  stage_assert_clean second_preflight_unknown_sibling "$(printf '%s\n%s' "$stage_target" "$second_sibling" | LC_ALL=C sort)"
+  stage_assert_no_unrelated_u second_preflight_unknown_sibling
+  has "$stage_target/old" preserve
+
+  stage_prepare stage_shaped_impostor
+  impostor="$stage_dest/.seethis-install.forged/candidate.app"
+  mkdir -p "$(dirname "$impostor")"; /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$impostor"
+  export MOCK_LS_ADD_ON_DUMP=3 MOCK_LS_ADD_PATH="$impostor"
+  stage_run_failure stage_shaped_impostor 'unresolved registered same-bundle app'
+  stage_assert_clean stage_shaped_impostor "$(printf '%s\n%s' "$stage_target" "$impostor" | LC_ALL=C sort)"
+  stage_assert_no_unrelated_u stage_shaped_impostor
+  has "$stage_target/old" preserve
+
+  stage_prepare concurrent_registration
+  concurrent_sibling="$tmp/concurrent-sibling/SeeThis.app"
+  mkdir -p "$(dirname "$concurrent_sibling")"; /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$concurrent_sibling"
+  export MOCK_LS_ADD_ON_DUMP=4 MOCK_LS_ADD_PATH="$concurrent_sibling"
+  stage_run_failure stage_concurrent_registration 'same-ID registration set changed during staging'
+  stage_assert_clean concurrent_registration "$(printf '%s\n%s' "$stage_target" "$concurrent_sibling" | LC_ALL=C sort)"
+  has "$stage_target/old" preserve
+
+  stage_prepare missing_set_race
+  missing_stage_path="$tmp/missing-stage-race/SeeThis.app"
+  mkdir -p "$(dirname "$missing_stage_path")"
+  /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$missing_stage_path"
+  make_owned_manifest "$missing_stage_path" "$tmp/missing-stage-owned.manifest" local.seethis.fixture
+  "$MOCK_REAL_PYTHON3" - "$missing_stage_path" <<'PY'
+import shutil, sys
+shutil.rmtree(sys.argv[1])
+PY
+  ls_state_row local.seethis.fixture "$missing_stage_path"
+  export MOCK_REAPPEAR_TARGET="$missing_stage_path" MOCK_REAPPEAR_SOURCE="$tmp/stage-bootstrap/SeeThis.app"
+  stage_run_failure stage_missing_set_race 'missing registered app set changed during staging' --owned-manifest "$tmp/missing-stage-owned.manifest"
+  stage_assert_clean missing_set_race "$(printf '%s\n%s' "$stage_target" "$missing_stage_path" | LC_ALL=C sort)"
+  has "$stage_target/old" preserve
+
+  stage_prepare copy_partial
+  export MOCK_CP_PARTIAL_REGISTER=1
+  stage_run_failure stage_copy_partial 'unproven stage registration remains; no automatic unregister'
+  stage_path copy_partial
+  [[ $(stage_op_count -u "$stage_registered_path") == 0 ]] || {
+    echo 'FAIL partial copy without proof was automatically unregistered' >&2; exit 1;
+  }
+  has "$stage_target/old" preserve
+
+  stage_prepare comparison_failure
+  export MOCK_CP_MUTATE_STAGE=1
+  stage_run_failure stage_comparison_failure 'unproven stage registration remains; no automatic unregister'
+  stage_path comparison_failure
+  [[ $(stage_op_count -u "$stage_registered_path") == 0 ]] || {
+    echo 'FAIL comparison failure unregistered stage without a valid proof' >&2; exit 1;
+  }
+  has "$stage_target/old" preserve
+
+  for mutation in requirement executable provenance signature inode symlink; do
+    stage_prepare "tamper_$mutation"
+    export MOCK_LS_STAGE_MUTATE=$mutation
+    stage_run_failure "stage_tamper_$mutation" 'installer-owned stage identity changed'
+    stage_path "tamper_$mutation"
+    [[ $(stage_op_count -u "$stage_registered_path") == 0 ]] || {
+      echo "FAIL tamper_$mutation unregistered stage without current proof" >&2; exit 1;
+    }
+    has "$stage_target/old" preserve
+  done
+
+  stage_prepare swap_failure
+  export MOCK_MV_FAIL_STAGE=1
+  stage_run_failure stage_swap_failure 'installation swap failed'
+  stage_assert_clean swap_failure "$stage_target"
+  has "$stage_target/old" preserve
+
+  stage_prepare validation_failure
+  export MOCK_MUTATE_SOURCE_TARGET_AFTER_SWAP=1 MOCK_MUTATE_SOURCE_APP="$stage_source"
+  stage_run_failure stage_validation_failure 'installed candidate content differs'
+  stage_assert_clean validation_failure "$stage_target"
+  has "$stage_target/old" preserve
+
+  stage_prepare registration_failure
+  export MOCK_LS_F_FAIL_PATH="$stage_target"
+  stage_run_failure stage_registration_failure 'Launch Services registration failed'
+  stage_assert_clean registration_failure "$stage_target"
+  has "$stage_target/old" preserve
+
+  stage_prepare canonical_alias_recovery
+  export MOCK_LS_U_ALIAS_CANONICAL=1
+  stage_run_success stage_canonical_alias_recovery
+  stage_assert_clean canonical_alias_recovery "$stage_target"
+  [[ $(stage_op_count -f "$stage_target") == 2 ]] || {
+    echo 'FAIL canonical alias recovery did not issue one bounded re-registration' >&2; exit 1;
+  }
+
+  stage_prepare alias_recovery_failure
+  export MOCK_LS_U_ALIAS_CANONICAL=1 MOCK_LS_F_FAIL_AFTER_U=1
+  stage_run_failure stage_alias_recovery_failure 'canonical alias registration recovery failed'
+  stage_path alias_recovery_failure
+  [[ $(stage_op_count -u "$stage_registered_path") == 1 && $(stage_op_count -f "$stage_target") -le 2 ]] || {
+    echo 'FAIL alias recovery failure exceeded bounded operations' >&2; exit 1;
+  }
+
+  stage_prepare canonical_identity_drift
+  export MOCK_LS_U_ALIAS_CANONICAL=1 MOCK_LS_U_MUTATE_CANONICAL=1
+  stage_run_failure stage_canonical_identity_drift 'canonical or stage identity drifted during cleanup'
+  stage_path canonical_identity_drift
+  [[ $(stage_op_count -u "$stage_registered_path") == 1 && $(stage_op_count -f "$stage_target") == 1 ]] || {
+    echo 'FAIL canonical identity drift was re-registered' >&2; exit 1;
+  }
+
+  stage_prepare malformed_cleanup_readback
+  export MOCK_LS_MALFORM_AFTER_U=1
+  stage_run_failure stage_malformed_cleanup_readback 'Launch Services'
+  stage_path malformed_cleanup_readback
+  [[ $(stage_op_count -u "$stage_registered_path") == 1 ]] || {
+    echo 'FAIL malformed cleanup readback was not reached' >&2; exit 1;
+  }
+
+  stage_prepare unknown_cleanup_delta
+  cleanup_sibling="$tmp/cleanup-sibling/SeeThis.app"
+  mkdir -p "$(dirname "$cleanup_sibling")"; /bin/cp -a "$tmp/stage-bootstrap/SeeThis.app" "$cleanup_sibling"
+  export MOCK_LS_ADD_ON_DUMP=2 MOCK_LS_ADD_PATH="$cleanup_sibling" MOCK_LS_U_REMOVE_OTHER="$cleanup_sibling"
+  stage_run_failure stage_unknown_cleanup_delta 'unknown same-ID registration delta during stage cleanup'
+  stage_assert_no_unrelated_u unknown_cleanup_delta
+
+  stage_prepare stage_reappears
+  export MOCK_LS_U_READD_STAGE=1
+  stage_run_failure stage_reappears 'unknown same-ID registration delta during stage cleanup'
+  stage_path stage_reappears
+  [[ $(stage_op_count -u "$stage_registered_path") == 1 ]] || { echo 'FAIL stage reappearance cleanup was retried' >&2; exit 1; }
+
+  stage_prepare unregister_failure
+  export MOCK_LS_U_FAIL=1
+  stage_run_failure stage_unregister_failure 'exact installer stage unregister failed'
+  stage_path unregister_failure
+  [[ $(stage_op_count -u "$stage_registered_path") == 1 && $(ls_state_paths) == *"$stage_registered_path"* ]] || {
+    echo 'FAIL unregister failure was reported without preserving evidence' >&2; exit 1;
+  }
+
+  echo 'CASE stage_lifecycle_mock expected=success (stateful LS assertions complete)'
+  if [[ "${SEETHIS_STAGE_FOCUSED:-0}" == 1 ]]; then echo 'package_macos_test: PASS (focused stage lifecycle mock)'; exit 0; fi
+fi
+
 reset_state
 success development "$script" package --source "$FIXTURE_SOURCE" --commit "$commit" --output "$tmp/dev" --mode development
 has "$tmp/dev/evidence.txt" "commit=$commit"; has "$tmp/dev/evidence.txt" bundle_id=local.seethis.fixture
@@ -1206,6 +1572,125 @@ export MOCK_STALE_PIDS=4242
 failure basename_only_stale 'stale or unverifiable process evidence for PID 4242' "$script" preflight --app "$tmp/bootstrap/SeeThis.app"
 reset_state; printf '101 /usr/bin/true\nmalformed-process-record\n' >"$tmp/ps.before"
 failure unrelated_malformed_record 'running-process snapshot is malformed or truncated' "$script" preflight --app "$tmp/bootstrap/SeeThis.app"
+
+# The protected XProtect bundle is read-only input here. Process rows and the
+# obsolete-envelope result are fixtures; the Security PID validity call is real.
+xprotect_app=/Library/Apple/System/Library/CoreServices/XProtect.app
+xprotect_exe=$xprotect_app/Contents/MacOS/XProtect
+xprotect_rejected() {
+  local name=$1 rc
+  log="$tmp/$name.log"
+  set +e
+  "$script" preflight --app "$tmp/bootstrap/SeeThis.app" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]] || ! grep -q '^ERROR: ' "$log" || grep -Fq 'status=PASS' "$log"; then
+    echo "FAIL $name accepted ambiguous XProtect evidence" >&2
+    sed -n '1,80p' "$log" >&2
+    exit 1
+  fi
+}
+
+if [[ -f "$xprotect_exe" && -r "$xprotect_app/Contents/Info.plist" ]]; then
+  xprotect_pid=$(/bin/ps -axo pid=,comm= | awk -v path="$xprotect_exe" '$2 == path && pid == "" {pid=$1} END {print pid}')
+  if [[ -n "$xprotect_pid" ]]; then
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_exe" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=obsolete MOCK_XPROTECT_VERIFY_LOG="$tmp/xprotect.verify"
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+    success xprotect_live_exact "$script" preflight --app "$tmp/bootstrap/SeeThis.app"
+    has "$log" status=PASS
+    grep -Fqx "$xprotect_app" "$MOCK_XPROTECT_VERIFY_LOG"
+
+    # The same otherwise-valid observation must fail when the real helper
+    # cannot create its temporary compilation directory.
+    xprotect_functions="$tmp/xprotect-functions.sh"
+    xprotect_helper_log="$tmp/xprotect-helper-unavailable.log"
+    sed '/^\[\[ \$# -gt 0 \]\]/,$d' "$script" >"$xprotect_functions"
+    if (
+      source "$xprotect_functions"
+      TMPDIR="$tmp/no-such-temp-root" unrelated_app_snapshot \
+        "$xprotect_exe" "$xprotect_exe" local.seethis.fixture \
+        "$(canonical "$tmp/bootstrap/SeeThis.app")" "$candidate_exe" "$xprotect_pid" \
+        "$xprotect_exe"
+    ) >"$xprotect_helper_log" 2>&1; then
+      echo 'FAIL xprotect_helper_unavailable unexpectedly passed' >&2
+      exit 1
+    fi
+    if ! grep -Fq "mktemp: mkdtemp failed on $tmp/no-such-temp-root/seethis-xprotect-check." "$xprotect_helper_log" ||
+       ! grep -Fq 'No such file or directory' "$xprotect_helper_log" ||
+       grep -Fq 'unbound variable' "$xprotect_helper_log"; then
+      echo 'FAIL xprotect_helper_unavailable did not reach failing helper' >&2
+      sed -n '1,80p' "$xprotect_helper_log" >&2
+      exit 1
+    fi
+
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_exe" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=other
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+    xprotect_rejected xprotect_other_static_error
+
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_exe" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=malformed
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+    xprotect_rejected xprotect_incomplete_static_diagnostic
+
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_exe" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=obsolete
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+    export MOCK_LIVE_OVERRIDE_PID="$xprotect_pid" MOCK_LIVE_OVERRIDE_PATH="$candidate_exe"
+    xprotect_rejected xprotect_changed_live_path
+
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_exe" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=obsolete
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$candidate_exe"
+    xprotect_rejected xprotect_changed_kernel_path
+
+    xprotect_alias="$tmp/XProtectAlias.app"
+    ln -s "$xprotect_app" "$xprotect_alias"
+    reset_state
+    printf '101 /usr/bin/true\n%s %s\n' "$xprotect_pid" "$xprotect_alias/Contents/MacOS/XProtect" >"$tmp/ps.before"
+    export MOCK_XPROTECT_STATIC_ERROR=obsolete
+    export MOCK_PROC_PIDPATH_PID="$xprotect_pid" MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+    export MOCK_LIVE_OVERRIDE_PID="$xprotect_pid" MOCK_LIVE_OVERRIDE_PATH="$xprotect_exe"
+    xprotect_rejected xprotect_symlink_raw_path
+  else
+    echo 'package_macos_test: SKIP live XProtect positive (no running XProtect PID)' >&2
+  fi
+
+  reset_state
+  printf '101 /usr/bin/true\n99999 %s\n' "$xprotect_exe" >"$tmp/ps.before"
+  export MOCK_XPROTECT_STATIC_ERROR=obsolete
+  export MOCK_PROC_PIDPATH_PID=99999 MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+  xprotect_rejected xprotect_unavailable_dynamic_guest
+
+  # PID 1 is Apple's launchd, not a process with the XProtect signing identity.
+  reset_state
+  printf '101 /usr/bin/true\n1 %s\n' "$xprotect_exe" >"$tmp/ps.before"
+  export MOCK_XPROTECT_STATIC_ERROR=obsolete
+  export MOCK_PROC_PIDPATH_PID=1 MOCK_PROC_PIDPATH_VALUE="$xprotect_exe"
+  xprotect_rejected xprotect_wrong_apple_identifier
+
+  forged_xprotect="$tmp/Forged/XProtect.app"
+  make_manual_bundle "$forged_xprotect" com.apple.XProtectFramework.XProtect XProtect
+  reset_state
+  printf '101 /usr/bin/true\n4242 %s\n' "$(canonical "$forged_xprotect/Contents/MacOS/XProtect")" >"$tmp/ps.before"
+  export MOCK_FORGED_XPROTECT_STATIC_ERROR=1
+  xprotect_rejected xprotect_forged_bundle_path
+
+  same_named_app="$tmp/SameBundleXProtect.app"
+  make_manual_bundle "$same_named_app" local.seethis.fixture XProtect
+  reset_state
+  printf '101 /usr/bin/true\n4242 %s\n' "$(canonical "$same_named_app/Contents/MacOS/XProtect")" >"$tmp/ps.before"
+  failure xprotect_name_same_bundle "unresolved running same-bundle app: $(canonical "$same_named_app")" \
+    "$script" preflight --app "$tmp/bootstrap/SeeThis.app"
+else
+  echo 'package_macos_test: SKIP XProtect host cases (protected bundle unavailable)' >&2
+fi
 
 reset_state; dest="$tmp/install"; mkdir -p "$dest"; cp -R "$tmp/bootstrap/SeeThis.app" "$dest/SeeThis.app"; echo old >"$dest/SeeThis.app/old"; lsrow local.seethis.fixture "$dest/SeeThis.app"
 success install "$script" install --app "$tmp/update/SeeThis.app" --destination "$dest" --acknowledge

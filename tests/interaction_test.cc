@@ -14,6 +14,12 @@
 #include <string_view>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#define SEETHIS_CAPTURE_POINTER_TESTING 1
+#include "../src/platform/mac/input_mac.mm"
+#undef SEETHIS_CAPTURE_POINTER_TESTING
+#endif
+
 #if defined(__APPLE__) && defined(SEETHIS_CLIPBOARD_MAC_TESTING)
 #import <AppKit/AppKit.h>
 #include <chrono>
@@ -57,7 +63,8 @@ seethis::core::WindowObservation WindowFor(
     const seethis::core::Context& context,std::uint64_t generation) {
   return {seethis::core::WindowAvailability::kReady,generation,
           seethis::core::Now(),context.window_pid,context.bundle_id,
-          context.window_id,context.window};
+          context.window_id,context.window,context.native_window,
+          context.window_title,{1,seethis::core::TitleAvailability::kReady}};
 }
 
 seethis::core::PageIdentity ChromePageFor(
@@ -366,6 +373,238 @@ void TestCaptureReleaseOrders() {
                 seethis::core::StartResult::kIgnoredRepeat &&
             repeated.Snapshot().state == InteractionState::kFinished,
         "autorepeat does not rearm or duplicate modifier-first completion");
+}
+
+#if defined(__APPLE__)
+void TestNativeDragIdleTimeout() {
+  using namespace seethis::core;
+  const auto point = [](double x) { return LogicalPoint(1, x, 10); };
+  const auto begin = [&](InteractionController& controller) {
+    Check(controller.ShortcutKeyDown(1'000, point(10)) == StartResult::kStarted,
+          "native drag fixture starts");
+    controller.SetSelectedDisplayGeometry({1, {0, 0}, {100, 80}, 1});
+    Check(controller.PointerDown(point(10), 1'000), "native drag begins");
+  };
+  for (const bool tap_first : {true, false}) {
+    InteractionController controller;
+    begin(controller);
+    double x = 20;
+    for (const auto time : {200'000LL, 500'000LL, 800'000LL}) {
+      const auto sample = point(x);
+      const bool first = tap_first
+          ? HandleCapturePointerMotion(&controller, kCGEventLeftMouseDragged,
+                                       sample, time)
+          : controller.PointerMoved(sample, time);
+      const bool duplicate = tap_first
+          ? controller.PointerMoved(sample, time + 1)
+          : HandleCapturePointerMotion(&controller, kCGEventLeftMouseDragged,
+                                       sample, time + 1);
+      Check(first && !duplicate &&
+                controller.Snapshot().last_activity_monotonic_ms == time &&
+                !controller.Watchdog(time + 1, true),
+            "either native/overlay order renews once and survives total five minutes");
+      x += 10;
+    }
+    Check(!HandleCapturePointerMotion(&controller, kCGEventLeftMouseDragged,
+                                     point(40), 1'099'999) &&
+              !controller.PointerMoved(point(40), 1'100'000) &&
+              !controller.Watchdog(1'100'000, true) &&
+              controller.Snapshot().last_activity_monotonic_ms == 800'000 &&
+              controller.Snapshot().key_down_monotonic_ms == 1'000 &&
+              controller.Watchdog(1'100'001, true) &&
+              !HandleCapturePointerMotion(&controller, kCGEventLeftMouseDragged,
+                                          point(50), 1'100'002),
+          "duplicate delivery never slides the exact idle boundary or revives expiry");
+  }
+  for (const auto type : {kCGEventMouseMoved, kCGEventRightMouseDragged,
+                          kCGEventOtherMouseDragged}) {
+    InteractionController controller;
+    begin(controller);
+    Check(!HandleCapturePointerMotion(&controller, type, point(30), 200'000) &&
+              controller.Snapshot().regions.front().size() == 1 &&
+              controller.Snapshot().last_activity_monotonic_ms == 1'000 &&
+              controller.Watchdog(301'001, true),
+          "hover and other-button motion neither consume geometry nor renew");
+  }
+  InteractionController invalid;
+  begin(invalid);
+  Check(!HandleCapturePointerMotion(&invalid, kCGEventLeftMouseDragged, {}, 2'000) &&
+            !HandleCapturePointerMotion(&invalid, kCGEventLeftMouseDragged,
+                                        point(20), -1) &&
+            !HandleCapturePointerMotion(&invalid, kCGEventLeftMouseDragged,
+                                        point(20), 999) &&
+            HandleCapturePointerMotion(&invalid, kCGEventLeftMouseDragged,
+                                       point(20), 301'000) &&
+            !invalid.Watchdog(301'001, true),
+        "invalid native samples cannot renew; accepted exact-deadline drag can");
+  Check(invalid.PointerUp(point(30), 400'000) &&
+            invalid.ShortcutKeyUp(400'001) &&
+            !invalid.ShortcutModifierUp(400'002) &&
+            !HandleCapturePointerMotion(&invalid, kCGEventLeftMouseDragged,
+                                        point(40), 400'003),
+        "native drag preserves single completion and out-of-session exclusion");
+
+  // Preserve the original QA witness as a negative control: an untimed first
+  // route still consumes geometry before its timed overlay duplicate.
+  InteractionController old_route;
+  begin(old_route);
+  Check(old_route.PointerMoved(point(20)) &&
+            !old_route.PointerMoved(point(20), 200'000) &&
+            old_route.PointerMoved(point(30)) &&
+            !old_route.PointerMoved(point(30), 300'999) &&
+            old_route.Watchdog(301'001, true),
+        "original untimed production relation reproduces premature expiry");
+}
+#endif
+
+void TestMarkIdleTimeout() {
+  using namespace seethis::core;
+  constexpr std::int64_t start = 1'000;
+  constexpr std::int64_t idle = 300'000;
+  const auto point = [](double x = 10, double y = 10) {
+    return LogicalPoint(1, x, y);
+  };
+  const auto begin = [&](InteractionController& controller) {
+    Check(controller.ShortcutKeyDown(start, point()) == StartResult::kStarted,
+          "idle fixture starts");
+    controller.SetSelectedDisplayGeometry({1, {0, 0}, {100, 80}, 1});
+    DrawRegion(controller, point(), point(20, 20));
+  };
+  Check(InteractionController::kDefaultMaximumHoldMilliseconds == idle,
+        "default marking inactivity is five minutes");
+  InteractionController untouched;
+  begin(untouched);
+  Check(!untouched.Watchdog(start + 30'000, true) &&
+            !untouched.Watchdog(start + 30'001, true) &&
+            untouched.Snapshot().regions.size() == 1,
+        "retained regions survive both sides of the old 30-second deadline");
+  Check(!untouched.Watchdog(start + idle - 1, true) &&
+            !untouched.Watchdog(start + idle, true),
+        "five-minute inactivity deadline remains live at the exact boundary");
+  Check(untouched.Watchdog(start + idle + 1, true) &&
+            untouched.Snapshot().cancel_reason == CancelReason::kWatchdogTimeout &&
+            untouched.Snapshot().subpaths.empty() &&
+            !untouched.PointerDown(point(), start + idle + 2) &&
+            !untouched.ShortcutKeyUp(start + idle + 3),
+        "true idle expiry clears pending marks and late events cannot revive them");
+
+  InteractionController renewed;
+  begin(renewed);
+  const auto click = [&](std::int64_t time) {
+    Check(renewed.PointerDown(point(30, 30), time) &&
+              renewed.PointerUp(point(30, 30), time),
+          "a valid marking click renews even without a drawable region");
+  };
+  click(start + idle - 1);
+  Check(!renewed.Watchdog(start + idle + 1, true) &&
+            renewed.Snapshot().regions.size() == 1,
+        "a click just before expiry preserves earlier regions");
+  click(start + 2 * idle - 2);
+  click(start + 3 * idle - 3);
+  const auto last_click = start + 3 * idle - 3;
+  Check(!renewed.Watchdog(last_click + idle, true) &&
+            renewed.Snapshot().key_down_monotonic_ms == start &&
+            renewed.Snapshot().last_activity_monotonic_ms == last_click &&
+            renewed.Snapshot().regions.size() == 1,
+        "repeated clicks extend beyond total five minutes without changing provenance");
+  Check(renewed.ShortcutKeyUp(last_click + idle) &&
+            !renewed.ShortcutModifierUp(last_click + idle + 1) &&
+            !renewed.Watchdog(last_click + idle + 2, false) &&
+            renewed.Snapshot().key_up_monotonic_ms == last_click + idle,
+        "renewed work completes exactly once with its original session timestamps");
+
+  InteractionController deadline;
+  begin(deadline);
+  Check(!deadline.Watchdog(start + idle, true) &&
+            deadline.PointerDown(point(), start + idle) &&
+            deadline.PointerUp(point(), start + idle) &&
+            !deadline.Watchdog(start + idle + 1, true),
+        "activity at the exact still-live deadline renews the interval");
+  InteractionController event_first;
+  begin(event_first);
+  Check(event_first.PointerDown(point(), start + idle + 1) &&
+            !event_first.Watchdog(start + idle + 1, true),
+        "accepted activity processed before an overdue watchdog preserves event order");
+
+  InteractionController ignored;
+  begin(ignored);
+  Check(!ignored.PointerMoved(point(50, 50), 200'000) &&
+            !ignored.PointerUp(point(), 200'000),
+        "passive hover and unmatched mouse-up do not renew");
+  Check(!ignored.PointerDown(LogicalPoint(2, 10, 10), 200'000) &&
+            !ignored.PointerDown(LogicalPoint(1, 10, 10, 2), 200'000) &&
+            !ignored.PointerDown(point(-1, 10), 200'000) &&
+            !ignored.PointerDown(point(std::numeric_limits<double>::infinity()), 200'000) &&
+            !ignored.PointerDown(point(std::numeric_limits<double>::quiet_NaN()), 200'000) &&
+            !ignored.PointerDown(point(), -1) &&
+            !ignored.PointerDown(point(), start - 1),
+        "invalid coordinates, display, scale and negative or stale times cannot renew");
+  Check(!ignored.Watchdog(200'000, true) &&
+            !ignored.PointerDown(point(), 199'999) &&
+            !ignored.Watchdog(-1, false) &&
+            !ignored.Watchdog(199'999, false) &&
+            ignored.Snapshot().last_activity_monotonic_ms == start &&
+            ignored.Watchdog(start + idle + 1, true),
+        "stale events after a newer observation cannot extend or alter the deadline");
+
+  InteractionController dragging;
+  begin(dragging);
+  Check(dragging.PointerDown(point(), 2'000) &&
+            dragging.PointerMoved(point(30, 30), 250'000) &&
+            dragging.PointerMoved(point(40, 40), 500'000) &&
+            !dragging.PointerMoved(point(40, 40), 750'000) &&
+            !dragging.PointerDown(point(), 750'000) &&
+            !dragging.PointerMoved(point(45, 45), 499'999) &&
+            dragging.Snapshot().last_activity_monotonic_ms == 500'000 &&
+            !dragging.Watchdog(800'000, true) &&
+            dragging.Watchdog(800'001, true),
+        "meaningful active dragging renews while stationary, duplicate and stale events do not");
+  InteractionController clipped;
+  begin(clipped);
+  Check(clipped.PointerDown(point(), 2'000) &&
+            clipped.PointerMoved(point(120, 10), 100'000) &&
+            !clipped.PointerMoved(point(130, 10), 200'000) &&
+            clipped.PointerUp(point(140, 10), 250'000) &&
+            clipped.Snapshot().last_activity_monotonic_ms == 100'000 &&
+            clipped.Watchdog(400'001, true),
+        "clipped drawing renews only on geometry change; outside move and release do not");
+  InteractionController invalid_up;
+  begin(invalid_up);
+  Check(invalid_up.PointerDown(point(), 2'000) &&
+            invalid_up.PointerUp(LogicalPoint(2, 10, 10), 200'000) &&
+            invalid_up.Snapshot().last_activity_monotonic_ms == 2'000 &&
+            invalid_up.Watchdog(302'001, true),
+        "invalid release can finalize the region without renewing the idle interval");
+  InteractionController release;
+  begin(release);
+  Check(release.PointerDown(point(), 2'000) &&
+            release.PointerUp(point(20, 20), 250'000) &&
+            !release.Watchdog(500'000, false) &&
+            release.Watchdog(500'250, false) &&
+            release.Snapshot().completion_reason == CompletionReason::kWatchdogObservedRelease &&
+            !release.ShortcutKeyUp(500'251),
+        "accepted mouse-up renews and physical release reconciliation still completes once");
+  InteractionController stale_up;
+  begin(stale_up);
+  Check(stale_up.PointerDown(point(), 2'000) &&
+            stale_up.PointerMoved(point(20, 20), 3'000) &&
+            stale_up.PointerUp(point(70, 70), 2'999) &&
+            !stale_up.Snapshot().region_active &&
+            stale_up.Snapshot().last_activity_monotonic_ms == 3'000 &&
+            stale_up.Snapshot().regions.back().back().position.x == 20 &&
+            stale_up.PointerDown(point(), 4'000) &&
+            stale_up.PointerUp(point(), -1) &&
+            !stale_up.Snapshot().region_active &&
+            stale_up.Snapshot().last_activity_monotonic_ms == 4'000,
+        "stale and negative mouse-up finish physical drag without renewing or adding stale geometry");
+  Check(untouched.ShortcutKeyDown(50, point()) == StartResult::kStarted &&
+            untouched.Snapshot().last_activity_monotonic_ms == 50 &&
+            untouched.PointerDown(point(), 60) &&
+            untouched.Cancel(CancelReason::kUser) &&
+            untouched.Snapshot().last_activity_monotonic_ms == 0 &&
+            untouched.Snapshot().regions.empty() &&
+            !untouched.PointerUp(point(), 70),
+        "a new session resets activity and explicit cancellation clears it");
 }
 
 void TestWatchdog() {
@@ -2374,12 +2613,90 @@ void TestReferenceDropdownSelectionAfterRealDeletion() {
 
 }  // namespace
 
+static void TestNativeWindowABA() {
+  using namespace seethis::core;
+  char name[]="/tmp/seethis-native-aba-XXXXXX";
+  const std::filesystem::path directory=mkdtemp(name);
+  {
+    ReferenceStore store(directory);int copies=0;
+    MarkController marks(store,[&](const StoredReference&){++copies;return true;});
+    auto a=DeleteContext();a.native_window={1,1234,"test-session",1};
+    auto b=a;b.window_id+=1;b.native_window.incarnation=2;
+    a.window_title=b.window_title="duplicate";
+    const std::string id(32,'a');
+    marks.SetWindowObservation(WindowFor(a,1));const auto generation=marks.Begin(id);
+    Check(marks.BindContext(generation,a),"new native A binds without title authority");
+    marks.Captured(generation,DeleteCapture());
+    marks.Release(generation,DeletePath(0),{1'000'004,1'004});store.WaitForIdleForTesting();
+    Check(marks.marks().size()==1&&marks.HitIdentity(DeletePath(0).front(),2,a.displays)==id,
+          "A paints and receives interaction with lifetime identity");
+    marks.SetWindowObservation(WindowFor(b,2));const auto before=copies;
+    Check(marks.marks().empty()&&!marks.HitIdentity(DeletePath(0).front(),2,a.displays)&&
+          !marks.RecopyJob(id)&&copies==before&&marks.inspector_jobs().size()==1,
+          "same-app native B hides A ink/hit/copy while preserving history");
+    marks.SetWindowObservation(WindowFor(a,3));
+    Check(marks.marks().size()==1&&marks.RecopyJob(id)&&copies==before+1,
+          "native A return restores eligibility without publishing from context refresh");
+    auto restarted=WindowFor(a,4);restarted.native_window.process_start_identity_us++;
+    marks.SetWindowObservation(restarted);
+    Check(marks.marks().empty()&&!marks.RecopyJob(id),"same PID/window tuple after app restart stays hidden");
+    marks.SetWindowObservation(WindowFor(a,3));
+    Check(marks.marks().empty(),"older matching observation cannot resurrect restarted process marks");
+  }
+  std::filesystem::remove_all(directory);
+}
+
+static void TestTitleWindowABA() {
+  using namespace seethis::core;
+  char name[]="/tmp/seethis-title-aba-XXXXXX";
+  const std::filesystem::path directory=mkdtemp(name);
+  for(int legacy=0;legacy<2;++legacy) {
+    ReferenceStore store(directory/std::to_string(legacy));int copies=0;
+    MarkController marks(store,[&](const StoredReference&){++copies;return true;});
+    auto a=DeleteContext();a.native_window={1,1234,"title-session",1};
+    a.window_title="Synthetic session A";a.title=legacy?TitleEvidence{}:TitleEvidence{1,TitleAvailability::kReady};
+    const std::string id(32,'a');marks.SetWindowObservation(WindowFor(a,1));
+    const auto g=marks.Begin(id);Check(marks.BindContext(g,a),"title A binds frozen same-window evidence");
+    marks.Captured(g,DeleteCapture());marks.Release(g,DeletePath(0),{1'000'004,1'004});store.WaitForIdleForTesting();
+    Check(marks.marks().size()==1,"new and historical title A expose real controller ink");
+    auto b=WindowFor(a,2);b.window_title="Synthetic session B";
+    marks.SetWindowObservation(b);const auto before=copies;
+    Check(marks.marks().empty()&&!marks.HitIdentity(DeletePath(0).front(),2,a.displays)&&
+          !marks.RecopyJob(id)&&marks.DeleteJob(id)==DeleteResult::kNotFound&&copies==before&&
+          marks.inspector_jobs().size()==1,
+          "same native B suppresses paint hit copy delete while keeping Inspector history");
+    marks.SetWindowObservation(WindowFor(a,1));
+    Check(marks.marks().empty(),"late matching A callback cannot replace newer B title");
+    marks.SetWindowObservation(WindowFor(a,3));
+    Check(marks.marks().size()==1&&marks.RecopyJob(id)&&copies==before+1,
+          "fresh A return restores exactly the original mark and copy eligibility");
+    auto denied=WindowFor(a,4);denied.title.availability=TitleAvailability::kDenied;
+    marks.SetWindowObservation(denied);
+    Check(marks.marks().empty()&&!marks.HitIdentity(DeletePath(0).front(),2,a.displays),
+          "same bytes with denied live title hide every interactive projection");
+    marks.SetWindowObservation(WindowFor(a,5));
+    Check(marks.marks().size()==1&&store.MarkSnapshots(id).marks[0].number==1,
+          "title availability return preserves stable numbering");
+    auto ambiguous=WindowFor(a,6);ambiguous.title.availability=TitleAvailability::kAmbiguous;
+    marks.SetWindowObservation(ambiguous);
+    Check(marks.marks().empty()&&marks.CopyHistoryJob(id),
+          "independently known identical-title ambiguity hides overlay while history copy remains explicit");
+  }
+  std::filesystem::remove_all(directory);
+}
+
 int main() {
+  TestTitleWindowABA();
+  TestNativeWindowABA();
   TestHoldMoveRelease();
   TestActiveAndEmptyRelease();
   TestCancellationRoutes();
   TestCaptureReleaseOrders();
   TestWatchdog();
+  TestMarkIdleTimeout();
+#if defined(__APPLE__)
+  TestNativeDragIdleTimeout();
+#endif
   TestGeometryAndScale();
   TestValidationAndHitRegions();
   TestDeleteGestureReducer();

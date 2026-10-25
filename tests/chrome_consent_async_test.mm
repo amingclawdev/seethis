@@ -2,6 +2,7 @@
 #import "../src/platform/mac/input_mac.mm"
 #import "../src/platform/mac/overlay_mac.mm"
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 
@@ -201,6 +202,8 @@ static void TestOutcomes() {
 struct InputOverlay final : OverlayAdapter {
   seethis::core::InteractionController* controller;
   int drawing=0,finished=0,refreshes=0;
+  std::function<void()> onObservation,onPointMapping;
+  std::function<void(ViewportInput,const std::optional<seethis::core::DisplayPoint>&)> onViewportInput;
   explicit InputOverlay(seethis::core::InteractionController* value):controller(value) {}
   void Refresh() override {
     ++refreshes;
@@ -208,10 +211,15 @@ struct InputOverlay final : OverlayAdapter {
     if(state==seethis::core::InteractionState::kDrawing)++drawing;
     if(state==seethis::core::InteractionState::kFinished)++finished;
   }
+  void ObserveViewportInput(ViewportInput event,const std::optional<seethis::core::DisplayPoint>& point = {}) override {
+    if(onViewportInput)onViewportInput(event,point);
+    if(onObservation)onObservation();
+  }
   void RebuildDisplays() override {}
   void UpdatePointerPolicy(const std::optional<seethis::core::DisplayPoint>&) override {}
   std::optional<seethis::core::DisplayPoint> DisplayPointAtGlobalLogical(
       seethis::core::Point2D point) const override {
+    if(onPointMapping)onPointMapping();
     return seethis::core::DisplayPoint{1,seethis::core::CoordinateUnit::kLogicalPoints,point,1};
   }
   void ToggleInspector() override {}
@@ -228,9 +236,12 @@ struct InputFixture {
   std::array<bool,128> keys{};
   CGEventFlags flags=kCGEventFlagMaskAlternate;
   pid_t foreground=123;
+  seethis::core::DeleteEventProvenance lastCarbonPress;
   std::unique_ptr<MacInputAdapter> input;
   const seethis::core::DisplayPoint pointer{1,seethis::core::CoordinateUnit::kLogicalPoints,{10,10},1};
-  InputFixture() {
+  explicit InputFixture(std::filesystem::path owned={})
+      :directory(owned.empty()?std::filesystem::current_path()/
+          ("hotkey-consent-fixture-"+std::to_string(getpid())):std::move(owned)) {
     readiness->input_monitor=InputMonitorState::kGranted;
     input=std::make_unique<MacInputAdapter>(&controller,&overlay,&settings,readiness,&deletion);
     Bind();
@@ -246,16 +257,18 @@ struct InputFixture {
     Require(CreateEvent(nullptr,kEventClassKeyboard,kind,
         time.value_or(GetCurrentEventTime()+0.001),kEventAttributeNone,&event)==noErr,
         "could not create local Carbon event");
+    if(kind==kEventHotKeyPressed)lastCarbonPress=CarbonEventProvenance(GetEventTime(event));
     EventHotKeyID identity{kCaptureHotKeySignature,
         generation.value_or(static_cast<UInt32>(input->CaptureGenerationForTesting()))};
     Require(SetEventParameter(event,kEventParamDirectObject,typeEventHotKeyID,
         sizeof(identity),&identity)==noErr,"could not identify Carbon event");
     const auto result=input->HotKeyForTesting(event);ReleaseEvent(event);return result;
   }
-  void Raw(CGEventType type,CGKeyCode key) {
+  void Raw(CGEventType type,CGKeyCode key,std::optional<std::uint64_t> timestamp={}) {
     CGEventRef event=CGEventCreateKeyboardEvent(nullptr,key,type==kCGEventKeyDown);
     Require(event!=nullptr,"could not create local keyboard event");
     CGEventSetFlags(event,flags);
+    if(timestamp)CGEventSetTimestamp(event,*timestamp);
     input->RawEventForTesting(type,event);CFRelease(event);
   }
   void Up(bool raw=false) {
@@ -422,10 +435,199 @@ static void TestPhysicalDrawingInterruption() {
   PumpUntil([&]{return !ChromeConnectionStatus().consent_pending;});input.Idle();input.Up();
 }
 
-int main() {
+// Actual MacInputAdapter callbacks, local unposted event objects and injected
+// snapshots. No Start, live tap, global hotkey, app panel or clipboard operation.
+static void TestCaptureRawReleaseIngress() {
+  using namespace seethis::core;
+  auto fake=Configure();fake->Foreground({}); // capture target is not Chrome
+  const auto make=[](bool invalidSettings=false) {
+    char pattern[]="/tmp/seethis-r2-input-XXXXXX";const char* path=mkdtemp(pattern);
+    Require(path,"R2 temporary directory unavailable");
+    if(invalidSettings){std::ofstream file(std::filesystem::path(path)/"settings.json");file<<"invalid-owned-fixture";}
+    return std::make_unique<InputFixture>(std::filesystem::path(path));
+  };
+  const auto now=[] {return CurrentCarbonEventProvenance().earliest_ns;};
+  const auto rawUp=[&](InputFixture& f,CGKeyCode key) {
+    usleep(2000);const auto stamp=now();f.Raw(kCGEventKeyUp,key,stamp);return stamp;
+  };
+  const auto press=[](InputFixture& f) {
+    usleep(2000);const auto binding=f.settings.Get();f.keys[binding.shortcut_key_code]=true;
+    f.flags=NativeModifiers(binding.shortcut_modifiers);f.Carbon();
+  };
+  const auto twoStrokes=[](InputFixture& f) {
+    const auto before=f.overlay.drawing;
+    for(int index=0;index<2;++index) {
+      const auto point=seethis::core::DisplayPoint{1,CoordinateUnit::kLogicalPoints,{10.0,20.0+index*20},1};
+      auto end=point;end.position.x+=20;
+      Require(f.controller.PointerDown(point)&&f.controller.PointerMoved(end)&&f.controller.PointerUp(end),
+          "R2 actual-adapter-started controller rejected stroke");
+      Require(f.controller.Snapshot().state==InteractionState::kDrawing,"R2 mouse up incorrectly finished hold");
+    }
+    Require(f.controller.Snapshot().regions.size()==2&&f.overlay.drawing==before,
+        "R2 two strokes must not create a second input admission");
+  };
+  {
+    auto owned=make();auto& f=*owned;const auto key=f.settings.Get().shortcut_key_code;
+    // Same adapter/controller/hold/registration across both rounds. Append is
+    // not an input concern; R1's unchanged selector separately covers OFF/ON.
+    for(int round=0;round<2;++round) {
+      const auto before=f.overlay.drawing;press(f);
+      Require(f.controller.Snapshot().state==InteractionState::kDrawing&&f.overlay.drawing==before+1,
+          round==0?"R2 first Carbon press did not enter controller/overlay exactly once":
+          "R2 second-round Carbon press did not enter controller/overlay exactly once");
+      twoStrokes(f);
+      if(round==0)f.Carbon(kEventHotKeyReleased);
+      else {f.flags=0;f.Raw(kCGEventFlagsChanged,58);}
+      Require(f.controller.Snapshot().state==InteractionState::kFinished&&f.input->CaptureHeldForTesting(),
+          "R2 release completion must not clear original held main key");
+      f.flags=NativeModifiers(f.settings.Get().shortcut_modifiers);
+      const auto finished=f.overlay.finished;const auto drawing=f.overlay.drawing;
+      const auto stamp=rawUp(f,key); // Combined remains DOWN: the source-bound counterexample.
+      Require(!f.input->CaptureHeldForTesting()&&f.keys[key]&&f.overlay.drawing==drawing&&f.overlay.finished==finished,
+          "R2 matching raw up must rearm without completion/replay/autostart");
+      const auto floor=f.input->CaptureBoundaryForTesting();
+      Require(floor.valid()&&floor.latest_ns>=stamp,"R2 event release did not advance monotonic floor");
+    }
+    press(f);const auto drawing=f.overlay.drawing;const auto heldPress=f.lastCarbonPress;
+    f.Carbon();Require(f.overlay.drawing==drawing,"R2 still-held press repeated capture");
+    const auto floor=f.input->CaptureBoundaryForTesting();
+    usleep(2000);
+    for(const std::uint64_t stamp:std::array<std::uint64_t,4>{0,1,heldPress.latest_ns,now()+10'000'000'000ULL}) {
+      f.Raw(kCGEventKeyUp,key,stamp);
+      Require(f.input->CaptureHeldForTesting()&&f.input->CaptureBoundaryForTesting().latest_ns==floor.latest_ns,
+          "R2 invalid/prepress/future release cleared hold or changed floor");
+    }
+    f.Raw(kCGEventKeyUp,static_cast<CGKeyCode>(key+1),now());
+    Require(f.input->CaptureHeldForTesting(),"R2 wrong key cleared hold");
+    // Rebinding advances the floor but preserves the immutable original hold.
+    f.Bind();const auto reboundFloor=f.input->CaptureBoundaryForTesting();
+    const auto oldRelease=rawUp(f,key);Require(!f.input->CaptureHeldForTesting(),"R2 same-key rebind lost original release");
+    press(f);const auto next=f.overlay.drawing;
+    f.Raw(kCGEventKeyUp,key,oldRelease);f.Carbon();
+    Require(f.input->CaptureHeldForTesting()&&f.overlay.drawing==next&&
+        f.input->CaptureBoundaryForTesting().latest_ns>=reboundFloor.latest_ns,
+        "R2 delayed old up rearmed a later hold or lowered registration floor");
+    // Physical-false fallback still retires the associated record coherently.
+    f.keys[key]=false;f.Carbon(kEventHotKeyReleased);
+    Require(!f.input->CaptureHeldForTesting(),"R2 physical-false fallback stopped working");
+  }
+  {
+    auto owned=make();auto& f=*owned;press(f);twoStrokes(f);
+    const auto original=f.settings.Get().shortcut_key_code;
+    const auto acceptedPress=CurrentCarbonEventProvenance(); // latest bound after accepted press
+    f.Carbon(kEventHotKeyReleased);const auto before=f.overlay.drawing;
+    f.Carbon();Require(f.overlay.drawing==before,"R2 Carbon release alone rearmed a held key");
+    const auto oldFloor=f.input->CaptureBoundaryForTesting();
+    f.Raw(kCGEventKeyUp,original,acceptedPress.earliest_ns-10'000'000);
+    Require(f.input->CaptureHeldForTesting()&&f.input->CaptureBoundaryForTesting().latest_ns==oldFloor.latest_ns,
+        "R2 stale prepress receipt changed current hold/floor");
+    // Original key survives a different-key binding and focus cancellation.
+    auto binding=f.settings.Get();binding.shortcut_key_code=8;
+    Require(f.settings.Update(binding),"R2 owned different-key binding rejected");f.Bind();
+    f.foreground=456;f.input->FocusChangedForTesting();
+    Require(f.input->CaptureHeldForTesting(),"R2 focus/binding change discarded original hold");
+    const auto advanced=f.input->CaptureBoundaryForTesting();
+    f.overlay.onObservation=[&]{Require(!f.input->CaptureHeldForTesting(),"R2 release consumer ran after synchronous presentation work");};
+    const auto originalUp=rawUp(f,original);f.overlay.onObservation={};
+    Require(!f.input->CaptureHeldForTesting()&&f.input->CaptureBoundaryForTesting().latest_ns>=advanced.latest_ns,
+        "R2 original key could not release across different-key rebind");
+    press(f);Require(f.controller.Snapshot().state==InteractionState::kDrawing,"R2 fresh new binding did not start");
+    f.Raw(kCGEventKeyUp,original,originalUp);f.Carbon();
+    Require(f.input->CaptureHeldForTesting(),"R2 old original key release cleared newly bound hold");
+    // Valid release after an already rejected press does not replay that press.
+    f.Carbon(kEventHotKeyReleased);const auto drawing=f.overlay.drawing;
+    rawUp(f,binding.shortcut_key_code);
+    Require(f.overlay.drawing==drawing,"R2 late release automatically replayed a rejected press");
+  }
+  {
+    auto owned=make();auto& f=*owned;press(f);twoStrokes(f);
+    const auto key=f.settings.Get().shortcut_key_code;
+    f.foreground=456;f.input->FocusChangedForTesting();
+    Require(f.input->CaptureHeldForTesting()&&f.controller.Snapshot().state==InteractionState::kIdle,
+        "R2 focus interruption must not discard physical hold");
+    f.input->RawEventForTesting(kCGEventTapDisabledByUserInput,nullptr);
+    Require(f.input->CaptureHeldForTesting()&&f.controller.Snapshot().state==InteractionState::kIdle,
+        "R2 monitor interruption must cancel without clearing held key");
+    rawUp(f,key);const auto drawing=f.overlay.drawing;
+    f.Carbon();Require(f.overlay.drawing==drawing,"R2 raw release bypassed unhealthy monitor");
+    f.readiness->input_monitor=InputMonitorState::kGranted;
+    f.input->CaptureRegisteredForTesting(false);f.Carbon();
+    Require(f.overlay.drawing==drawing,"R2 raw release bypassed registration readiness");
+    f.input->CaptureRegisteredForTesting(true);
+    f.Carbon(kEventHotKeyPressed,static_cast<UInt32>(f.input->CaptureGenerationForTesting()-1));
+    f.Carbon(kEventHotKeyPressed,{},GetCurrentEventTime()-1);
+    f.flags|=kCGEventFlagMaskCommand;f.Carbon();
+    Require(f.overlay.drawing==drawing&&!f.input->CaptureHeldForTesting(),
+        "R2 stale generation/provenance/extra modifier bypassed admission");
+    press(f);Require(f.overlay.drawing==drawing+1,"R2 healthy fresh press did not recover");
+  }
+  {
+    auto owned=make(true);auto& f=*owned;Require(!f.settings.usable(),"R2 malformed owned config fixture not invalid");
+    press(f);Require(!f.input->CaptureHeldForTesting()&&f.overlay.drawing==0,"R2 unavailable settings admitted capture");
+  }
+  // Existing injected consent backend only; no real Automation request or UI.
+  fake=Configure();
+  {
+    auto owned=make();auto& f=*owned;press(f);
+    PumpUntil([&]{return fake->asks==1;});
+    Require(f.input->CaptureHeldForTesting()&&f.overlay.drawing==0,"R2 consent entry must consume hold without drawing");
+    f.flags=0;f.Raw(kCGEventFlagsChanged,58);f.flags=kCGEventFlagMaskAlternate;f.Carbon(kEventHotKeyReleased);f.Carbon();
+    Require(fake->asks==1&&f.overlay.drawing==0&&f.input->CaptureHeldForTesting(),"R2 modifier/Carbon release bypassed consent hold");
+    rawUp(f,f.settings.Get().shortcut_key_code);
+    Require(f.overlay.drawing==0,"R2 consent release auto-started drawing");
+    fake->Release();PumpUntil([&]{return !ChromeConnectionStatus().consent_pending;});
+  }
+  StopChromeConnection();
+  std::cout<<"R2 actual-adapter raw-release/rebind/provenance/readiness/two-round multi-stroke checks PASS\n";
+}
+
+// Local CG objects only, fed into the actual unstarted input callback. The
+// existing physical-input seam supplies display conversion, never NSScreen.
+static void TestSourceFocusEventIngress() {
+  InputFixture f;double top=100;
+  f.input->ConfigureCaptureForTesting({[&](CGKeyCode key){return f.keys[key];},
+      [&]{return f.flags;},[&]{return f.foreground;},[&]{return top;}},f.pointer);
+  for(const auto type:{kCGEventLeftMouseDown,kCGEventRightMouseDown,kCGEventOtherMouseDown,
+      kCGEventLeftMouseDragged,kCGEventRightMouseDragged,kCGEventOtherMouseDragged,kCGEventScrollWheel}) {
+    CGEventRef event=type==kCGEventScrollWheel?
+        CGEventCreateScrollWheelEvent(nullptr,kCGScrollEventUnitPixel,1,1):
+        CGEventCreateMouseEvent(nullptr,type,CGPointMake(25,30),kCGMouseButtonLeft);
+    Require(event,"owned mouse event created");CGEventSetLocation(event,CGPointMake(25,30));CGEventSetTimestamp(event,CurrentCarbonEventProvenance().earliest_ns);
+    unsigned mappings=0,delivered=0;
+    f.overlay.onPointMapping=[&]{++mappings;CGEventSetLocation(event,CGPointMake(80,90));};
+    f.overlay.onViewportInput=[&](ViewportInput kind,const auto& point) {
+      if(kind==ViewportInput::kInterrupted)return;
+      ++delivered;
+      const auto expected=type==kCGEventLeftMouseDown?ViewportInput::kPrimaryDown:
+          type==kCGEventScrollWheel?ViewportInput::kScroll:ViewportInput::kPointer;
+      Require(kind==expected,"F3 actual adapter maps only fresh primary down, never right/other/drag/scroll");
+      Require(point&&point->position.x==25&&point->position.y==70&&point->display_id==1&&point->backing_scale==1,
+          "F3 actual adapter forwards latched original CG down point despite later event/pointer movement");
+    };
+    f.input->RawEventForTesting(type,event);
+    Require(delivered==1&&mappings==1,"F3 event point is converted once before presentation callbacks");
+    CFRelease(event);
+  }
+  f.overlay.onPointMapping={};
+  auto stale=CGEventCreateMouseEvent(nullptr,kCGEventLeftMouseDown,CGPointMake(25,30),kCGMouseButtonLeft);
+  CGEventSetTimestamp(stale,1);unsigned staleCalls=0;
+  f.overlay.onViewportInput=[&](ViewportInput kind,const auto&) {
+    if(kind==ViewportInput::kInterrupted)return;
+    ++staleCalls;Require(kind==ViewportInput::kPointer,"F3 delayed/invalid timestamp fails closed as generic pointer");
+  };
+  f.input->RawEventForTesting(kCGEventLeftMouseDown,stale);CFRelease(stale);
+  Require(staleCalls==1,"F3 stale native event still invalidates through ordinary pointer policy");
+  std::cout<<"F3 actual unstarted adapter primary/right/other/drag/scroll original event-point and stale-event checks passed\n";
+}
+
+int main(int argc,char** argv) {
   @autoreleasepool {
     try {
       Require(NSThread.isMainThread,"test must own main thread");
+      TestSourceFocusEventIngress();
+      if(argc==2&&std::string_view(argv[1])=="--focus-pointer-component-only")return 0;
+      TestCaptureRawReleaseIngress();
+      if(argc==2&&std::string_view(argv[1])=="--capture-rearm-component-only")return 0;
       TestActionsAndMainProgress(false);TestActionsAndMainProgress(true);
       TestQueuedStaleTarget();TestQueuedStaleTarget(true);TestQueuedStaleTarget(false,true);
       TestOutstandingInvalidation(false,true,false);

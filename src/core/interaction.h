@@ -160,6 +160,8 @@ struct InteractionSnapshot {
   // These are not hardware event timestamps or capture timestamps.
   std::int64_t key_down_monotonic_ms = 0;
   std::int64_t key_up_monotonic_ms = 0;
+  // Idle deadline bookkeeping, separate from original session provenance.
+  std::int64_t last_activity_monotonic_ms = 0;
 
   [[nodiscard]] bool captures_pointer() const {
     return state == InteractionState::kDrawing;
@@ -168,7 +170,7 @@ struct InteractionSnapshot {
 
 class InteractionController {
  public:
-  static constexpr std::int64_t kDefaultMaximumHoldMilliseconds = 30'000;
+  static constexpr std::int64_t kDefaultMaximumHoldMilliseconds = 300'000;
   // A listen-only physical-state sample can precede the queued Carbon/CG
   // release callback. Keep the session alive for a bounded callback drain.
   static constexpr std::int64_t kReleaseReconciliationMilliseconds = 250;
@@ -177,9 +179,14 @@ class InteractionController {
                                             DisplayPoint initial_point,
                                             bool autorepeat = false);
   void SetSelectedDisplayGeometry(DisplayGeometry geometry);
-  [[nodiscard]] bool PointerMoved(DisplayPoint point);
-  [[nodiscard]] bool PointerDown(DisplayPoint point);
-  [[nodiscard]] bool PointerUp(DisplayPoint point);
+  // Timed events use the keyboard/watchdog monotonic clock. Legacy untimed
+  // callers retain drawing behavior but do not renew the idle deadline.
+  [[nodiscard]] bool PointerMoved(
+      DisplayPoint point, std::optional<std::int64_t> monotonic_ms = {});
+  [[nodiscard]] bool PointerDown(
+      DisplayPoint point, std::optional<std::int64_t> monotonic_ms = {});
+  [[nodiscard]] bool PointerUp(
+      DisplayPoint point, std::optional<std::int64_t> monotonic_ms = {});
   [[nodiscard]] bool ShortcutKeyUp(std::int64_t monotonic_ms);
   [[nodiscard]] bool ShortcutModifierUp(std::int64_t monotonic_ms);
   [[nodiscard]] bool Cancel(CancelReason reason);
@@ -196,11 +203,16 @@ class InteractionController {
   [[nodiscard]] bool Complete(std::int64_t monotonic_ms,
                               CompletionReason reason);
   void FinishActiveRegion();
+  [[nodiscard]] bool ActivityTimeValid(
+      std::optional<std::int64_t> monotonic_ms) const;
+  void RecordActivity(std::optional<std::int64_t> monotonic_ms);
   InteractionState state_ = InteractionState::kIdle;
   CancelReason cancel_reason_ = CancelReason::kNone;
   CompletionReason completion_reason_ = CompletionReason::kNone;
   std::int64_t drawing_started_ms_ = 0;
   std::int64_t drawing_finished_ms_ = 0;
+  std::int64_t last_activity_ms_ = 0;
+  std::int64_t last_observed_ms_ = 0;
   DisplayId selected_display_id_ = 0;
   double selected_backing_scale_ = 0;
   DisplayPoint session_origin_;

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -20,7 +21,8 @@ struct Settings {
   std::uint32_t shortcut_modifiers = kShortcutOption;
   std::uint16_t delete_shortcut_key_code = 2;  // macOS ANSI D.
   std::uint32_t delete_shortcut_modifiers = kShortcutOption;
-  std::int64_t maximum_hold_ms = 30'000;
+  // Maximum inactivity during marking; accepted timed pointer activity renews it.
+  std::int64_t maximum_hold_ms = 300'000;
   double crop_margin_points = 8.0;
   double mark_hit_radius_points = 10.0;
   std::int64_t reference_ttl_seconds = 7 * 24 * 60 * 60;
@@ -50,9 +52,37 @@ enum class SettingsLoadState {
 [[nodiscard]] std::optional<Settings> ParseSettingsJson(
     const std::string& json, std::string* error = nullptr);
 
+// A snapshot is the only presentation authority. Legacy mark bits are dormant.
+enum class GlobalVisibilityState { kVisible, kInvisible, kUncertain, kUnavailable };
+struct GlobalVisibilitySnapshot {
+  GlobalVisibilityState state = GlobalVisibilityState::kUnavailable;
+  bool initialized_this_session = false;
+  std::string error;
+  [[nodiscard]] bool permits_presentation() const {
+    return state == GlobalVisibilityState::kVisible;
+  }
+  [[nodiscard]] const char* name() const {
+    switch (state) {
+      case GlobalVisibilityState::kVisible: return "visible";
+      case GlobalVisibilityState::kInvisible: return "invisible";
+      case GlobalVisibilityState::kUncertain: return "uncertain";
+      case GlobalVisibilityState::kUnavailable: return "unavailable";
+    }
+    return "unavailable";
+  }
+};
+// Optional fault seam at the real persistence boundaries; empty in production.
+enum class SettingsPersistPoint { kBeforeRename, kDirectorySync };
+using SettingsPersistHook = std::function<bool(SettingsPersistPoint)>;
+
 class SettingsStore {
  public:
-  explicit SettingsStore(std::filesystem::path path);
+  explicit SettingsStore(std::filesystem::path path,
+                         SettingsPersistHook persist_hook = {});
+
+  [[nodiscard]] GlobalVisibilitySnapshot Visibility() const;
+  [[nodiscard]] bool SetGlobalVisibility(bool visible, std::string* error = nullptr);
+  [[nodiscard]] bool ToggleGlobalVisibility(std::string* error = nullptr);
 
   [[nodiscard]] Settings Get() const;
   [[nodiscard]] SettingsLoadState load_state() const { return load_state_; }
@@ -67,12 +97,18 @@ class SettingsStore {
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
 
  private:
-  bool Persist(const Settings& settings, const std::string& secret,
-               std::string* error);
+  enum class PersistResult { kFailed, kUncertain, kConfirmed };
+  PersistResult Persist(const Settings& settings, const std::string& secret,
+                        bool visible, std::string* error);
+  bool CommitLocked(const Settings& settings, bool visible, std::string* error);
+  bool ConfirmDurability(std::string* error) const;
 
   std::filesystem::path path_;
   mutable std::mutex mutex_;
-  std::mutex update_mutex_;
+  SettingsPersistHook persist_hook_;
+  bool global_reference_visible_ = true;
+  bool visibility_initialized_ = false;
+  GlobalVisibilitySnapshot visibility_;
   Settings settings_;
   std::string reference_secret_;
   SettingsLoadState load_state_ = SettingsLoadState::kReady;

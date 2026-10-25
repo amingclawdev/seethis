@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <set>
@@ -23,6 +24,7 @@ namespace seethis::core {
 namespace {
 
 constexpr std::size_t kMaxSettingsBytes = 16 * 1024;
+constexpr std::int64_t kStoredSettingsSchema = 4;
 
 std::string Hex(const unsigned char* bytes, std::size_t size) {
   static constexpr char digits[] = "0123456789abcdef";
@@ -176,7 +178,8 @@ std::optional<Settings> ParsePublic(const FlatObject& values,
                                     std::string* error) {
   std::int64_t schema = 0;
   if (!Integer(values, "schema", &schema) ||
-      (schema != 1 && schema != 2)) {
+      (schema != 1 && schema != 2 &&
+       !(allow_legacy && (schema == 3 || schema == kStoredSettingsSchema)))) {
     if (error) *error = "unsupported settings schema";
     return {};
   }
@@ -189,7 +192,7 @@ std::optional<Settings> ParsePublic(const FlatObject& values,
       "maximum_hold_ms", "crop_margin_points", "mark_hit_radius_points",
       "reference_ttl_seconds", "maximum_visible_references"};
   auto allowed = legacy_allowed;
-  if (schema == 2) {
+  if (schema >= 2) {
     allowed.insert("delete_shortcut_key_code");
     allowed.insert("delete_shortcut_modifiers");
   }
@@ -204,7 +207,7 @@ std::optional<Settings> ParsePublic(const FlatObject& values,
   double crop = 0, hit = 0;
   if (!Integer(values, "shortcut_key_code", &key) ||
       !Integer(values, "shortcut_modifiers", &modifiers) ||
-      (schema == 2 &&
+      (schema >= 2 &&
        (!Integer(values, "delete_shortcut_key_code", &delete_key) ||
         !Integer(values, "delete_shortcut_modifiers", &delete_modifiers))) ||
       !Integer(values, "maximum_hold_ms", &hold) ||
@@ -226,21 +229,28 @@ std::optional<Settings> ParsePublic(const FlatObject& values,
   settings.delete_shortcut_key_code = static_cast<std::uint16_t>(delete_key);
   settings.delete_shortcut_modifiers =
       static_cast<std::uint32_t>(delete_modifiers);
-  settings.maximum_hold_ms = hold;
+  // Only persisted older schemas carry the historical 30-second default.
+  // Public API schema 2 stays compatible and never rewrites explicit updates.
+  settings.maximum_hold_ms =
+      allow_legacy && schema < 3 && hold == 30'000
+          ? Settings{}.maximum_hold_ms : hold;
   settings.crop_margin_points = crop;
   settings.mark_hit_radius_points = hit;
   settings.reference_ttl_seconds = ttl;
   settings.maximum_visible_references = static_cast<std::size_t>(maximum);
   if (!ValidateSettings(settings, error)) return {};
-  if (migrated_legacy) *migrated_legacy = schema == 1;
+  if (migrated_legacy) *migrated_legacy = schema < kStoredSettingsSchema;
   return settings;
 }
 
-std::string StoredJson(const Settings& settings, const std::string& secret) {
+std::string StoredJson(const Settings& settings, const std::string& secret, bool visible) {
   std::string json = SettingsJson(settings);
+  // Storage evolution is independent of the existing public API schema.
+  json.replace(0, std::string("{\"schema\":2").size(), "{\"schema\":4");
   json.pop_back();
   return json.substr(0, json.size() - 1) +
-         ",\"reference_secret\":\"" + secret + "\"}\n";
+         ",\"reference_secret\":\"" + secret + "\",\"visibility_initialized\":1," +
+         "\"global_reference_visible\":" + (visible ? "1" : "0") + "}\n";
 }
 
 }  // namespace
@@ -262,8 +272,8 @@ bool ValidateSettings(const Settings& settings, std::string* error) {
       (settings.delete_shortcut_modifiers & ~kAllModifiers) != 0)
     return fail("delete shortcut modifiers out of range");
   if (settings.maximum_hold_ms < 1'000 ||
-      settings.maximum_hold_ms > 120'000)
-    return fail("maximum hold must be between 1000 and 120000 ms");
+      settings.maximum_hold_ms > 300'000)
+    return fail("maximum inactivity must be between 1000 and 300000 ms");
   if (!std::isfinite(settings.crop_margin_points) ||
       settings.crop_margin_points < 0 || settings.crop_margin_points > 128)
     return fail("crop margin must be between 0 and 128 points");
@@ -287,6 +297,7 @@ bool ShortcutBindingsConflict(const Settings& settings) {
 
 std::string SettingsJson(const Settings& settings) {
   std::ostringstream out;
+  out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\"schema\":2,\"shortcut_key_code\":"
       << settings.shortcut_key_code << ",\"shortcut_modifiers\":"
       << settings.shortcut_modifiers << ",\"delete_shortcut_key_code\":"
@@ -317,15 +328,18 @@ std::optional<Settings> ParseSettingsJson(const std::string& json,
   return ParsePublic(*values, false, nullptr, error);
 }
 
-SettingsStore::SettingsStore(std::filesystem::path path)
-    : path_(std::move(path)), reference_secret_(RandomSecret()) {
+SettingsStore::SettingsStore(std::filesystem::path path,
+                             SettingsPersistHook persist_hook)
+    : path_(std::move(path)), persist_hook_(std::move(persist_hook)),
+      reference_secret_(RandomSecret()) {
   if (!std::filesystem::exists(path_)) {
     std::string error;
-    if (Persist(settings_, reference_secret_, &error)) {
+    if (CommitLocked(settings_, true, &error)) {
       reference_capability_available_ = true;
+      visibility_.initialized_this_session = true;
     } else {
-      load_state_ = SettingsLoadState::kInvalid;
-      load_error_ = std::move(error);
+      // Keep initialization retryable without inventing a confirmed default.
+      reference_capability_available_ = visibility_.state == GlobalVisibilityState::kUncertain;
     }
     return;
   }
@@ -347,30 +361,109 @@ SettingsStore::SettingsStore(std::filesystem::path path)
     std::int64_t schema = 0;
     if (!Integer(*values, "schema", &schema) || schema < 1)
       throw std::runtime_error("settings schema is invalid");
-    if (schema > 2) {
+    if (schema > kStoredSettingsSchema) {
       load_state_ = SettingsLoadState::kUnsupported;
       load_error_ = "unsupported settings schema; existing file preserved";
+      visibility_.error = load_error_;
       return;
     }
     values->erase("reference_secret");
+    bool needs_initialization = schema < kStoredSettingsSchema;
+    if (schema == kStoredSettingsSchema) {
+      std::int64_t initialized = 0, visible = 0;
+      if (!Integer(*values, "visibility_initialized", &initialized) || (initialized != 0 && initialized != 1) ||
+          !Integer(*values, "global_reference_visible", &visible) || (visible != 0 && visible != 1))
+        throw std::runtime_error("settings visibility state is invalid");
+      needs_initialization = initialized == 0;
+      global_reference_visible_ = visible == 1;
+      values->erase("visibility_initialized");
+      values->erase("global_reference_visible");
+    }
     std::string error;
-    bool migrated_legacy = false;
-    auto parsed = ParsePublic(*values, true, &migrated_legacy, &error);
+    auto parsed = ParsePublic(*values, true, nullptr, &error);
     if (!parsed) {
       load_state_ = error == "settings keys must match schema exactly"
           ? SettingsLoadState::kUnsupported : SettingsLoadState::kInvalid;
       load_error_ = error + "; existing file preserved";
+      visibility_.error = load_error_;
       return;
     }
     settings_ = *parsed;
-    if (migrated_legacy) {
-      std::string ignored;
-      (void)Persist(settings_, reference_secret_, &ignored);
+    if (needs_initialization) {
+      global_reference_visible_ = true;
+      if (CommitLocked(settings_, true, &error))
+        visibility_.initialized_this_session = true;
+    } else {
+      // A successful read, including equal bytes after rename, is not a sync.
+      visibility_initialized_ = true;
+      if (ConfirmDurability(&error)) {
+        visibility_.state = global_reference_visible_ ? GlobalVisibilityState::kVisible
+                                                    : GlobalVisibilityState::kInvisible;
+      } else {
+        visibility_.state = GlobalVisibilityState::kUncertain;
+        visibility_.error = error;
+      }
     }
   } catch (const std::exception& exception) {
     load_state_ = SettingsLoadState::kInvalid;
     load_error_ = std::string(exception.what()) + "; existing file preserved";
+    visibility_.error = load_error_;
   }
+}
+
+GlobalVisibilitySnapshot SettingsStore::Visibility() const {
+  std::lock_guard lock(mutex_);
+  return visibility_;
+}
+
+bool SettingsStore::ConfirmDurability(std::string* error) const {
+  const int file = open(path_.c_str(), O_RDONLY);
+  const bool file_synced = file >= 0 && fsync(file) == 0;
+  if (file >= 0) close(file);
+  const int directory = open(path_.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+  const bool directory_synced = directory >= 0 &&
+      (!persist_hook_ || persist_hook_(SettingsPersistPoint::kDirectorySync)) &&
+      fsync(directory) == 0;
+  if (directory >= 0) close(directory);
+  if (!file_synced || !directory_synced) {
+    if (error) *error = "settings durability uncertain; retry required";
+    return false;
+  }
+  return true;
+}
+
+bool SettingsStore::CommitLocked(const Settings& settings, bool visible, std::string* error) {
+  std::string failure;
+  const auto result = Persist(settings, reference_secret_, visible, &failure);
+  if (result == PersistResult::kFailed) {
+    visibility_.error = failure;
+    if (error) *error = failure;
+    return false;
+  }
+  settings_ = settings;
+  global_reference_visible_ = visible;
+  visibility_initialized_ = true;
+  reference_capability_available_ = true;
+  visibility_.state = result == PersistResult::kUncertain ? GlobalVisibilityState::kUncertain
+      : visible ? GlobalVisibilityState::kVisible : GlobalVisibilityState::kInvisible;
+  visibility_.error = failure;
+  if (error) *error = failure;
+  return result == PersistResult::kConfirmed;
+}
+
+bool SettingsStore::SetGlobalVisibility(bool visible, std::string* error) {
+  std::lock_guard lock(mutex_);
+  if (!usable()) { if (error) *error = load_error_; return false; }
+  return CommitLocked(settings_, visible, error);
+}
+
+bool SettingsStore::ToggleGlobalVisibility(std::string* error) {
+  std::lock_guard lock(mutex_);
+  if (!usable()) { if (error) *error = load_error_; return false; }
+  // Retry an uncertain/uninitialized choice rather than interpreting it as Invisible.
+  const bool next = visibility_.state == GlobalVisibilityState::kUncertain ||
+      !visibility_initialized_ ? global_reference_visible_ : !global_reference_visible_;
+  return CommitLocked(settings_, next, error);
 }
 
 Settings SettingsStore::Get() const {
@@ -392,22 +485,20 @@ bool SettingsStore::Update(const Settings& settings, std::string* error) {
     if (error) *error = "capture and delete shortcuts conflict";
     return false;
   }
-  std::lock_guard update_lock(update_mutex_);
+  std::lock_guard lock(mutex_);
   if (!usable()) {
     if (error) *error = load_error_;
     return false;
   }
-  std::string secret;
-  {std::lock_guard lock(mutex_);secret=reference_secret_;}
-  if (!Persist(settings, secret, error)) return false;
-  {std::lock_guard lock(mutex_);settings_=settings;}
-  return true;
+  // Public schema-2 clients cannot replace internal visibility or the secret.
+  return CommitLocked(settings, global_reference_visible_, error);
 }
 
-bool SettingsStore::Persist(const Settings& settings,
-                            const std::string& secret,
+SettingsStore::PersistResult SettingsStore::Persist(const Settings& settings,
+                            const std::string& secret, bool visible,
                             std::string* error) {
   int descriptor = -1;
+  bool renamed = false;
   std::filesystem::path temporary;
   try {
     std::filesystem::create_directories(path_.parent_path());
@@ -419,7 +510,7 @@ bool SettingsStore::Persist(const Settings& settings,
     temporary = name.data();
     if (fchmod(descriptor, S_IRUSR | S_IWUSR) != 0)
       throw std::runtime_error("settings permissions failed");
-    const std::string json = StoredJson(settings, secret);
+    const std::string json = StoredJson(settings, secret, visible);
     std::size_t written = 0;
     while (written < json.size()) {
       const auto count = write(descriptor, json.data() + written,
@@ -430,19 +521,23 @@ bool SettingsStore::Persist(const Settings& settings,
     if (fsync(descriptor) != 0) throw std::runtime_error("settings fsync failed");
     close(descriptor);
     descriptor = -1;
+    if (persist_hook_ && !persist_hook_(SettingsPersistPoint::kBeforeRename))
+      throw std::runtime_error("settings replace failed before rename");
     if (rename(temporary.c_str(), path_.c_str()) != 0)
       throw std::runtime_error("atomic settings replace failed");
+    renamed = true;
     const int directory = open(path_.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
     if (directory < 0) throw std::runtime_error("settings directory open failed");
-    const bool synced = fsync(directory) == 0;
+    const bool synced = (!persist_hook_ || persist_hook_(SettingsPersistPoint::kDirectorySync)) &&
+                        fsync(directory) == 0;
     close(directory);
     if (!synced) throw std::runtime_error("settings directory fsync failed");
-    return true;
+    return PersistResult::kConfirmed;
   } catch (const std::exception& exception) {
     if (descriptor >= 0) close(descriptor);
     if (!temporary.empty()) unlink(temporary.c_str());
     if (error) *error = exception.what();
-    return false;
+    return renamed ? PersistResult::kUncertain : PersistResult::kFailed;
   }
 }
 

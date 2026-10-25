@@ -1,3 +1,18 @@
+#include <CoreGraphics/CGEventTypes.h>
+
+#include "core/interaction.h"
+
+// The event tap and overlay can deliver the same drag in either order. Both
+// routes must carry time so the first meaningful sample renews inactivity.
+static bool HandleCapturePointerMotion(
+    seethis::core::InteractionController* controller, CGEventType type,
+    const std::optional<seethis::core::DisplayPoint>& pointer,
+    std::int64_t observed_ms) {
+  return type == kCGEventLeftMouseDragged && pointer.has_value() &&
+      controller->PointerMoved(*pointer, observed_ms);
+}
+
+#if !defined(SEETHIS_CAPTURE_POINTER_TESTING)
 #import "privacy_action_mac.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -82,7 +97,14 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
         overlay_(overlay),
         settings_(settings),
         readiness_(std::move(readiness)),
-        deletion_(deletion) {}
+        deletion_(deletion) {
+    prefix_ingress_.SetActions({
+      [this]{return overlay_->BeginCapturePrefix();},
+      [this]{overlay_->ConfirmCapturePrefix();},
+      [this]{overlay_->CancelCapturePrefix();},
+      [this]{overlay_->ObserveViewportInput(seethis::platform::ViewportInput::kInterrupted);},
+      [this]{SchedulePrefixDeadline();}});
+  }
 
   ~MacInputAdapter() override { Stop(); }
 
@@ -91,6 +113,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     std::function<bool(CGKeyCode)> key_down;
     std::function<CGEventFlags()> flags;
     std::function<pid_t()> foreground_pid;
+    std::function<double()> quartz_to_appkit_top;
   };
   // External registration/physical snapshots only; callback decisions stay real.
   void ConfigureCaptureForTesting(
@@ -103,7 +126,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     active_capture_modifiers_ = NativeModifiers(settings.shortcut_modifiers);
     effective_capture_modifiers_ = settings.shortcut_modifiers;
     last_pointer_ = pointer;
-    capture_eligibility_.ObserveBoundary(CurrentCarbonEventProvenance());
+    RecordCaptureEligibilityBoundary(CurrentCarbonEventProvenance());
   }
   OSStatus HotKeyForTesting(EventRef event) {
     return HotKeyCallback(nullptr, event, this);
@@ -117,6 +140,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     RunWatchdog();
   }
   void FocusChangedForTesting() { ApplicationActivated(); }
+  bool CaptureHeldForTesting() const {return capture_hold_.key().has_value();}
+  seethis::core::DeleteEventProvenance CaptureBoundaryForTesting() const {return capture_boundary_;}
+  void CaptureRegisteredForTesting(bool registered) {capture_registered_=registered;}
   std::uint64_t CaptureGenerationForTesting() const {
     return capture_generation_;
   }
@@ -198,6 +224,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void Stop() override {
+    RetirePrefixReadiness();
     interruption_state_.Clear();
     if (watchdog_timer_ != nil) {
       [watchdog_timer_ invalidate];
@@ -238,10 +265,16 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     return KeyboardMask() | CGEventMaskBit(kCGEventMouseMoved) |
            CGEventMaskBit(kCGEventLeftMouseDragged) |
            CGEventMaskBit(kCGEventRightMouseDragged) |
-           CGEventMaskBit(kCGEventOtherMouseDragged);
+           CGEventMaskBit(kCGEventOtherMouseDragged) |
+           CGEventMaskBit(kCGEventScrollWheel) |
+           CGEventMaskBit(kCGEventLeftMouseDown) |
+           CGEventMaskBit(kCGEventRightMouseDown) |
+           CGEventMaskBit(kCGEventOtherMouseDown);
   }
 
   void DestroyTap() {
+    RetirePrefixReadiness();
+    overlay_->ObserveViewportInput(seethis::platform::ViewportInput::kInterrupted);
     if (run_loop_source_ != nullptr) {
       CFRunLoopRemoveSource(CFRunLoopGetMain(), run_loop_source_,
                             kCFRunLoopCommonModes);
@@ -255,6 +288,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void DestroyDeleteHotKey() {
+    RetirePrefixReadiness();
     if (capture_hotkey_ != nullptr) {
       UnregisterEventHotKey(capture_hotkey_);
       capture_hotkey_ = nullptr;
@@ -285,6 +319,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void RegisterCaptureHotKey() {
+    RetirePrefixReadiness();
     if (capture_hotkey_ != nullptr) {
       UnregisterEventHotKey(capture_hotkey_);
       capture_hotkey_ = nullptr;
@@ -299,7 +334,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       return;
     }
     const auto settings = settings_->Get();
-    capture_eligibility_.ObserveBoundary(CurrentCarbonEventProvenance());
+    RecordCaptureEligibilityBoundary(CurrentCarbonEventProvenance());
     active_capture_conflict_ =
         seethis::core::ShortcutBindingsConflict(settings);
     active_capture_key_ = static_cast<CGKeyCode>(settings.shortcut_key_code);
@@ -395,6 +430,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       return eventNotHandledErr;
     }
     if (is_capture) {
+      (void)self->RefreshPrefixReadiness();
       if (!self->capture_registered_ || !self->settings_->usable() ||
           !seethis::platform::InputMonitorReady(
               self->readiness_->input_monitor.load())) {
@@ -410,11 +446,14 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       self->ReconcileCaptureHold();
       if (GetEventKind(event) == kEventHotKeyPressed) {
         if (self->capture_hold_.key()) {
+          self->LogCaptureRearm("carbon_press","rejected","held_repeat");
           self->LogCaptureStage("capture-hotkey-down", "held-repeat", observed_ms);
           return noErr;
         }
         if (exact_chord && self->CapturePressEligible(carbon_provenance)) {
-          self->capture_hold_.Begin(self->active_capture_key_);
+          if(self->capture_hold_.Begin(self->active_capture_key_))
+            self->capture_hold_evidence_=CaptureHoldEvidence{++self->next_capture_hold_id_,
+                self->active_capture_key_,carbon_provenance};
           if (const auto target =
                   seethis::platform::GetChromeCaptureConsentTarget()) {
             // Authorization is a separate intent: no mark/context/pixels may be
@@ -430,6 +469,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
             return noErr;
           }
         }
+        if(exact_chord&&self->CapturePressEligible(carbon_provenance)&&pointer) {
+          self->prefix_ingress_.Confirm(self->PrefixReadinessSnapshot(),observed_ms);
+        } else self->InvalidateCapturePrefix();
         const auto start = exact_chord &&
             self->CapturePressEligible(carbon_provenance) && pointer
             ? self->controller_->ShortcutKeyDown(observed_ms, *pointer)
@@ -443,6 +485,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
           self->foreground_process_ = self->CurrentForegroundProcess();
           self->active_key_code_ = self->active_capture_key_;
           self->active_modifiers_ = self->active_capture_modifiers_;
+          self->capture_release_continuity_.Begin(self->active_capture_modifiers_);
           self->overlay_->Refresh();
           self->overlay_->UpdatePointerPolicy(pointer);
         }
@@ -503,10 +546,72 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
 #endif
     return FrontmostProcessIdentifier();
   }
+  seethis::platform::CapturePrefixReadiness PrefixReadinessSnapshot() const {
+    const auto settings=settings_->Get();
+    seethis::platform::CapturePrefixReadiness state;
+    state.running=started_;state.settings_usable=settings_->usable();
+    state.registered=capture_registered_&&capture_hotkey_!=nullptr;
+    state.handler_ready=hotkey_handler_!=nullptr;
+    state.monitor_ready=seethis::platform::InputMonitorReady(readiness_->input_monitor.load())&&
+        event_tap_!=nullptr&&run_loop_source_!=nullptr&&CGEventTapIsEnabled(event_tap_);
+    state.screen_ready=readiness_->screen_recording.load()==seethis::platform::ScreenRecordingState::kReady;
+    state.shortcut_ready=seethis::platform::CaptureShortcutReady(readiness_->capture_shortcut.load());
+    state.conflict=active_capture_conflict_||seethis::core::ShortcutBindingsConflict(settings);
+    state.secure_input=IsSecureEventInputEnabled();
+    state.configured_key=settings.shortcut_key_code;state.registered_key=active_capture_key_;
+    state.configured_modifiers=settings.shortcut_modifiers;state.registered_modifiers=effective_capture_modifiers_;
+    state.native_binding_matches=active_capture_modifiers_==NativeModifiers(settings.shortcut_modifiers);
+    state.registration_generation=capture_generation_;
+    return state;
+  }
+  bool RefreshPrefixReadiness() {return prefix_ingress_.Readiness(PrefixReadinessSnapshot());}
+  void RetirePrefixReadiness() {prefix_ingress_.LoseReadiness();}
+  void InvalidateCapturePrefix() {prefix_ingress_.Invalidate();}
+  void SchedulePrefixDeadline() {
+    const auto alive=std::weak_ptr<int>(prefix_lifetime_);
+    MacInputAdapter* owner=this;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+        seethis::platform::CapturePrefixContinuity::kDeadlineMs*NSEC_PER_MSEC),
+        dispatch_get_main_queue(),^{
+      if(!alive.expired())owner->prefix_ingress_.Tick(MonotonicMilliseconds());
+    });
+  }
   void ReconcileCaptureHold() {
     const auto key = capture_hold_.key();
-    if (key && capture_hold_.ObserveRelease(PhysicalKeyIsDown(*key)))
+    if (key && capture_hold_.ObserveRelease(PhysicalKeyIsDown(*key))) {
+      capture_hold_evidence_.reset();
       RecordCaptureEligibilityBoundary(CurrentCarbonEventProvenance());
+      LogCaptureRearm("sample_false","rearmed","sample_release");
+    }
+  }
+  void ObserveRawCaptureRelease(CGKeyCode key,seethis::core::DeleteEventProvenance release) {
+    const auto held=capture_hold_evidence_;
+    if(!held||!capture_hold_.key()) {
+      if(key==active_capture_key_)LogCaptureRearm("raw_key_up","rejected","no_hold");
+      return;
+    }
+    // This is the ORIGINAL key/press, even after rebinding. A raw CGEvent has no
+    // registration generation and must never be labelled with the current one.
+    if(key!=held->key) {
+      if(key==active_capture_key_)LogCaptureRearm("raw_key_up","rejected","key_mismatch");
+      return;
+    }
+    const auto observed=CurrentCarbonEventProvenance();
+    if(!release.valid()||!held->press.valid()||!observed.valid()||
+       release.latest_ns>observed.latest_ns) {
+      LogCaptureRearm("raw_key_up","rejected","invalid_provenance");return;
+    }
+    if(release.earliest_ns<=held->press.latest_ns) {
+      LogCaptureRearm("raw_key_up","rejected","not_after_press");return;
+    }
+    if(!capture_hold_evidence_||capture_hold_evidence_->id!=held->id||
+       capture_hold_.key()!=std::optional<CGKeyCode>(held->key)) {
+      LogCaptureRearm("raw_key_up","rejected","hold_changed");return;
+    }
+    if(!capture_hold_.ObserveRelease(false))return;
+    capture_hold_evidence_.reset();
+    const bool advanced=RecordCaptureEligibilityBoundary(release);
+    LogCaptureRearm("raw_key_up","rearmed",advanced?"matching_release":"boundary_not_advanced");
   }
   bool DeleteKeyIsDown() const { return PhysicalKeyIsDown(active_delete_key_); }
 
@@ -529,9 +634,21 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
         CaptureModifiersAreExact(PhysicalModifiers()), provenance);
   }
 
-  void RecordCaptureEligibilityBoundary(
+  bool RecordCaptureEligibilityBoundary(
       seethis::core::DeleteEventProvenance boundary) {
-    capture_eligibility_.ObserveBoundary(boundary);
+    if(!boundary.valid()||(capture_boundary_.valid()&&
+        boundary.latest_ns<=capture_boundary_.latest_ns))return false;
+    capture_boundary_=boundary;
+    capture_eligibility_.ObserveBoundary(boundary);return true;
+  }
+  void LogCaptureRearm(const char* source,const char* outcome,const char* reason) const {
+    const auto snapshot=controller_->Snapshot();
+    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_INFO,
+        "seethis capture stage=hold-rearm source=%{public}s outcome=%{public}s reason=%{public}s "
+        "state=%{public}s completion=%{public}s cancel=%{public}s",
+        source,outcome,reason,seethis::core::InteractionStateName(snapshot.state),
+        seethis::core::CompletionReasonName(snapshot.completion_reason),
+        seethis::core::CancelReasonName(snapshot.cancel_reason));
   }
 
   void RefreshDeleteReadiness() {
@@ -569,6 +686,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
                 readiness_->input_monitor.load())));
     effective_shortcuts.Capture({active_capture_key_,effective_capture_modifiers_,
         capture_registered_},readiness_->capture_shortcut.load());
+    (void)RefreshPrefixReadiness();
   }
 
   void PublishDeleteBinding() {
@@ -582,6 +700,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
             ? seethis::platform::ScreenRecordingState::kReady
             : seethis::platform::ScreenRecordingState::kDenied);
     effective_shortcuts.Screen(readiness_->screen_recording.load());
+    (void)RefreshPrefixReadiness();
+    if(readiness_->screen_recording.load()!=seethis::platform::ScreenRecordingState::kReady)
+      overlay_->ObserveViewportInput(seethis::platform::ViewportInput::kInterrupted);
   }
 
   seethis::platform::InputMonitorProbe ProbeTap(bool retry_attempt) const {
@@ -638,6 +759,8 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     const auto state =
         seethis::platform::ClassifyInputMonitor(ProbeTap(retry_attempt));
     readiness_->input_monitor.store(state);
+    overlay_->ObserveViewportInput(seethis::platform::InputMonitorReady(state)?
+        seethis::platform::ViewportInput::kHealthy:seethis::platform::ViewportInput::kInterrupted);
     RefreshDeleteReadiness();
     RefreshCaptureReadiness();
     return seethis::platform::InputMonitorReady(state);
@@ -660,12 +783,19 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
 
   std::optional<seethis::core::DisplayPoint> PointerFromEvent(
       CGEventRef event) {
-    if (event == nullptr || NSScreen.screens.firstObject == nil) {
-      last_pointer_.reset();
-      return {};
+    if(event==nullptr){last_pointer_.reset();return {};}
+    double primary_top=0;
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+    if(test_input_&&test_input_->quartz_to_appkit_top)
+      primary_top=test_input_->quartz_to_appkit_top();
+    else
+#endif
+    {
+      NSScreen* primary=NSScreen.screens.firstObject;
+      if(!primary){last_pointer_.reset();return {};}
+      primary_top=NSMaxY(primary.frame);
     }
-    const CGPoint location = CGEventGetLocation(event);
-    const double primary_top = NSMaxY(NSScreen.screens.firstObject.frame);
+    const CGPoint location=CGEventGetLocation(event);
     const auto global = seethis::platform::AppKitGlobalPointFromQuartz(
         {location.x, location.y}, primary_top);
     last_pointer_ = global
@@ -721,6 +851,54 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void HandleEvent(CGEventType type, CGEventRef event) {
+    // Latch the delivered event location before readiness or presentation callbacks.
+    // A later mouseLocation sample is not evidence of this pointer-down target.
+    const bool pointer_event=type==kCGEventMouseMoved||type==kCGEventLeftMouseDown||
+        type==kCGEventRightMouseDown||type==kCGEventOtherMouseDown||
+        type==kCGEventLeftMouseDragged||type==kCGEventRightMouseDragged||
+        type==kCGEventOtherMouseDragged||type==kCGEventScrollWheel;
+    const auto viewport_pointer=pointer_event?PointerFromEvent(event):std::nullopt;
+    bool fresh_primary=false;
+    if(type==kCGEventLeftMouseDown) {
+      const auto delivered=RawEventProvenance(event),now=CurrentCarbonEventProvenance();
+      fresh_primary=delivered.valid()&&now.valid()&&delivered.latest_ns<=now.latest_ns&&
+          now.latest_ns-delivered.earliest_ns<=2'000'000'000ull;
+    }
+    // Preserve the delivered release edge before any synchronous presentation work.
+    if(type==kCGEventKeyUp&&event)ObserveRawCaptureRelease(
+        static_cast<CGKeyCode>(CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode)),
+        RawEventProvenance(event));
+    using seethis::platform::ViewportInput;
+    const bool prefix_ready=RefreshPrefixReadiness();
+    if(type==kCGEventMouseMoved||type==kCGEventLeftMouseDown||type==kCGEventRightMouseDown||
+       type==kCGEventOtherMouseDown||type==kCGEventLeftMouseDragged||type==kCGEventRightMouseDragged||
+       type==kCGEventOtherMouseDragged||type==kCGEventScrollWheel||
+       type==kCGEventTapDisabledByTimeout||type==kCGEventTapDisabledByUserInput)InvalidateCapturePrefix();
+    if(type==kCGEventTapDisabledByTimeout||type==kCGEventTapDisabledByUserInput)
+      overlay_->ObserveViewportInput(ViewportInput::kInterrupted);
+    else if(type==kCGEventScrollWheel)
+      overlay_->ObserveViewportInput(ViewportInput::kScroll,viewport_pointer);
+    else if(type==kCGEventLeftMouseDown||type==kCGEventRightMouseDown||type==kCGEventOtherMouseDown||
+            type==kCGEventLeftMouseDragged||type==kCGEventRightMouseDragged||type==kCGEventOtherMouseDragged) {
+      if(controller_->Snapshot().state!=seethis::core::InteractionState::kDrawing)
+        overlay_->ObserveViewportInput(fresh_primary?ViewportInput::kPrimaryDown:ViewportInput::kPointer,viewport_pointer);
+    } else if(type==kCGEventKeyDown||type==kCGEventKeyUp||type==kCGEventFlagsChanged) {
+      const auto key=static_cast<CGKeyCode>(CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode));
+      const auto settings=settings_->Get();
+      const auto modifiers=ShortcutModifierFlags(CGEventGetFlags(event));
+      const bool release_tail=capture_release_continuity_.Observe(key==active_capture_key_,
+          type==kCGEventKeyUp,type==kCGEventFlagsChanged,modifiers);
+      const bool capture_key=prefix_ready&&type==kCGEventKeyDown && key==settings.shortcut_key_code &&
+          modifiers==NativeModifiers(settings.shortcut_modifiers);
+      bool prefix_modifier=false;
+      if(!release_tail&&type==kCGEventFlagsChanged)
+        prefix_modifier=prefix_ingress_.ModifierEvent(PrefixReadinessSnapshot(),modifiers,
+            active_capture_modifiers_,MonotonicMilliseconds());
+      if(type==kCGEventFlagsChanged)prefix_ingress_.Released(modifiers);
+      if(!capture_key&&!release_tail&&!prefix_modifier) {
+        InvalidateCapturePrefix();overlay_->ObserveViewportInput(ViewportInput::kKeyboard);
+      }
+    }
     ReconcileCaptureHold();
     if (type == kCGEventTapDisabledByTimeout ||
         type == kCGEventTapDisabledByUserInput) {
@@ -741,9 +919,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
         type == kCGEventRightMouseDragged ||
         type == kCGEventOtherMouseDragged) {
-      const auto event_pointer = PointerFromEvent(event);
-      if (event_pointer.has_value() &&
-          controller_->PointerMoved(*event_pointer)) {
+      const auto event_pointer = viewport_pointer;
+      if (HandleCapturePointerMotion(controller_, type, event_pointer,
+                                     MonotonicMilliseconds())) {
         overlay_->Refresh();
       }
       overlay_->UpdatePointerPolicy(event_pointer);
@@ -860,6 +1038,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void Cancel(seethis::core::CancelReason reason) {
+    InvalidateCapturePrefix();
     deletion_->Interrupt(DeleteKeyIsDown(), CurrentCarbonEventProvenance());
     LogDeleteStage("interrupted");
     RecordCaptureEligibilityBoundary(CurrentCarbonEventProvenance());
@@ -877,7 +1056,12 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void RunWatchdog() {
+    (void)RefreshPrefixReadiness();
     ReconcileCaptureHold();
+    prefix_ingress_.Tick(MonotonicMilliseconds());
+    if(prefix_ingress_.pending()&&
+       !prefix_ingress_.PhysicalModifiersValid(ShortcutModifierFlags(PhysicalModifiers())))
+      InvalidateCapturePrefix();
     const auto requested_retry = readiness_->retry_generation.load();
     if (requested_retry != observed_retry_generation_) {
       observed_retry_generation_ = requested_retry;
@@ -894,6 +1078,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       const auto recovery_action = decision.action;
       const auto recovery_attempts = decision.recovery_attempts;
       readiness_->input_monitor.store(decision.state);
+      (void)RefreshPrefixReadiness();
+      overlay_->ObserveViewportInput(seethis::platform::InputMonitorReady(decision.state)?
+          seethis::platform::ViewportInput::kHealthy:seethis::platform::ViewportInput::kInterrupted);
       if (recovery_action != seethis::platform::InputRecoveryAction::kNone) {
         Cancel(seethis::core::CancelReason::kInputMonitorInterrupted);
         interruption_state_.Clear();
@@ -1005,6 +1192,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   }
 
   void ApplicationActivated() {
+    InvalidateCapturePrefix();
     if (controller_->Snapshot().state ==
             seethis::core::InteractionState::kDrawing &&
         foreground_process_ != 0 &&
@@ -1034,6 +1222,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   __strong id display_observer_ = nil;
   __strong id workspace_observer_ = nil;
   pid_t foreground_process_ = 0;
+  seethis::platform::CaptureReleaseContinuity capture_release_continuity_;
+  seethis::platform::CapturePrefixIngress prefix_ingress_;
+  std::shared_ptr<int> prefix_lifetime_=std::make_shared<int>(0);
   std::optional<CGKeyCode> active_key_code_;
   std::optional<seethis::core::DisplayPoint> last_pointer_;
   CGEventFlags active_modifiers_ = 0;
@@ -1054,6 +1245,12 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   bool active_capture_conflict_ = false;
   seethis::platform::CaptureShortcutEligibility capture_eligibility_;
   seethis::platform::CaptureShortcutHold capture_hold_;
+  struct CaptureHoldEvidence {
+    std::uint64_t id;CGKeyCode key;seethis::core::DeleteEventProvenance press;
+  };
+  std::optional<CaptureHoldEvidence> capture_hold_evidence_;
+  std::uint64_t next_capture_hold_id_=0;
+  seethis::core::DeleteEventProvenance capture_boundary_;
 #if defined(SEETHIS_CHROME_CONSENT_TESTING)
   std::optional<TestPhysicalInput> test_input_;
 #endif
@@ -1069,7 +1266,7 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   std::int64_t capture_release_first_ms_ = 0;
 };
 
-@interface STApplicationDelegate : NSObject <NSApplicationDelegate> {
+@interface STApplicationDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate> {
   std::unique_ptr<seethis::core::InteractionController> _controller;
   std::unique_ptr<seethis::core::DeleteGestureController> _deletion;
   std::unique_ptr<seethis::core::SettingsStore> _settings;
@@ -1081,24 +1278,16 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   __strong NSStatusItem* _statusItem;
   __strong STPrivacyPolicyAction* _privacyPolicyAction;
   __strong NSMenuItem* _startupStateItem;
-  __strong NSMenuItem* _inputStateItem;
-  __strong NSMenuItem* _screenStateItem;
-  __strong NSMenuItem* _captureStateItem;
-  __strong NSMenuItem* _deleteStateItem;
-  __strong NSMenuItem* _settingsStateItem;
-  __strong NSMenuItem* _inspectorItem;
-  __strong NSArray<NSMenuItem*>* _chromeStateItems;
-  __strong NSMenuItem* _chromeGuidanceItem;
-  __strong NSMenuItem* _guidanceItem;
-  __strong NSMenuItem* _screenGuidanceItem;
-  __strong NSMenuItem* _identityGuidanceItem;
-  __strong NSMenuItem* _settingsGuidanceItem;
+  __strong NSMenuItem* _chromeStateItem;
   __strong NSTimer* _statusTimer;
   __strong NSPanel* _entryPanel;
   __strong NSTextField* _entryStatus;
-  __strong NSTextField* _entryInput;
-  __strong NSTextField* _entryScreen;
+  __strong NSTextView* _entryDetails;
   __strong NSButton* _entryInspectorButton;
+  __strong NSString* _chromeStatus;
+  __strong NSString* _chromeActionError;
+  seethis::platform::ChromeCompactStatus _chromeCompactStatus;
+  std::int64_t _chromeLastCheckMs;
 }
 @end
 
@@ -1115,12 +1304,18 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
              inDomains:NSUserDomainMask].firstObject;
   const auto root=std::filesystem::path(support.path.UTF8String)/"SeeThis";
   _settings=std::make_unique<seethis::core::SettingsStore>(root/"settings-v1.json");
+  const auto visibility=_settings->Visibility();
+  if(!visibility.permits_presentation() && !visibility.error.empty())
+    std::cerr<<"seethis: global visibility="<<visibility.name()
+      <<" detail="<<visibility.error<<'\n';
   if(!_settings->usable())
     std::cerr<<"seethis: settings state="
       <<seethis::core::SettingsLoadStateName(_settings->load_state())
       <<" file="<<_settings->path()<<" detail="<<_settings->load_error()<<'\n';
   _references=std::make_unique<seethis::core::ReferenceStore>(root/"references-v1");
   _readiness=std::make_shared<seethis::platform::PermissionReadinessState>();
+  _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kUnchecked;
+  _chromeLastCheckMs=0;
   const char* app_name=NSProcessInfo.processInfo.processName.UTF8String;
   const char* bundle_id=NSBundle.mainBundle.bundleIdentifier.UTF8String;
   const char* bundle_path=NSBundle.mainBundle.bundlePath.UTF8String;
@@ -1167,100 +1362,24 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       _statusItem!=nil,static_cast<double>(_statusItem.length),
       _statusItem.isVisible,_statusItem.button!=nil);
   NSMenu* menu=[NSMenu new];
+  menu.delegate=self;
+  _startupStateItem=[[NSMenuItem alloc] initWithTitle:@"SeeThis"
+      action:@selector(showPermissionEntry:) keyEquivalent:@""];
+  _startupStateItem.target=self;
+  [menu addItem:_startupStateItem];
+  _chromeStateItem=[[NSMenuItem alloc]
+      initWithTitle:@"Chrome — Not ready"
+      action:@selector(showPermissionEntry:) keyEquivalent:@""];
+  _chromeStateItem.target=self;
+  [menu addItem:_chromeStateItem];
+  NSMenuItem* inspectorItem=[[NSMenuItem alloc] initWithTitle:@"Show Inspector"
+      action:@selector(showInspector:) keyEquivalent:@""];
+  inspectorItem.target=self;
+  [menu addItem:inspectorItem];
   _privacyPolicyAction=[[STPrivacyPolicyAction alloc] initWithOpener:^BOOL(NSURL* url) {
     return [NSWorkspace.sharedWorkspace openURL:url];
   }];
-  _startupStateItem=[[NSMenuItem alloc] initWithTitle:@"SeeThis"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_startupStateItem];
-  NSMenuItem* entryItem=[[NSMenuItem alloc] initWithTitle:@"Show SeeThis…"
-      action:@selector(showPermissionEntry:) keyEquivalent:@""];
-  entryItem.target=self;[menu addItem:entryItem];
   [menu addItem:[_privacyPolicyAction menuItem]];
-  [menu addItem:NSMenuItem.separatorItem];
-  _inputStateItem=[[NSMenuItem alloc] initWithTitle:@"Input Monitoring: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_inputStateItem];
-  _screenStateItem=[[NSMenuItem alloc] initWithTitle:@"Screen Recording: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_screenStateItem];
-  _captureStateItem=[[NSMenuItem alloc] initWithTitle:@"Capture shortcut: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_captureStateItem];
-  _deleteStateItem=[[NSMenuItem alloc] initWithTitle:@"Delete shortcut: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_deleteStateItem];
-  _settingsStateItem=[[NSMenuItem alloc] initWithTitle:@"Settings: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_settingsStateItem];
-  _inspectorItem=[[NSMenuItem alloc] initWithTitle:@"Show Inspector…"
-      action:@selector(toggleInspector:) keyEquivalent:@"i"];
-  _inspectorItem.target=self;[menu addItem:_inspectorItem];
-  [menu addItem:NSMenuItem.separatorItem];
-  NSMutableArray<NSMenuItem*>* chromeItems=[NSMutableArray array];
-  for(NSUInteger index=0;index<5;++index) {
-    NSMenuItem* item=[[NSMenuItem alloc] initWithTitle:@"Chrome: checking…"
-        action:nil keyEquivalent:@""];
-    [menu addItem:item];[chromeItems addObject:item];
-  }
-  _chromeStateItems=chromeItems;
-  for(NSArray* action in @[@[@"Connect Chrome",NSStringFromSelector(@selector(connectChrome:))],
-                           @[@"Retry Chrome",NSStringFromSelector(@selector(retryChrome:))],
-                           @[@"Open Automation Settings…",NSStringFromSelector(@selector(openChromeAutomationSettings:))]]) {
-    NSMenuItem* item=[[NSMenuItem alloc] initWithTitle:action[0]
-        action:NSSelectorFromString(action[1]) keyEquivalent:@""];
-    item.target=self;[menu addItem:item];
-  }
-  _chromeGuidanceItem=[[NSMenuItem alloc] initWithTitle:@"Chrome recovery: checking…"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_chromeGuidanceItem];
-  [menu addItem:NSMenuItem.separatorItem];
-  _guidanceItem=[[NSMenuItem alloc] initWithTitle:@"Readiness guidance unavailable"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_guidanceItem];
-  _screenGuidanceItem=[[NSMenuItem alloc]
-      initWithTitle:@"Screen Recording guidance unavailable"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_screenGuidanceItem];
-  _identityGuidanceItem=[[NSMenuItem alloc]
-      initWithTitle:@"App identity guidance unavailable"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_identityGuidanceItem];
-  _settingsGuidanceItem=[[NSMenuItem alloc]
-      initWithTitle:@"Settings guidance unavailable"
-      action:nil keyEquivalent:@""];
-  [menu addItem:_settingsGuidanceItem];
-  [menu addItem:NSMenuItem.separatorItem];
-  NSMenuItem* retryItem=[[NSMenuItem alloc] initWithTitle:@"Retry Input Monitoring"
-      action:@selector(retryInputMonitoring:) keyEquivalent:@"r"];
-  retryItem.target=self;[menu addItem:retryItem];
-  NSMenuItem* inputSettingsItem=[[NSMenuItem alloc]
-      initWithTitle:@"Open Input Monitoring Settings…"
-      action:@selector(openInputMonitoringSettings:) keyEquivalent:@""];
-  inputSettingsItem.target=self;[menu addItem:inputSettingsItem];
-  NSMenuItem* screenSettingsItem=[[NSMenuItem alloc]
-      initWithTitle:@"Open Screen Recording Settings…"
-      action:@selector(openScreenRecordingSettings:) keyEquivalent:@""];
-  screenSettingsItem.target=self;[menu addItem:screenSettingsItem];
-  NSString* bundleIdentifier=NSBundle.mainBundle.bundleIdentifier;
-  if(bundleIdentifier==nil)bundleIdentifier=@"unknown bundle";
-  NSMenuItem* appItem=[[NSMenuItem alloc]
-      initWithTitle:[NSString stringWithFormat:@"App: %@",bundleIdentifier]
-      action:nil keyEquivalent:@""];
-  [menu addItem:appItem];
-  NSMenuItem* locationItem=[[NSMenuItem alloc]
-      initWithTitle:[NSString stringWithFormat:@"Location: %@",
-        NSBundle.mainBundle.bundlePath]
-      action:nil keyEquivalent:@""];
-  [menu addItem:locationItem];
-  NSMenuItem* revealItem=[[NSMenuItem alloc]
-      initWithTitle:@"Reveal This App in Finder"
-      action:@selector(revealCurrentApp:) keyEquivalent:@""];
-  revealItem.target=self;[menu addItem:revealItem];
-  [menu addItem:NSMenuItem.separatorItem];
-  NSMenuItem* settingsItem=[[NSMenuItem alloc] initWithTitle:@"Open Settings…"
-      action:@selector(openSettings:) keyEquivalent:@","];
-  settingsItem.target=self;[menu addItem:settingsItem];
   [menu addItem:NSMenuItem.separatorItem];
   NSMenuItem* quitItem=[[NSMenuItem alloc] initWithTitle:@"Quit SeeThis"
       action:@selector(quit:) keyEquivalent:@"q"];
@@ -1277,6 +1396,12 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       });
   _statusTimer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES
       block:^(NSTimer*) {[weakSelf refreshPermissionMenu];}];
+}
+
+- (void)menuWillOpen:(NSMenu*)menu {
+  (void)menu;
+  _chromeLastCheckMs=0;
+  [self refreshPermissionMenu];
 }
 
 - (void)recordEntryLayoutDiagnostic {
@@ -1296,88 +1421,140 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
 
 - (void)refreshPermissionMenu {
   if(!_readiness)return;
-  const auto chrome=seethis::platform::RefreshChromeConnection();
-  auto chromeText=[](std::string_view value) {
-    return [NSString stringWithUTF8String:std::string(value).c_str()];
-  };
-  const NSArray<NSString*>* chromeTitles=@[
-    [NSString stringWithFormat:@"Chrome: %@",chromeText(seethis::platform::ChromeRunningName(chrome.target))],
-    [NSString stringWithFormat:@"Chrome Automation: %@",chromeText(
-        chrome.consent_pending?"request in progress":
-            seethis::platform::ChromeConsentName(chrome.permission.consent))],
-    [NSString stringWithFormat:@"Chrome provider: %@",chromeText(
-        seethis::platform::ChromeProviderName(chrome.provider))],
-    [NSString stringWithFormat:@"Chrome page identity: %@",chromeText(
-        seethis::platform::ChromePageReadinessName(chrome.page))],
-    chrome.observation_active?@"Chrome context observation: active":@"Chrome context observation: inactive"];
-  for(NSUInteger index=0;index<_chromeStateItems.count;++index)
-    _chromeStateItems[index].title=chromeTitles[index];
-  _chromeGuidanceItem.title=[@"Chrome recovery: " stringByAppendingString:
-      chromeText(seethis::platform::ChromeRecoveryGuidance(chrome))];
+  // These preflights do not ask for permission or touch the operational tap.
+  _readiness->input_monitor_permission.store(CGPreflightListenEventAccess()
+      ? seethis::platform::InputMonitoringPermissionState::kGranted
+      : seethis::platform::InputMonitoringPermissionState::kDenied);
+  _readiness->screen_recording.store(seethis::platform::ScreenRecordingReady()
+      ? seethis::platform::ScreenRecordingState::kReady
+      : seethis::platform::ScreenRecordingState::kDenied);
+  const auto inputPermission=_readiness->input_monitor_permission.load();
   const auto input=_readiness->input_monitor.load();
   const auto screen=_readiness->screen_recording.load();
-  const auto startup_status=seethis::platform::PermissionStartupStatus(input, screen);
+  const auto startup_status=seethis::platform::PermissionStartupStatus(
+      inputPermission,screen);
   _statusItem.button.toolTip=[NSString stringWithUTF8String:
       std::string(startup_status).c_str()];
   _startupStateItem.title=_statusItem.button.toolTip;
+  _statusItem.button.accessibilityLabel=_startupStateItem.title;
+  // Chrome is optional. Keep its compact status current without asking for
+  // Automation consent or trying to acquire a page. Consent cannot establish
+  // the page/provider identity used by the actual capture flow.
+  const auto now=MonotonicMilliseconds();
+  if(_chromeLastCheckMs==0 || now-_chromeLastCheckMs>=5000) {
+    _chromeLastCheckMs=now;
+    NSRunningApplication* chrome=[NSRunningApplication
+        runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].firstObject;
+    if(!chrome) {
+      _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kNotRunning;
+      _chromeStatus=@"Google Chrome is not running. Optional.";
+    } else if(seethis::platform::ChromeAutomationPreflight(
+                  chrome.processIdentifier)) {
+      _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kAutomationAllowedPageUnchecked;
+      _chromeStatus=@"Automation is allowed for running Google Chrome. The current page and provider identity have not been verified. Optional.";
+      // This is a display of an existing observation, never a page check.
+      const auto connection=seethis::platform::ChromeConnectionStatus();
+      const auto start=chrome.launchDate
+          ? seethis::platform::ChromeProcessStartIdentity(
+              chrome.launchDate.timeIntervalSince1970)
+          : std::optional<std::int64_t>{};
+      if(start && connection.target==seethis::platform::ChromeRunningTarget{
+            chrome.processIdentifier,*start} &&
+          connection.permission.consent==seethis::platform::ChromeConsent::kGranted &&
+          connection.observation_active &&
+          connection.provider==seethis::platform::ChromeProviderState::kReady &&
+          connection.page==seethis::core::PageAvailability::kReady) {
+        _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kReady;
+        _chromeStatus=@"Running Google Chrome has a verified current page and provider observation. Optional.";
+      }
+    } else {
+      _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kAutomationUnavailable;
+      _chromeStatus=@"Automation is unavailable or not granted. Check SeeThis → Google Chrome in System Settings > Privacy & Security > Automation. Optional.";
+    }
+  }
+  _chromeStateItem.title=[NSString stringWithUTF8String:std::string(
+      seethis::platform::ChromeCompactStatusLabel(_chromeCompactStatus)).c_str()];
+  if(!_entryDetails)return;
+
+  // The optional connection exposes richer state only in Show details. Reading
+  // it never requests Automation consent or captures a Chrome page.
+  const auto chromeConnection=seethis::platform::RefreshChromeConnection();
+  auto chromeText=[](std::string_view value) {
+    return [NSString stringWithUTF8String:std::string(value).c_str()];
+  };
+  NSString* chromeDetails=[NSString stringWithFormat:
+      @"%@\nChrome: %@\nAutomation: %@\nProvider: %@\nPage identity: %@\nContext observation: %@\nRecovery: %@%@",
+      _chromeStatus?:@"Not checked. Optional.",
+      chromeText(seethis::platform::ChromeRunningName(chromeConnection.target)),
+      chromeText(chromeConnection.consent_pending?"request in progress":
+          seethis::platform::ChromeConsentName(chromeConnection.permission.consent)),
+      chromeText(seethis::platform::ChromeProviderName(chromeConnection.provider)),
+      chromeText(seethis::platform::ChromePageReadinessName(chromeConnection.page)),
+      chromeConnection.observation_active?@"active":@"inactive",
+      chromeText(seethis::platform::ChromeRecoveryGuidance(chromeConnection)),
+      _chromeActionError?:@""];
+
+  NSString* permissionName=[NSString stringWithUTF8String:
+      std::string(seethis::platform::InputMonitoringPermissionStateName(
+          inputPermission)).c_str()];
+  NSString* permissionGuidance=inputPermission==
+      seethis::platform::InputMonitoringPermissionState::kGranted
+      ? @"System permission granted."
+      : @"Enable Input Monitoring for this exact app in System Settings.";
   NSString* inputName=[NSString stringWithUTF8String:
       std::string(seethis::platform::InputMonitorStateName(input)).c_str()];
-  _inputStateItem.title=[NSString stringWithFormat:@"Input Monitoring: %@%@",
-      inputName,seethis::platform::InputMonitorReady(input)?@" (ready)":@" (not ready)"];
   NSString* screenName=[NSString stringWithUTF8String:
       std::string(seethis::platform::ScreenRecordingStateName(screen)).c_str()];
-  _screenStateItem.title=[NSString stringWithFormat:@"Screen Recording: %@%@",
-      screenName,screen==seethis::platform::ScreenRecordingState::kReady?
-          @" (ready)":@" (not ready)"];
   const auto capture=_readiness->capture_shortcut.load();
   NSString* captureName=[NSString stringWithUTF8String:
       std::string(seethis::platform::CaptureShortcutStateName(capture)).c_str()];
-  _captureStateItem.title=[NSString stringWithFormat:@"Capture shortcut: %@%@",
-      captureName,seethis::platform::CaptureShortcutReady(capture)?
-          @" (ready)":@" (not ready)"];
   const auto deletion=_readiness->delete_shortcut.load();
   NSString* deletionName=[NSString stringWithUTF8String:
       std::string(seethis::platform::DeleteShortcutStateName(deletion)).c_str()];
-  _deleteStateItem.title=[NSString stringWithFormat:@"Delete shortcut: %@%@",
-      deletionName,seethis::platform::DeleteShortcutReady(deletion)?
-          @" (ready)":@" (not ready)"];
   const auto settingsState=_settings->load_state();
   NSString* settingsName=[NSString stringWithUTF8String:
       seethis::core::SettingsLoadStateName(settingsState)];
-  _settingsStateItem.title=[NSString stringWithFormat:@"Settings: %@%@",
-      settingsName,_settings->usable()?@" (ready)":@" (preserved, unusable)"];
-  const std::string input_guidance=std::string(
-      seethis::platform::InputMonitorGuidance(input));
-  _guidanceItem.title=[NSString stringWithFormat:@"Input Monitoring guidance: %@",
-      [NSString stringWithUTF8String:input_guidance.c_str()]];
-  const std::string screen_guidance=std::string(
-      seethis::platform::ScreenRecordingGuidance(screen));
-  _screenGuidanceItem.title=[NSString stringWithFormat:@"Screen Recording guidance: %@",
-      [NSString stringWithUTF8String:screen_guidance.c_str()]];
-  _identityGuidanceItem.title=[NSString stringWithFormat:@"App identity guidance: %@",
-      [NSString stringWithUTF8String:
-          std::string(seethis::platform::ExactAppRelaunchGuidance()).c_str()]];
-  const std::string settings_guidance = _settings->usable()
-      ? "Settings are ready."
-      : _settings->load_error();
-  _settingsGuidanceItem.title=[NSString stringWithFormat:@"Settings guidance: %@",
-      [NSString stringWithUTF8String:settings_guidance.c_str()]];
-  if(_inspectorItem)
-    _inspectorItem.title=_overlay&&_overlay->InspectorVisible()?
-      @"Hide Inspector":@"Show Inspector…";
+  NSString* inputGuidance=[NSString stringWithUTF8String:
+      std::string(seethis::platform::InputMonitorGuidance(input)).c_str()];
+  NSString* screenGuidance=[NSString stringWithUTF8String:
+      std::string(seethis::platform::ScreenRecordingGuidance(screen)).c_str()];
+  NSString* captureGuidance=[NSString stringWithUTF8String:
+      std::string(seethis::platform::CaptureShortcutGuidance(capture)).c_str()];
+  NSString* deleteGuidance=[NSString stringWithUTF8String:
+      std::string(seethis::platform::DeleteShortcutGuidance(deletion)).c_str()];
+  NSString* settingsGuidance=_settings->usable()
+      ? @"Settings are ready."
+      : [NSString stringWithUTF8String:_settings->load_error().c_str()];
+  NSString* identityGuidance=[NSString stringWithUTF8String:
+      std::string(seethis::platform::ExactAppRelaunchGuidance()).c_str()];
+  NSString* bundleIdentifier=NSBundle.mainBundle.bundleIdentifier?:@"unknown bundle";
+  NSString* bundlePath=NSBundle.mainBundle.bundlePath?:@"unknown location";
+  NSMutableString* details=[NSMutableString stringWithFormat:
+      @"BASE PERMISSIONS\nInput Monitoring: %@ — %@\nScreen Recording: %@ — %@\n\n"
+       "KEYBOARD AND SHORTCUTS\nEvent tap: %@ — %@\n"
+       "Capture shortcut: %@ — %@\nDelete shortcut: %@ — %@\n\n"
+       "SETTINGS\nState: %@ — %@\nFile: %s\n\n"
+       "CHROME (OPTIONAL)\n%@\n\n"
+       "THIS APP\nBundle: %@\nLocation: %@\n%@",
+      permissionName,permissionGuidance,screenName,screenGuidance,
+      inputName,inputGuidance,captureName,captureGuidance,
+      deletionName,deleteGuidance,settingsName,settingsGuidance,
+      _settings->path().c_str(),chromeDetails,
+      bundleIdentifier,bundlePath,identityGuidance];
   // Refresh existing details only; polling never presents or reopens a panel.
   _entryStatus.stringValue=_startupStateItem.title;
-  _entryInput.stringValue=_inputStateItem.title;
-  _entryScreen.stringValue=_screenStateItem.title;
-  _entryInspectorButton.title=_inspectorItem.title;
+  if(![_entryDetails.string isEqualToString:details])_entryDetails.string=details;
+  _entryInspectorButton.title=_overlay&&_overlay->InspectorVisible()?
+      @"Hide Inspector":@"Show Inspector…";
 }
 
 - (void)presentPermissionEntry:(seethis::platform::PermissionEntryTrigger)trigger {
   if(!_readiness || !seethis::platform::PermissionEntryShouldPresent(
-      trigger,_readiness->input_monitor.load(),_readiness->screen_recording.load()))
+      trigger,_readiness->input_monitor_permission.load(),
+      _readiness->screen_recording.load()))
     return;
   if(!_entryPanel) {
-    _entryPanel=[[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,480,350)
+    _entryPanel=[[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,640,620)
         styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable
         backing:NSBackingStoreBuffered defer:NO];
     _entryPanel.title=@"SeeThis";
@@ -1386,19 +1563,27 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
     _entryPanel.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
     NSView* content=_entryPanel.contentView;
     NSTextField* introduction=[NSTextField wrappingLabelWithString:
-        @"SeeThis is running. Use the menu bar icon to open actions and permission details."];
-    introduction.frame=NSMakeRect(22,289,436,42);
+        @"SeeThis is running. Ready reflects the two macOS capture permissions. Operational issues and optional Chrome access appear below."];
+    introduction.frame=NSMakeRect(22,565,596,42);
     [content addSubview:introduction];
     _entryStatus=[NSTextField labelWithString:@""];
-    _entryStatus.font=[NSFont boldSystemFontOfSize:13];
-    _entryStatus.frame=NSMakeRect(22,254,436,24);
+    _entryStatus.font=[NSFont boldSystemFontOfSize:16];
+    _entryStatus.frame=NSMakeRect(22,535,596,24);
     [content addSubview:_entryStatus];
-    _entryInput=[NSTextField labelWithString:@""];
-    _entryInput.frame=NSMakeRect(22,224,436,24);
-    [content addSubview:_entryInput];
-    _entryScreen=[NSTextField labelWithString:@""];
-    _entryScreen.frame=NSMakeRect(22,196,436,24);
-    [content addSubview:_entryScreen];
+    NSScrollView* scroll=[[NSScrollView alloc]
+        initWithFrame:NSMakeRect(22,225,596,300)];
+    scroll.borderType=NSBezelBorder;
+    scroll.hasVerticalScroller=YES;
+    scroll.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
+    _entryDetails=[[NSTextView alloc]
+        initWithFrame:NSMakeRect(0,0,596,300)];
+    _entryDetails.editable=NO;
+    _entryDetails.selectable=YES;
+    _entryDetails.font=[NSFont systemFontOfSize:12];
+    _entryDetails.textContainerInset=NSMakeSize(8,8);
+    _entryDetails.textContainer.widthTracksTextView=YES;
+    scroll.documentView=_entryDetails;
+    [content addSubview:scroll];
     NSButton* (^addButton)(NSString*,SEL,NSRect)=
         ^NSButton*(NSString* title,SEL action,NSRect frame) {
           NSButton* button=[NSButton buttonWithTitle:title target:self action:action];
@@ -1406,15 +1591,24 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
           [content addSubview:button];return button;
         };
     addButton(@"Open Input Monitoring Settings…",@selector(openInputMonitoringSettings:),
-        NSMakeRect(22,153,436,30));
+        NSMakeRect(22,185,292,30));
     addButton(@"Open Screen Recording Settings…",@selector(openScreenRecordingSettings:),
-        NSMakeRect(22,115,436,30));
-    _entryInspectorButton=addButton(@"Show Inspector…",@selector(toggleInspector:),
-        NSMakeRect(22,77,210,30));
+        NSMakeRect(326,185,292,30));
     addButton(@"Retry Input Monitoring",@selector(retryInputMonitoring:),
-        NSMakeRect(248,77,210,30));
-    addButton(@"Open Settings…",@selector(openSettings:),NSMakeRect(22,29,210,30));
-    addButton(@"Quit SeeThis",@selector(quit:),NSMakeRect(248,29,210,30));
+        NSMakeRect(22,147,292,30));
+    _entryInspectorButton=addButton(@"Show Inspector…",@selector(toggleInspector:),
+        NSMakeRect(326,147,292,30));
+    addButton(@"Connect Chrome",@selector(connectChrome:),
+        NSMakeRect(22,109,292,30));
+    addButton(@"Retry Chrome",@selector(retryChrome:),
+        NSMakeRect(326,109,292,30));
+    addButton(@"Open Chrome Automation Settings…",
+        @selector(openChromeAutomationSettings:),NSMakeRect(22,71,292,30));
+    addButton(@"Open Settings…",@selector(openSettings:),
+        NSMakeRect(326,71,292,30));
+    addButton(@"Reveal This App in Finder",@selector(revealCurrentApp:),
+        NSMakeRect(22,33,292,30));
+    addButton(@"Quit SeeThis",@selector(quit:),NSMakeRect(326,33,292,30));
     [_entryPanel center];
   }
   [self refreshPermissionMenu];
@@ -1425,6 +1619,8 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   if(!onScreen)[_entryPanel center];
   [NSApplication.sharedApplication activateIgnoringOtherApps:YES];
   [_entryPanel makeKeyAndOrderFront:nil];
+  _chromeLastCheckMs=0;
+  [self refreshPermissionMenu];
 }
 
 - (void)showPermissionEntry:(id)sender {
@@ -1445,20 +1641,44 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   [self refreshPermissionMenu];
 }
 
+- (void)showInspector:(id)sender {
+  (void)sender;
+  if(!_overlay)return;
+  if(!_overlay->InspectorVisible())_overlay->ToggleInspector();
+  Class inspectorClass=NSClassFromString(@"STInspectorPanel");
+  for(NSWindow* window in NSApplication.sharedApplication.windows) {
+    if(inspectorClass && [window isKindOfClass:inspectorClass] &&
+        window.isVisible) {
+      [window orderFrontRegardless];
+      break;
+    }
+  }
+  [self refreshPermissionMenu];
+}
+
 - (void)retryInputMonitoring:(id)sender {
   (void)sender;if(_input)_input->RetryInputMonitoring();[self refreshPermissionMenu];
 }
 
 - (void)connectChrome:(id)sender {
-  (void)sender;seethis::platform::ConnectChromeExplicit();[self refreshPermissionMenu];
+  (void)sender;
+  _chromeActionError=nil;
+  seethis::platform::ConnectChromeExplicit();
+  [self refreshPermissionMenu];
 }
 - (void)retryChrome:(id)sender {
-  (void)sender;seethis::platform::RetryChromeExplicit();[self refreshPermissionMenu];
+  (void)sender;
+  _chromeActionError=nil;
+  seethis::platform::RetryChromeExplicit();
+  [self refreshPermissionMenu];
 }
 - (void)openChromeAutomationSettings:(id)sender {
   (void)sender;
   if(!seethis::platform::OpenChromeAutomationSettingsExplicit())
-    _chromeGuidanceItem.title=@"Chrome recovery: Could not open Settings. Open System Settings > Privacy & Security > Automation > SeeThis > Google Chrome, then choose Retry Chrome.";
+    _chromeActionError=@"\nCould not open Settings. Open System Settings > Privacy & Security > Automation > SeeThis > Google Chrome, then choose Retry Chrome.";
+  else
+    _chromeActionError=nil;
+  [self refreshPermissionMenu];
 }
 
 - (void)openInputMonitoringSettings:(id)sender {
@@ -1490,7 +1710,8 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   seethis::platform::StopChromeConnection();
   [_statusTimer invalidate];_statusTimer=nil;
   [_entryPanel close];_entryPanel=nil;
-  _entryStatus=nil;_entryInput=nil;_entryScreen=nil;_entryInspectorButton=nil;
+  _entryStatus=nil;_entryDetails=nil;_entryInspectorButton=nil;
+  _chromeStatus=nil;_chromeActionError=nil;_chromeLastCheckMs=0;
   if (_input) {
     _input->Stop();
   }
@@ -1504,12 +1725,8 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   _settings.reset();
   _readiness.reset();
   if(_statusItem)[NSStatusBar.systemStatusBar removeStatusItem:_statusItem];
-  _statusItem=nil;_inputStateItem=nil;_screenStateItem=nil;
-  _startupStateItem=nil;
-  _deleteStateItem=nil;_settingsStateItem=nil;_guidanceItem=nil;
-  _inspectorItem=nil;
-  _chromeStateItems=nil;_chromeGuidanceItem=nil;
-  _screenGuidanceItem=nil;_identityGuidanceItem=nil;_settingsGuidanceItem=nil;
+  _statusItem=nil;_startupStateItem=nil;_chromeStateItem=nil;
+  _privacyPolicyAction=nil;
 }
 @end
 
@@ -1546,3 +1763,5 @@ int RunApplication() {
 }
 
 }  // namespace seethis::platform
+
+#endif  // !SEETHIS_CAPTURE_POINTER_TESTING

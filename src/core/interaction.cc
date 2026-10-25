@@ -141,6 +141,8 @@ StartResult InteractionController::ShortcutKeyDown(
   completion_reason_ = CompletionReason::kNone;
   drawing_started_ms_ = monotonic_ms;
   drawing_finished_ms_ = 0;
+  last_activity_ms_ = monotonic_ms;
+  last_observed_ms_ = monotonic_ms;
   selected_display_id_ = initial_point.display_id;
   selected_backing_scale_ = initial_point.backing_scale;
   session_origin_ = initial_point;
@@ -160,8 +162,23 @@ void InteractionController::SetSelectedDisplayGeometry(DisplayGeometry geometry)
   selected_display_geometry_ = geometry;
 }
 
-bool InteractionController::PointerDown(DisplayPoint point) {
+bool InteractionController::ActivityTimeValid(
+    std::optional<std::int64_t> monotonic_ms) const {
+  return !monotonic_ms ||
+         (*monotonic_ms >= 0 && *monotonic_ms >= last_observed_ms_);
+}
+
+void InteractionController::RecordActivity(
+    std::optional<std::int64_t> monotonic_ms) {
+  if (!monotonic_ms) return;
+  last_activity_ms_ = *monotonic_ms;
+  last_observed_ms_ = *monotonic_ms;
+}
+
+bool InteractionController::PointerDown(
+    DisplayPoint point, std::optional<std::int64_t> monotonic_ms) {
   if (state_ != InteractionState::kDrawing || region_active_ ||
+      !ActivityTimeValid(monotonic_ms) ||
       !IsLogicalPoint(point) || point.display_id != selected_display_id_ ||
       point.backing_scale != selected_backing_scale_) {
     return false;
@@ -172,11 +189,14 @@ bool InteractionController::PointerDown(DisplayPoint point) {
   subpaths_.push_back({{point}});
   region_active_ = true;
   last_pointer_ = point;
+  RecordActivity(monotonic_ms);
   return true;
 }
 
-bool InteractionController::PointerMoved(DisplayPoint point) {
+bool InteractionController::PointerMoved(
+    DisplayPoint point, std::optional<std::int64_t> monotonic_ms) {
   if (state_ != InteractionState::kDrawing || !region_active_ ||
+      !ActivityTimeValid(monotonic_ms) ||
       !IsLogicalPoint(point) || point.display_id != selected_display_id_ ||
       point.backing_scale != selected_backing_scale_) {
     return false;
@@ -185,8 +205,10 @@ bool InteractionController::PointerMoved(DisplayPoint point) {
   last_pointer_ = point;
   if (!selected_display_geometry_ || !previous) {
     auto& path = subpaths_.back().back();
-    if (!SamePoint(path.back(), point)) path.push_back(point);
+    if (SamePoint(path.back(), point)) return false;
+    path.push_back(point);
     regions_.back().push_back(point);
+    RecordActivity(monotonic_ms);
     return true;
   }
   const bool previous_in =
@@ -198,6 +220,7 @@ bool InteractionController::PointerMoved(DisplayPoint point) {
     if (SamePoint(path.back(), point)) return false;
     path.push_back(point);
     regions_.back().push_back(point);
+    RecordActivity(monotonic_ms);
     return true;
   }
   Point2D clipped_start, clipped_end;
@@ -212,8 +235,10 @@ bool InteractionController::PointerMoved(DisplayPoint point) {
                           point.backing_scale};
   if (previous_in && !current_in) {
     auto& path = subpaths_.back().back();
-    if (!SamePoint(path.back(), exit)) path.push_back(exit);
+    if (SamePoint(path.back(), exit)) return false;
+    path.push_back(exit);
     regions_.back().push_back(exit);
+    RecordActivity(monotonic_ms);
     return true;
   }
   if (!previous_in && current_in) {
@@ -223,6 +248,7 @@ bool InteractionController::PointerMoved(DisplayPoint point) {
     if (!SamePoint(entry, point)) region.back().push_back(point);
     regions_.back().push_back(entry);
     regions_.back().push_back(point);
+    if (!SamePoint(entry, point)) RecordActivity(monotonic_ms);
     return true;
   }
   if (SamePoint(entry, exit)) {
@@ -231,12 +257,17 @@ bool InteractionController::PointerMoved(DisplayPoint point) {
   subpaths_.back().push_back({entry, exit});
   regions_.back().push_back(entry);
   regions_.back().push_back(exit);
+  RecordActivity(monotonic_ms);
   return true;
 }
 
-bool InteractionController::PointerUp(DisplayPoint point) {
+bool InteractionController::PointerUp(
+    DisplayPoint point, std::optional<std::int64_t> monotonic_ms) {
   if (state_ != InteractionState::kDrawing || !region_active_) return false;
-  if (!IsLogicalPoint(point) || point.display_id != selected_display_id_ ||
+  // A release still ends the physical drag when its sample cannot be used;
+  // it must not append stale geometry or renew activity.
+  if (!ActivityTimeValid(monotonic_ms) || !IsLogicalPoint(point) ||
+      point.display_id != selected_display_id_ ||
       point.backing_scale != selected_backing_scale_) {
     FinishActiveRegion();
     return true;
@@ -273,6 +304,7 @@ bool InteractionController::PointerUp(DisplayPoint point) {
         }
       }
       last_pointer_ = point;
+      if (current_in) RecordActivity(monotonic_ms);
       FinishActiveRegion();
       return true;
     }
@@ -288,6 +320,7 @@ bool InteractionController::PointerUp(DisplayPoint point) {
     regions_.back().push_back(point);
   }
   last_pointer_ = point;
+  RecordActivity(monotonic_ms);
   FinishActiveRegion();
   return true;
 }
@@ -339,6 +372,8 @@ bool InteractionController::Cancel(CancelReason reason) {
   completion_reason_ = CompletionReason::kNone;
   drawing_started_ms_ = 0;
   drawing_finished_ms_ = 0;
+  last_activity_ms_ = 0;
+  last_observed_ms_ = 0;
   regions_.clear();
   subpaths_.clear();
   region_active_ = false;
@@ -356,11 +391,13 @@ bool InteractionController::Watchdog(std::int64_t monotonic_ms,
                                      bool shortcut_key_is_down,
                                      std::int64_t maximum_hold_ms,
                                      bool shortcut_modifiers_present) {
-  if (state_ != InteractionState::kDrawing) {
+  if (state_ != InteractionState::kDrawing || monotonic_ms < 0 ||
+      monotonic_ms < last_observed_ms_) {
     return false;
   }
-  if (maximum_hold_ms >= 0 && monotonic_ms >= drawing_started_ms_ &&
-      monotonic_ms - drawing_started_ms_ > maximum_hold_ms) {
+  last_observed_ms_ = monotonic_ms;
+  if (maximum_hold_ms >= 0 && monotonic_ms >= last_activity_ms_ &&
+      monotonic_ms - last_activity_ms_ > maximum_hold_ms) {
     return Cancel(CancelReason::kWatchdogTimeout);
   }
   const bool shortcut_released =
@@ -401,7 +438,8 @@ bool InteractionController::Watchdog(std::int64_t monotonic_ms,
 InteractionSnapshot InteractionController::Snapshot() const {
   InteractionSnapshot snapshot{state_, cancel_reason_, completion_reason_,
                                session_origin_, regions_, subpaths_, region_active_,
-                               drawing_started_ms_, drawing_finished_ms_};
+                               drawing_started_ms_, drawing_finished_ms_,
+                               last_activity_ms_};
   Flatten(subpaths_, &snapshot.regions);
   return snapshot;
 }

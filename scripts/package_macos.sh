@@ -2,6 +2,22 @@
 set -euo pipefail
 umask 077
 
+# These values are constructed only by install_action. In particular, an
+# environment variable cannot turn a public preflight into an owned-stage one.
+install_stage_proof_active=0
+install_stage_root=''
+install_stage_path=''
+install_stage_target=''
+install_stage_canonical=''
+install_stage_id=''
+install_stage_root_inode=''
+install_stage_destination_inode=''
+install_stage_identity=''
+install_stage_preserve=0
+install_stage_registered_baseline=''
+install_stage_canonical_register_succeeded=0
+install_stage_canonical_expected_identity=''
+
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 note() { printf '%s\n' "$*"; }
 usage() {
@@ -331,7 +347,7 @@ PY
 }
 
 unrelated_app_snapshot() {
-  local path=$1 raw_path=$2 candidate_id=$3 candidate_app=$4 candidate_exec=$5 app_root name='' snapshot_id
+  local path=$1 raw_path=$2 candidate_id=$3 candidate_app=$4 candidate_exec=$5 pid=$6 original_raw_path=$7 app_root name='' snapshot_id verify_error
   local declared=0 app_display binary_display app_display_id app_team binary_exec binary_id binary_team signed_exec
   [[ "$raw_path" = /* && "$raw_path" == "$path" && -f "$path" && -r "$path" && ! -L "$path" ]] || return 1
   [[ "$path" == */Contents/MacOS/* ]] || return 1
@@ -347,7 +363,11 @@ unrelated_app_snapshot() {
   fi
   snapshot_id=$(bundle_id "$app_root") || return 1
   [[ -n "$snapshot_id" && "$snapshot_id" != "$candidate_id" ]] || return 1
-  strict_verify "$app_root" || return 1
+  if ! verify_error=$(codesign --verify --deep --strict "$app_root" 2>&1); then
+    [[ "$verify_error" == "$app_root: resource envelope is obsolete (custom omit rules)" ]] || return 1
+    verified_xprotect_process "$pid" "$path" "$original_raw_path" "$snapshot_id" "$name" "$declared" || return 1
+    return 0
+  fi
   [[ "$(bundle_id "$app_root")" == "$snapshot_id" ]] || return 1
   if ((declared)); then
     [[ "$(executable_name "$app_root")" == "$name" ]] || return 1
@@ -382,6 +402,80 @@ unrelated_app_snapshot() {
     executable_name "$app_root" >/dev/null 2>&1 && return 1
     only_macos_executable "$app_root/Contents/MacOS" "$path"
   fi
+}
+
+xprotect_dynamic_signature_valid() (
+  local pid=$1 temp result=1
+  temp=$(mktemp -d "${TMPDIR:-/tmp}/seethis-xprotect-check.XXXXXX") || return 1
+  cat >"$temp/check.c" <<'C'
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2 || !argv[1][0]) return 1;
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(argv[1], &end, 10);
+    if (errno || *end || parsed <= 0 || parsed > INT_MAX) return 1;
+    int pid = (int)parsed;
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &pid);
+    if (!number) return 1;
+    const void *keys[] = { kSecGuestAttributePid };
+    const void *values[] = { number };
+    CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    SecCodeRef guest = NULL;
+    SecRequirementRef requirement = NULL;
+    int valid = 0;
+    if (attributes &&
+        SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &guest) == errSecSuccess && guest &&
+        SecRequirementCreateWithString(CFSTR("anchor apple and identifier \"com.apple.XProtectFramework.XProtect\""),
+                                       kSecCSDefaultFlags, &requirement) == errSecSuccess && requirement &&
+        SecCodeCheckValidity(guest, kSecCSDefaultFlags, requirement) == errSecSuccess) {
+        valid = 1;
+    }
+    if (requirement) CFRelease(requirement);
+    if (guest) CFRelease(guest);
+    if (attributes) CFRelease(attributes);
+    CFRelease(number);
+    return valid ? 0 : 1;
+}
+C
+  if /usr/bin/clang -Werror -Wall -Wextra -framework Security -framework CoreFoundation \
+      "$temp/check.c" -o "$temp/check" >/dev/null 2>&1; then
+    "$temp/check" "$pid" && result=0
+  fi
+  rm -f "$temp/check" "$temp/check.c"
+  rmdir "$temp"
+  return "$result"
+)
+
+verified_xprotect_process() {
+  local pid=$1 path=$2 raw_path=$3 snapshot_id=$4 name=$5 declared=$6
+  local expected=/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtect
+  local root=/Library/Apple/System/Library/CoreServices/XProtect.app kernel_path live_raw
+  [[ "$pid" =~ ^[0-9]+$ && "$path" == "$expected" && "$raw_path" == "$expected" &&
+     "$declared" == 1 && "$name" == XProtect &&
+     "$snapshot_id" == com.apple.XProtectFramework.XProtect &&
+     -f "$expected" && -r "$expected" && -x "$expected" && ! -L "$expected" &&
+     -f "$root/Contents/Info.plist" && -r "$root/Contents/Info.plist" &&
+     ! -L "$root/Contents/Info.plist" && "$(real "$expected")" == "$expected" ]] || return 1
+  [[ "$(bundle_id "$root")" == "$snapshot_id" && "$(executable_name "$root")" == "$name" ]] || return 1
+  kernel_path=$(proc_pidpath_exact "$pid") || return 1
+  [[ "$kernel_path" == "$expected" ]] || return 1
+  xprotect_dynamic_signature_valid "$pid" || return 1
+  [[ -f "$expected" && -r "$expected" && -x "$expected" && ! -L "$expected" &&
+     "$(real "$expected")" == "$expected" &&
+     "$(bundle_id "$root")" == "$snapshot_id" && "$(executable_name "$root")" == "$name" ]] || return 1
+  kernel_path=$(proc_pidpath_exact "$pid") || return 1
+  [[ "$kernel_path" == "$expected" ]] || return 1
+  live_raw=$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//') || return 1
+  [[ "$live_raw" == "$expected" ]] || return 1
+  [[ "$(bundle_id "$root")" == "$snapshot_id" && "$(executable_name "$root")" == "$name" &&
+     "$(real "$expected")" == "$expected" ]] || return 1
 }
 
 pid_absent_from_complete_snapshot() {
@@ -589,6 +683,38 @@ check_prior_identity() {
   fi
 }
 
+verified_bundle_identity() {
+  local app=$1 verified_tree='' verified_id='' verified_name=''
+  local verified_executable_hash='' verified_requirement='' verified_cdhash=''
+  local inode provenance_hash requirement_hash
+  [[ -d "$app" && ! -L "$app" && "$(real "$app")" == "$app" ]] || return 1
+  [[ -f "$app/Contents/Info.plist" ]] || return 1
+  strict_verify "$app" && validate_signed_provenance "$app" || return 1
+  measure_bundle "$app" verified 'verified bundle' || return 1
+  inode=$(stat -f '%d:%i' "$app") || return 1
+  provenance_hash=$(sha256_file "$(provenance_file "$app")") || return 1
+  requirement_hash=$(sha256_text "$verified_requirement") || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$inode" "$verified_tree" "$verified_id" "$verified_name" \
+    "$verified_executable_hash" "$requirement_hash" "$verified_cdhash" "$provenance_hash"
+}
+
+verify_install_stage() {
+  local identity
+  [[ "$install_stage_proof_active" == 1 && -n "$install_stage_path" &&
+     "$install_stage_path" == "$install_stage_root/candidate.app" &&
+     "$install_stage_root" == "$(dirname "$install_stage_root")/$(basename "$install_stage_root")" &&
+     "$(dirname "$install_stage_root")" == "$install_stage_target" &&
+     -d "$install_stage_root" && ! -L "$install_stage_root" &&
+     "$(real "$install_stage_root")" == "$install_stage_root" &&
+     "$(stat -f '%d:%i' "$install_stage_root" 2>/dev/null)" == "$install_stage_root_inode" &&
+     "$(stat -f '%d:%i' "$install_stage_target" 2>/dev/null)" == "$install_stage_destination_inode" &&
+     -d "$install_stage_path" && ! -L "$install_stage_path" &&
+     "$(real "$install_stage_path")" == "$install_stage_path" ]] || return 1
+  identity=$(verified_bundle_identity "$install_stage_path") || return 1
+  [[ "$identity" == "$install_stage_identity" ]]
+}
+
 preflight_action() {
   local app='' canonical_target='' audit_index='' audit_index_sha='' id requirement cd candidate_exec candidate_name candidate_hash
   local -a owned_manifests=()
@@ -645,6 +771,10 @@ preflight_action() {
       continue
     fi
     [[ "$path" == "$app" ]] && continue
+    if [[ "$install_stage_proof_active" == 1 && "$path" == "$install_stage_path" ]]; then
+      verify_install_stage || die "installer-owned stage identity changed: $path"
+      continue
+    fi
     if [[ -n "$canonical_target" && "$path" == "$canonical_target" ]]; then
       [[ -d "$path" ]] || die 'registered canonical target is missing'
       local registered_id
@@ -672,7 +802,7 @@ preflight_action() {
         verified_process_alias "$pid" "$raw_observed" "$observed" || die "ambiguous process evidence for PID $pid"
         alias_proven=1; proof_raw=$observed
       fi
-      if unrelated_app_snapshot "$observed" "$proof_raw" "$id" "$app" "$candidate_exec"; then
+      if unrelated_app_snapshot "$observed" "$proof_raw" "$id" "$app" "$candidate_exec" "$pid" "$raw_observed"; then
         if live=$(live_process_path "$pid"); then
           [[ "$live" == "$observed" ]] || die "ambiguous process evidence for PID $pid"
         else
@@ -1083,6 +1213,173 @@ package_action() {
   note "PACKAGED app=$(real "$app") zip=$(real "$archive") evidence=$(real "$output/evidence.txt") owned_manifest=$(real "$output/owned-artifacts.txt")"
 }
 
+ls_set_contains() {
+  local set=$1 wanted=$2 row
+  while IFS= read -r row; do [[ "$row" != "$wanted" ]] || return 0; done <<<"$set"
+  return 1
+}
+
+ls_set_without() {
+  local set=$1 removed=$2 row
+  while IFS= read -r row; do
+    [[ -n "$row" && "$row" != "$removed" ]] && printf '%s\n' "$row"
+  done <<<"$set"
+  return 0
+}
+
+ls_set_with() {
+  local set=$1 added=$2
+  { [[ -z "$set" ]] || printf '%s\n' "$set"; printf '%s\n' "$added"; } | LC_ALL=C sort -u
+}
+
+install_stage_cleanup() {
+  local before_remove='' before='' after='' expected='' without_canonical=''
+  local canonical_before='' canonical_after='' final='' expected_baseline='' stage_registered=0
+  [[ -n "$install_stage_root" ]] || return 0
+  [[ -d "$install_stage_root" && ! -L "$install_stage_root" &&
+     "$(real "$install_stage_root")" == "$install_stage_root" &&
+     "$(stat -f '%d:%i' "$install_stage_root" 2>/dev/null)" == "$install_stage_root_inode" ]] || {
+    printf 'ERROR: installer stage root changed; preserved for inspection: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  before_remove=$(registered_apps "$install_stage_id") || {
+    printf 'ERROR: stage cleanup cannot read the complete same-ID registration set; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  printf 'stage_ls_before_remove=%s\n' "$before_remove" >&2
+  if [[ -e "$install_stage_path" || -L "$install_stage_path" ]]; then
+    if [[ "$install_stage_proof_active" == 1 ]]; then
+      verify_install_stage || {
+        printf 'ERROR: installer-owned stage identity changed; preserved: %s\n' "$install_stage_root" >&2
+        return 1
+      }
+    else
+      [[ -d "$install_stage_path" && ! -L "$install_stage_path" &&
+         "$(real "$install_stage_path")" == "$install_stage_path" ]] || {
+        printf 'ERROR: unproven stage path changed; preserved: %s\n' "$install_stage_root" >&2
+        return 1
+      }
+    fi
+    rm -rf "$install_stage_path" || {
+      printf 'ERROR: stage path could not be removed; preserved: %s\n' "$install_stage_root" >&2
+      return 1
+    }
+  fi
+  [[ ! -e "$install_stage_path" && ! -L "$install_stage_path" ]] || {
+    printf 'ERROR: stage path reappeared; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  before=$(registered_apps "$install_stage_id") || {
+    printf 'ERROR: stage cleanup readback is malformed; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  printf 'stage_ls_before_unregister=%s\n' "$before" >&2
+  [[ "$(ls_set_without "$before_remove" "$install_stage_path")" == \
+     "$(ls_set_without "$before" "$install_stage_path")" ]] || {
+    printf 'ERROR: same-ID registration set drifted during stage removal; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  if [[ -e "$install_stage_canonical" ]]; then
+    canonical_before=$(verified_bundle_identity "$install_stage_canonical") || {
+      printf 'ERROR: canonical identity is invalid during stage cleanup; preserved: %s\n' "$install_stage_root" >&2
+      return 1
+    }
+  elif [[ -L "$install_stage_canonical" ]]; then
+    printf 'ERROR: canonical path became a symbolic link; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  fi
+  printf 'stage_canonical_before=%s\t%s\n' "$install_stage_canonical" "$canonical_before" >&2
+  if ls_set_contains "$before" "$install_stage_path"; then
+    ((install_stage_proof_active == 1)) || {
+      printf 'ERROR: unproven stage registration remains; no automatic unregister: %s\n' "$install_stage_path" >&2
+      return 1
+    }
+    stage_registered=1
+    "$(lsregister_command)" -u "$install_stage_path" >/dev/null || {
+      printf 'ERROR: exact installer stage unregister failed; preserved: %s\n' "$install_stage_root" >&2
+      return 1
+    }
+  fi
+  after=$(registered_apps "$install_stage_id") || {
+    printf 'ERROR: stage cleanup final readback is malformed; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  printf 'stage_ls_after_unregister=%s\n' "$after" >&2
+  if [[ -e "$install_stage_canonical" ]]; then
+    canonical_after=$(verified_bundle_identity "$install_stage_canonical") || return 1
+  fi
+  printf 'stage_canonical_after=%s\t%s\n' "$install_stage_canonical" "$canonical_after" >&2
+  [[ "$canonical_after" == "$canonical_before" &&
+     ! -e "$install_stage_path" && ! -L "$install_stage_path" ]] || {
+    printf 'ERROR: canonical or stage identity drifted during cleanup; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  [[ "$canonical_before" == "$install_stage_canonical_expected_identity" ]] || {
+    printf 'ERROR: canonical identity differs from intended installed or prior app; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  expected=$before
+  if ((stage_registered)); then expected=$(ls_set_without "$before" "$install_stage_path"); fi
+  if [[ "$after" != "$expected" ]]; then
+    without_canonical=$(ls_set_without "$expected" "$install_stage_canonical")
+    if ((stage_registered)) && ls_set_contains "$expected" "$install_stage_canonical" &&
+       [[ -n "$canonical_before" && "$after" == "$without_canonical" ]]; then
+      "$(lsregister_command)" -f "$install_stage_canonical" >/dev/null || {
+        printf 'ERROR: canonical alias registration recovery failed; preserved: %s\n' "$install_stage_root" >&2
+        return 1
+      }
+      after=$(registered_apps "$install_stage_id") || return 1
+      canonical_after=$(verified_bundle_identity "$install_stage_canonical") || return 1
+      printf 'stage_ls_after_canonical_recovery=%s\n' "$after" >&2
+      printf 'stage_canonical_after_recovery=%s\t%s\n' "$install_stage_canonical" "$canonical_after" >&2
+      [[ "$after" == "$expected" && "$canonical_after" == "$canonical_before" &&
+         ! -e "$install_stage_path" && ! -L "$install_stage_path" ]] || {
+        printf 'ERROR: canonical alias registration recovery readback failed; preserved: %s\n' "$install_stage_root" >&2
+        return 1
+      }
+    else
+      printf 'ERROR: unknown same-ID registration delta during stage cleanup; preserved: %s\n' "$install_stage_root" >&2
+      return 1
+    fi
+  fi
+  expected_baseline=$install_stage_registered_baseline
+  if ((install_stage_canonical_register_succeeded)); then
+    expected_baseline=$(ls_set_with "$expected_baseline" "$install_stage_canonical")
+  fi
+  [[ "$after" == "$expected_baseline" ]] || {
+    printf 'ERROR: same-ID registration set differs from install baseline; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  final=$(registered_apps "$install_stage_id") || return 1
+  printf 'stage_ls_final_readback=%s\n' "$final" >&2
+  [[ "$final" == "$after" && ! -e "$install_stage_path" && ! -L "$install_stage_path" ]] || {
+    printf 'ERROR: stage or same-ID registration reappeared during final readback; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  }
+  return 0
+}
+
+install_stage_finalize() {
+  local prior_status=$1
+  trap - EXIT
+  if ! install_stage_cleanup; then
+    printf 'ERROR: stage cleanup is unresolved; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  fi
+  if [[ "$install_stage_preserve" == 1 ]]; then
+    printf 'ERROR: rollback artifact requires recovery; preserved: %s\n' "$install_stage_root" >&2
+    return 1
+  fi
+  rm -rf "$install_stage_root" || return 1
+  return "$prior_status"
+}
+
+install_stage_exit_trap() {
+  local prior_status=$?
+  install_stage_finalize "$prior_status" || exit 2
+  exit "$prior_status"
+}
+
 install_action() {
   local app='' destination='' audit_index='' audit_index_sha='' ack=0 manifest
   local -a owned_manifests=()
@@ -1113,26 +1410,40 @@ install_action() {
   if ((owned_count > 0)); then
     for manifest in "${owned_manifests[@]}"; do preflight_args+=(--owned-manifest "$manifest"); done
   fi
-  local preflight_report continuity_report missing_hash_before missing_hash_after
+  local preflight_report continuity_report missing_hash_before missing_hash_after stage_registered_now
   preflight_report=$(preflight_action "${preflight_args[@]}")
   continuity_report=$(printf '%s\n' "$preflight_report" | sed -n 's/^continuity_note=//p')
   missing_hash_before=$(printf '%s\n' "$preflight_report" | sed -n 's/^missing_registered_set_sha256=//p')
   [[ "$missing_hash_before" =~ ^[0-9a-f]{64}$ ]] || die 'initial missing registration set is unavailable'
-  local target_existed_before=0 target_inode_before='' target_tree_before=''
+  local target_existed_before=0 target_inode_before='' target_tree_before='' prior_identity_before=''
   if [[ -e "$target" ]]; then
     target_existed_before=1
     target_inode_before=$(stat -f '%d:%i' "$target") || die 'canonical target identity is unavailable'
     target_tree_before=$(bundle_tree_hash "$target") || die 'canonical target tree hash is unavailable'
+    install_stage_canonical_expected_identity=$(verified_bundle_identity "$target") || die 'canonical target signed identity is unavailable'
+    prior_identity_before=$install_stage_canonical_expected_identity
   fi
 
   local stage_root staged candidate_tree candidate_id candidate_name candidate_req candidate_hash candidate_cdhash
+  install_stage_id=$(bundle_id "$app") || die 'candidate bundle identifier is unavailable'
+  [[ -n "$install_stage_id" ]] || die 'candidate bundle identifier is empty'
+  install_stage_registered_baseline=$(registered_apps "$install_stage_id") || die 'initial same-ID registration set is unavailable'
+  install_stage_target=$destination
+  install_stage_canonical=$target
+  install_stage_destination_inode=$(stat -f '%d:%i' "$destination") || die 'install destination identity is unavailable'
   stage_root=$(mktemp -d "$destination/.seethis-install.XXXXXX")
   staged="$stage_root/candidate.app"
-  if ! cp -a "$app" "$staged"; then rm -rf "$stage_root"; die 'staging copy failed; canonical target was not changed'; fi
-  strict_verify "$staged" || { rm -rf "$stage_root"; die 'staged candidate signature invalid; canonical target was not changed'; }
+  install_stage_root=$stage_root
+  install_stage_path=$staged
+  install_stage_root_inode=$(stat -f '%d:%i' "$stage_root") || die 'installer stage root identity is unavailable'
+  [[ -d "$stage_root" && ! -L "$stage_root" && "$(real "$stage_root")" == "$stage_root" &&
+     "$(dirname "$stage_root")" == "$destination" ]] || die 'installer stage root is unsafe'
+  trap 'install_stage_exit_trap' EXIT
+  if ! cp -a "$app" "$staged"; then die 'staging copy failed; canonical target was not changed'; fi
+  strict_verify "$staged" || die 'staged candidate signature invalid; canonical target was not changed'
+  validate_signed_provenance "$staged" || die 'staged candidate signed provenance invalid; canonical target was not changed'
   if ! compare_complete_bundles "$app" "$staged" 'source candidate' 'staged candidate' staged_candidate; then
     local comparison_error=$bundle_comparison_error
-    rm -rf "$stage_root"
     die "$comparison_error; canonical target was not changed"
   fi
   candidate_tree=$bundle_comparison_left_tree
@@ -1141,33 +1452,41 @@ install_action() {
   candidate_req=$bundle_comparison_left_requirement
   candidate_hash=$bundle_comparison_left_executable_hash
   candidate_cdhash=$bundle_comparison_left_cdhash
+  install_stage_identity=$(verified_bundle_identity "$staged") || die 'staged candidate identity is unavailable'
+  install_stage_proof_active=1
 
   if ((target_existed_before)); then
-    [[ -d "$target" && ! -L "$target" ]] || { rm -rf "$stage_root"; die 'canonical target changed during staging'; }
+    [[ -d "$target" && ! -L "$target" ]] || die 'canonical target changed during staging'
     [[ "$(stat -f '%d:%i' "$target")" == "$target_inode_before" &&
        "$(bundle_tree_hash "$target")" == "$target_tree_before" ]] ||
-      { rm -rf "$stage_root"; die 'canonical target changed during staging'; }
+      die 'canonical target changed during staging'
   else
     [[ ! -e "$target" && ! -L "$target" ]] ||
-      { rm -rf "$stage_root"; die 'canonical target appeared during staging'; }
+      die 'canonical target appeared during staging'
   fi
+  verify_install_stage || die 'installer-owned stage identity changed before second preflight'
   if ! preflight_report=$(preflight_action "${preflight_args[@]}" 2>&1); then
-    rm -rf "$stage_root"
     printf '%s\n' "$preflight_report" >&2
     exit 2
   fi
+  stage_registered_now=$(registered_apps "$install_stage_id") || die 'same-ID registration set is unavailable after second preflight'
+  [[ "$(ls_set_without "$stage_registered_now" "$install_stage_path")" == \
+     "$install_stage_registered_baseline" ]] || die 'same-ID registration set changed during staging'
   missing_hash_after=$(printf '%s\n' "$preflight_report" | sed -n 's/^missing_registered_set_sha256=//p')
   [[ "$missing_hash_after" == "$missing_hash_before" ]] ||
-    { rm -rf "$stage_root"; die 'missing registered app set changed during staging'; }
+    die 'missing registered app set changed during staging'
+  verify_install_stage || die 'installer-owned stage identity changed before swap'
 
   local backup="$stage_root/previous.app" displaced="$stage_root/failed-new.app" had_previous=0
   if [[ -e "$target" ]]; then
     had_previous=1
-    if ! mv "$target" "$backup"; then rm -rf "$stage_root"; die 'unable to stage previous canonical app; target was not changed'; fi
+    if ! mv "$target" "$backup"; then die 'unable to stage previous canonical app; target was not changed'; fi
   fi
   if ! mv "$staged" "$target"; then
-    if ((had_previous)) && ! mv "$backup" "$target"; then die "installation swap failed and previous app could not be restored; preserved at $backup"; fi
-    rm -rf "$stage_root"
+    if ((had_previous)) && ! mv "$backup" "$target"; then
+      install_stage_preserve=1
+      die "installation swap failed and previous app could not be restored; preserved at $backup"
+    fi
     die 'installation swap failed; previous canonical app was restored'
   fi
   local validation_ok=1 validation_error='installed candidate signature validation failed'
@@ -1191,22 +1510,44 @@ install_action() {
       validation_ok=0; validation_error='installed candidate CDHash differs'
     fi
   fi
+  if ((validation_ok)) && ! install_stage_canonical_expected_identity=$(verified_bundle_identity "$target"); then
+    validation_ok=0
+    validation_error='installed candidate signed identity differs or is unavailable'
+  fi
   if ((validation_ok == 0)); then
-    mv "$target" "$displaced" || true
-    if ((had_previous)) && ! mv "$backup" "$target"; then die "installed candidate validation failed and previous app could not be restored; preserved at $backup"; fi
-    rm -rf "$stage_root"
+    if ! mv "$target" "$displaced"; then
+      install_stage_preserve=1
+      die "installed candidate validation failed and new app could not be displaced; preserved at $target"
+    fi
+    if ((had_previous)) && ! mv "$backup" "$target"; then
+      install_stage_preserve=1
+      die "installed candidate validation failed and previous app could not be restored; preserved at $backup"
+    fi
     die "$validation_error; previous canonical app was restored"
   fi
   if ! "$lsreg" -f "$target" >/dev/null; then
-    mv "$target" "$displaced" || true
-    if ((had_previous)); then
-      if ! mv "$backup" "$target"; then die "Launch Services registration failed and previous app could not be restored; preserved at $backup"; fi
-      "$lsreg" -f "$target" >/dev/null 2>&1 || true
+    if ! mv "$target" "$displaced"; then
+      install_stage_preserve=1
+      die "Launch Services registration failed and new app could not be displaced; preserved at $target"
     fi
-    rm -rf "$stage_root"
+    if ((had_previous)); then
+      if ! mv "$backup" "$target"; then
+        install_stage_preserve=1
+        die "Launch Services registration failed and previous app could not be restored; preserved at $backup"
+      fi
+      install_stage_canonical_expected_identity=$prior_identity_before
+      "$lsreg" -f "$target" >/dev/null 2>&1 || {
+        install_stage_preserve=1
+        printf 'ERROR: previous canonical registration could not be restored; preserved at %s\n' "$stage_root" >&2
+        die 'Launch Services registration failed; previous canonical app was restored'
+      }
+    else
+      install_stage_canonical_expected_identity=''
+    fi
     die 'Launch Services registration failed; previous canonical app was restored'
   fi
-  rm -rf "$stage_root"
+  install_stage_canonical_register_succeeded=1
+  install_stage_finalize 0 || die 'installer stage cleanup failed after swap'
   note "INSTALLED app=$(real "$target") bundle_id=$candidate_id executable_sha256=$candidate_hash designated_requirement=$candidate_req"
   note "continuity_note=$continuity_report"
 }

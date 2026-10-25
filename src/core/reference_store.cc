@@ -396,6 +396,10 @@ Stamp Now() {
 std::string Sha256(const Bytes& input) {
   Sha256State state;state.Update(input.data(),input.size());return state.Finish();
 }
+std::string StableMarkId(std::string_view reference_id,std::size_t slot) {
+  const std::string seed=std::string(reference_id)+":"+std::to_string(slot);
+  return Sha256(Bytes(seed.begin(),seed.end())).substr(0,32);
+}
 bool ValidPageIdentity(const PageIdentity& identity, std::string* error) {
   auto fail=[&](const char* message){if(error)*error=message;return false;};
   const auto hex=[](const std::string& value) {
@@ -426,7 +430,10 @@ bool PageIdentityMatchesContext(const PageIdentity& identity,
                                 const Context& context) {
   return identity.provider=="chrome" && context.bundle_id==identity.bundle_id &&
       identity.browser_pid==context.window_pid && identity.window_id==context.window_id &&
-      Same(identity.window_bounds,context.window);
+      Same(identity.window_bounds,context.window) &&
+      (context.native_window.version==0 ||
+       (identity.provider_version==2 && context.native_window.version==1 &&
+        identity.process_start_identity_us==context.native_window.process_start_identity_us));
 }
 bool PageIdentityVisible(const std::optional<PageIdentity>& required,
                          const PageObservation& current) {
@@ -438,23 +445,126 @@ bool PageIdentityVisible(const std::optional<PageIdentity>& required,
       current.identity && SamePageIdentity(*required,*current.identity) &&
       current.observed.monotonic_us>0 && age>=0 && age<=2'000'000;
 }
+void NativeWindowLifetimeTracker::Observe(std::int64_t pid,std::int64_t start,
+                                           const std::vector<std::uint64_t>& ids,
+                                           std::uint64_t generation,bool complete) {
+  if(!complete || generation<=generation_ || pid<=0 || start<=0 || session_.empty())return;
+  generation_=generation;
+  for(auto& entry:entries_)if(entry.pid==pid && entry.start==start)
+    entry.present=std::find(ids.begin(),ids.end(),entry.id)!=ids.end() && entry.present;
+  for(const auto id:ids) {
+    if(!id)continue;
+    auto found=std::find_if(entries_.begin(),entries_.end(),[&](const auto& entry) {
+      return entry.pid==pid && entry.start==start && entry.id==id;
+    });
+    if(found==entries_.end())entries_.push_back({pid,start,id,++next_,true});
+    else if(!found->present){found->present=true;found->incarnation=++next_;}
+  }
+}
+NativeWindowIdentity NativeWindowLifetimeTracker::Identity(
+    std::int64_t pid,std::int64_t start,std::uint64_t id) const {
+  for(const auto& entry:entries_)
+    if(entry.pid==pid && entry.start==start && entry.id==id && entry.present)
+      return {1,start,session_,entry.incarnation};
+  return {1,start,{},0};
+}
+namespace {
+bool NativeIdentityMatches(const NativeWindowIdentity& required,
+                           const NativeWindowIdentity& current) {
+  // Preserve the original weaker fresh-tuple branch for genuine old records.
+  if(required.version==0)return required.process_start_identity_us==0 &&
+      required.observation_session.empty() && required.incarnation==0;
+  if(required.version!=1 || current.version!=1 ||
+     required.process_start_identity_us<=0 || current.process_start_identity_us<=0 ||
+     required.process_start_identity_us!=current.process_start_identity_us ||
+     required.observation_session.empty() || current.observation_session.empty() ||
+     !required.incarnation || !current.incarnation)return false;
+  // A fresh SeeThis process cannot reconstruct unobserved historical windows.
+  return required.observation_session!=current.observation_session ||
+      required.incarnation==current.incarnation;
+}
+}
 bool WindowObservationMatchesContext(const Context& required,
                                      const WindowObservation& current) {
   const auto now=Now();
   const auto age=now.monotonic_us-current.observed.monotonic_us;
-  return current.availability==WindowAvailability::kReady &&
+  return NativeIdentityMatches(required.native_window,current.native_window) &&
+      (required.native_window.version==0 ||
+       (required.pid==required.window_pid && required.window_pid>0 &&
+        required.window_id>0 && !required.bundle_id.empty() && ValidRect(required.window) &&
+        required.native_window.process_start_identity_us<=required.observed.utc_us &&
+        current.native_window.process_start_identity_us<=current.observed.utc_us)) &&
+      current.availability==WindowAvailability::kReady &&
       current.generation>0 && current.observed.monotonic_us>0 &&
       age>=0 && age<=2'000'000 && current.pid==required.window_pid &&
       current.bundle_id==required.bundle_id &&
       current.window_id==required.window_id &&
       Same(current.bounds,required.window);
 }
+namespace {
+bool CaptureContextProvenanceSupported(const Context& c) {
+  // These are the capture-origin fields already frozen in positional Context.
+  // Genuine native-v0 records retain their weaker tuple lifetime semantics.
+  std::set<std::string> uuids;std::set<DisplayId> ids;
+  for(const auto& d:c.displays) {
+    if(d.uuid.empty() || !uuids.insert(d.uuid).second || !ids.insert(d.id).second || !d.id ||
+       !ValidRect(d.logical) || !ValidRect(d.pixels) || !Finite(d.scale) || d.scale<=0 ||
+       d.pixels.width!=d.logical.width*d.scale || d.pixels.height!=d.logical.height*d.scale ||
+       !Same(d.logical_to_pixels,{d.scale,-d.scale,d.pixels.x-d.logical.x*d.scale,
+           d.pixels.y+(d.logical.y+d.logical.height)*d.scale}))return false;
+  }
+  return c.pid>0 && c.window_pid==c.pid && c.self_pid>0 && c.self_pid!=c.pid &&
+      c.window_id>0 && c.window_layer==0 && ValidRect(c.window) &&
+      Finite(c.quartz_to_appkit_top) && c.quartz_to_appkit_top>0 &&
+      !c.app_name.empty() && (!c.bundle_id.empty() || !c.executable.empty()) &&
+      ValidStamp(c.observed) && !c.displays.empty() &&
+      c.selection_method=="frontmost-pid/topmost-normal-containing-initial-point" &&
+      c.exclusion_method=="exact-window-allowlist;self-pid-rejected;child-windows-off" &&
+      !c.excluded_window_ids.empty() &&
+      std::find(c.excluded_window_ids.begin(),c.excluded_window_ids.end(),c.window_id)==
+          c.excluded_window_ids.end();
+}
+bool LegacyCaptureTitleSupported(const Context& c) {
+  return CaptureContextProvenanceSupported(c) && ValidSourceContextText(c.window_title,1024);
+}
+}
+const char* TitleScopeCapabilityName(const Context& c) {
+  if(c.bundle_id=="com.google.Chrome")return "Chrome page identity; title not applicable";
+  if(c.title.version==0) {
+    if(c.title.policy_present || c.title.availability!=TitleAvailability::kUnavailable || !LegacyCaptureTitleSupported(c))
+      return "Legacy title unavailable: missing or invalid capture evidence; recapture required";
+    return c.native_window.version==0?
+        "Legacy captured exact title; weaker native tuple lifetime (no process-start evidence)":
+        "Legacy captured exact title with native process identity";
+  }
+  if(c.title.version!=1)return "Unsupported title policy; overlays hidden";
+  if(!CapturedTitleAvailable(c))
+    return "Title-scoped-v1 unavailable; overlays hidden; history retained";
+  return c.native_window.version==0?
+      "Title-scoped-v1 exact title; weaker native tuple lifetime (no process-start evidence)":
+      "Title-scoped-v1 exact title heuristic (1024 UTF-8 bytes maximum)";
+}
+bool CapturedTitleAvailable(const Context& required) {
+  return required.title.version==0?
+      !required.title.policy_present && required.title.availability==TitleAvailability::kUnavailable && LegacyCaptureTitleSupported(required):
+      required.title.version==1 && required.title.availability==TitleAvailability::kReady &&
+          CaptureContextProvenanceSupported(required) && ValidSourceContextText(required.window_title,1024);
+}
+bool TitleContextVisible(const Context& required,const WindowObservation& current) {
+  // WindowObservationMatchesContext supplies the shared fresh timestamp/native
+  // gate. Never match empty/unavailable strings or guess a historical title.
+  return CapturedTitleAvailable(required) && current.title.version==1 &&
+      current.title.availability==TitleAvailability::kReady &&
+      ValidSourceContextText(current.window_title,1024) &&
+      required.window_title==current.window_title;
+}
 bool ReferenceVisible(const Context& context,
                       const std::optional<PageIdentity>& page_identity,
                       const WindowObservation& window_observation,
                       const PageObservation& page_observation) {
   if(!WindowObservationMatchesContext(context,window_observation))return false;
-  if(!page_identity)return context.bundle_id!="com.google.Chrome";
+  if(!page_identity)return context.bundle_id!="com.google.Chrome" &&
+      TitleContextVisible(context,window_observation);
   return PageIdentityMatchesContext(*page_identity,context) &&
       PageIdentityVisible(page_identity,page_observation);
 }
@@ -539,8 +649,133 @@ std::optional<std::string> RgbaHash(const Pixels& pixels,Rect bounds) {
 }
 }
 Bytes EncodePng(const Pixels& pixels) {return EncodeLegacyPng(pixels);}
+bool ValidSourceContextText(std::string_view value,std::size_t maximum_bytes) {
+  if(value.empty()||value.size()>maximum_bytes)return false;
+  for(std::size_t i=0;i<value.size();) {
+    const auto first=static_cast<unsigned char>(value[i++]);
+    if(first<0x20||first==0x7f)return false;
+    if(first<0x80)continue;
+    unsigned count=0;std::uint32_t code=0,minimum=0;
+    if(first>=0xc2&&first<=0xdf){count=1;code=first&0x1f;minimum=0x80;}
+    else if(first>=0xe0&&first<=0xef){count=2;code=first&0x0f;minimum=0x800;}
+    else if(first>=0xf0&&first<=0xf4){count=3;code=first&7;minimum=0x10000;}
+    else return false;
+    if(count>value.size()-i)return false;
+    while(count--) {
+      const auto next=static_cast<unsigned char>(value[i++]);
+      if((next&0xc0)!=0x80)return false;
+      code=(code<<6)|(next&0x3f);
+    }
+    if(code<minimum||code>0x10ffff||(code>=0xd800&&code<=0xdfff)||
+       (code>=0x80&&code<=0x9f))return false;
+  }
+  return true;
+}
+const char* SourceFieldAvailabilityName(SourceFieldAvailability availability) {
+  switch(availability) {
+    case SourceFieldAvailability::kCaptured:return "captured";
+    case SourceFieldAvailability::kLegacyUnavailable:return "legacy_unavailable";
+    case SourceFieldAvailability::kNotApplicable:return "not_applicable";
+    case SourceFieldAvailability::kInvalidOrOverLimit:return "invalid_or_over_limit";
+  }
+  return "invalid_or_over_limit";
+}
+namespace {
+bool ValidCapturedPageMetadata(const CapturedPageMetadata& metadata) {
+  if(metadata.availability==SourceFieldAvailability::kCaptured)
+    return metadata.url&&ValidSourceContextText(*metadata.url,16384)&&
+        metadata.observed_utc_us&&*metadata.observed_utc_us>0;
+  return (metadata.availability==SourceFieldAvailability::kLegacyUnavailable||
+      metadata.availability==SourceFieldAvailability::kNotApplicable||
+      metadata.availability==SourceFieldAvailability::kInvalidOrOverLimit)&&
+      !metadata.url&&!metadata.observed_utc_us;
+}
+bool CapturedPageMatches(const CapturedPageMetadata& metadata,
+                         const std::optional<PageIdentity>& identity,const Context& context) {
+  if(!ValidCapturedPageMetadata(metadata))return false;
+  if(metadata.availability!=SourceFieldAvailability::kCaptured)return true;
+  if(!identity||!ValidPageIdentity(*identity)||
+     !PageIdentityMatchesContext(*identity,context))return false;
+  static constexpr std::string_view domain="seethis/chrome-navigation/v1\0";
+  Bytes input(domain.begin(),domain.end());
+  input.insert(input.end(),metadata.url->begin(),metadata.url->end());
+  return Sha256(input)==identity->navigation_digest;
+}
+void NormalizeCapturedPage(Reference& reference) {
+  if(reference.captured_page &&
+     !CapturedPageMatches(*reference.captured_page,reference.page_identity,reference.context)) {
+    reference.captured_page=CapturedPageMetadata{std::nullopt,
+        SourceFieldAvailability::kInvalidOrOverLimit,std::nullopt};
+  }
+}
+void WriteCapturedPage(Writer& writer,const std::optional<CapturedPageMetadata>& source) {
+  const std::uint64_t present=source?1:0;writer(present);
+  if(!source)return;
+  auto metadata=*source;
+  const std::uint64_t has_url=metadata.url?1:0,has_observed=metadata.observed_utc_us?1:0;
+  writer(metadata.availability,has_url);
+  if(has_url)writer(*metadata.url);
+  writer(has_observed);
+  if(has_observed)writer(*metadata.observed_utc_us);
+}
+bool ReadCapturedPage(Reader& reader,std::optional<CapturedPageMetadata>& target) {
+  std::uint64_t present=0;reader(present);if(present>1)return false;
+  if(!present){target.reset();return true;}
+  CapturedPageMetadata metadata;std::uint64_t status=0,has_url=0,has_observed=0;
+  reader(status,has_url);if(status>3||has_url>1)return false;
+  metadata.availability=static_cast<SourceFieldAvailability>(status);
+  if(has_url){std::string url;reader(url);metadata.url=std::move(url);}
+  reader(has_observed);if(has_observed>1)return false;
+  if(has_observed){std::int64_t observed=0;reader(observed);metadata.observed_utc_us=observed;}
+  if(!ValidCapturedPageMetadata(metadata))return false;
+  target=std::move(metadata);return true;
+}
+void ProjectText(std::string_view value,std::size_t limit,
+                 std::optional<std::string>& output,SourceFieldAvailability& availability) {
+  availability=value.empty()?SourceFieldAvailability::kLegacyUnavailable:
+      SourceFieldAvailability::kInvalidOrOverLimit;
+  if(ValidSourceContextText(value,limit)) {
+    output=std::string(value);availability=SourceFieldAvailability::kCaptured;
+  }
+}
+}
+SourceContextProjection ProjectSourceContext(const Reference& reference) {
+  SourceContextProjection result;const auto& context=reference.context;
+  ProjectText(context.app_name,256,result.app_name,result.app_name_availability);
+  ProjectText(context.bundle_id,512,result.bundle_id,result.bundle_id_availability);
+  ProjectText(context.window_title,1024,result.window_title,result.window_title_availability);
+  const bool chrome=context.bundle_id=="com.google.Chrome";
+  if(chrome&&context.window_title.empty())
+    result.window_title_availability=SourceFieldAvailability::kNotApplicable;
+  if(context.window_id>0)result.window_id=context.window_id;
+  if(ValidStamp(context.observed))result.context_observed_utc_us=context.observed.utc_us;
+  if(ValidStamp(reference.image_completed))
+    result.image_completed_utc_us=reference.image_completed.utc_us;
+  if(!chrome)result.page_url_availability=SourceFieldAvailability::kNotApplicable;
+  else if(reference.captured_page) {
+    const auto& metadata=*reference.captured_page;
+    if(CapturedPageMatches(metadata,reference.page_identity,reference.context)) {
+      result.page_url=metadata.url;result.page_url_availability=metadata.availability;
+      result.page_url_observed_utc_us=metadata.observed_utc_us;
+    } else result.page_url_availability=SourceFieldAvailability::kInvalidOrOverLimit;
+  }
+  return result;
+}
+SourceContextProjection ProjectSourceContext(const ReferenceJobSnapshot& job) {
+  SourceContextProjection result;
+  if(job.metadata)result=ProjectSourceContext(*job.metadata);
+  else if(job.ready)result=ProjectSourceContext(job.ready->value);
+  else {
+    Reference reference;reference.context=job.context;
+    reference.page_identity=job.page_identity;reference.captured_page=job.captured_page;
+    result=ProjectSourceContext(reference);
+  }
+  if(job.state!=ReferenceJobState::kReady)result.image_completed_utc_us.reset();
+  return result;
+}
+
 Bytes Serialize(const Reference& reference) {
-  Reference copy=reference; Writer w; w(copy);
+  Reference copy=reference;NormalizeCapturedPage(copy); Writer w; w(copy);
   if (copy.schema >= 2 && copy.subpath_version >= 1) {
     const std::uint64_t version = 1;
     w(version);
@@ -553,31 +788,63 @@ Bytes Serialize(const Reference& reference) {
     const bool has_page_identity = true;
     w(page_version, has_page_identity, *copy.page_identity);
   }
+  if(copy.captured_page) {
+    const std::uint64_t metadata_version=3;w(metadata_version);
+    WriteCapturedPage(w,copy.captured_page);
+  }
+  if(copy.context.native_window.version) {
+    const std::uint64_t native_version=4;w(native_version);
+    auto& identity=copy.context.native_window;
+    w(identity.version,identity.process_start_identity_us,
+      identity.observation_session,identity.incarnation);
+  }
+  if(copy.context.title.policy_present || copy.context.title.version || copy.context.title.availability!=TitleAvailability::kUnavailable) {
+    const std::uint64_t title_tail=5;w(title_tail);
+    w(copy.context.title.version,copy.context.title.availability);
+  }
   return w.bytes;
 }
 std::optional<Reference> Deserialize(const Bytes& bytes) {
   if(bytes.size()>kMaxBytes) return {};
   try { Reference v; Reader r{bytes}; bool explicit_tail = false; r(v);
-    bool page_tail=false;
-    if (v.schema >= 2 && r.offset < bytes.size()) {
-      std::uint64_t version = 0; r(version);
-      if (version == 1) {
-        v.subpath_version = version;
-        explicit_tail = true;
-        for (auto& region : v.regions) r(region.subpaths);
-        r(v.source.encoding, v.crop.encoding, v.crop.pixel_hash_contract,
-          v.crop.pixel_sha256);
-      } else if (version == 2) page_tail=true;
-      else return {};
+    std::uint64_t next_version=0;
+    if(v.schema>=2&&r.offset<bytes.size()) {
+      r(next_version);
+      if(next_version==1) {
+        v.subpath_version=1;explicit_tail=true;
+        for(auto& region:v.regions)r(region.subpaths);
+        r(v.source.encoding,v.crop.encoding,v.crop.pixel_hash_contract,v.crop.pixel_sha256);
+        next_version=0;
+      }
     }
-    if (r.offset < bytes.size()) {
-      std::uint64_t page_version = 0; bool has_page_identity = false;
-      if (!page_tail) r(page_version); else page_version=2;
-      if (page_version != 2) return {};
-      r(has_page_identity);
-      if (!has_page_identity) return {};
-      PageIdentity identity; r(identity); v.page_identity=std::move(identity);
+    if(next_version==0&&r.offset<bytes.size())r(next_version);
+    if(next_version==2) {
+      std::uint64_t present=0;r(present);if(present!=1)return {};
+      PageIdentity identity;r(identity);v.page_identity=std::move(identity);
+      next_version=0;
+      if(r.offset<bytes.size())r(next_version);
     }
+    if(next_version==3) {
+      if(!ReadCapturedPage(r,v.captured_page)||!v.captured_page)return {};
+      next_version=0;
+      if(r.offset<bytes.size())r(next_version);
+    }
+    if(next_version==4) {
+      auto& identity=v.context.native_window;
+      r(identity.version,identity.process_start_identity_us,
+        identity.observation_session,identity.incarnation);
+      if(identity.version!=1 || identity.observation_session.size()>128)return {};
+      next_version=0;
+      if(r.offset<bytes.size())r(next_version);
+    }
+    if(next_version==5) {
+      // Preserve unsupported versions/statuses as unavailable evidence. Dropping
+      // this tail would silently turn a required record into a legacy match.
+      r(v.context.title.version,v.context.title.availability);
+      v.context.title.policy_present=true;
+      next_version=0;
+    }
+    if(next_version!=0)return {};
     if(r.offset!=bytes.size() || Serialize(v)!=bytes)return {};
     for(auto* image:{&v.source,&v.crop}) {
       // The legacy record layout has no codec field. Treat it as legacy-only;
@@ -777,21 +1044,33 @@ struct ReferenceStore::Impl {
     std::shared_ptr<const Bytes> bytes;
     std::string code="deriving";
     std::string byte_sha256;
+    std::string cache_key,metadata_binding;
+    std::shared_ptr<const Reference> metadata;
   };
   struct DerivedAnnotated {
     std::string id;
+    std::optional<std::size_t> region_index;
     std::uint64_t generation=0;
     ReadyAssetState state=ReadyAssetState::kPending;
     std::shared_ptr<const Bytes> bytes;
     std::string code="deriving";
     std::string byte_sha256;
     std::uint64_t last_access=0;
+    AnnotatedRepresentation representation=AnnotatedRepresentation::kNumbered;
+    std::string cache_key,metadata_binding;
+  };
+  struct AnnotatedWaiter {
+    std::string id,cache_key,metadata_binding;
+    std::optional<std::size_t> region_index;
+    AnnotatedRepresentation representation;
+    std::shared_ptr<const Reference> metadata;
   };
   mutable std::mutex mutex;
   std::condition_variable work_ready;
   std::condition_variable idle;
   std::deque<std::function<void()>> work;
   std::unordered_map<std::string,ReferenceJobSnapshot> jobs;
+  std::unordered_map<std::string,std::shared_ptr<std::atomic_bool>> append_operations;
   std::unordered_map<std::string,std::size_t> reservations;
   std::unordered_map<std::string,std::size_t> owners;
   std::unordered_map<std::string,std::uint64_t> ready_access;
@@ -799,6 +1078,8 @@ struct ReferenceStore::Impl {
   std::optional<DerivedCrop> derived_crop;
   std::optional<DerivedAnnotated> derived_annotated;
   std::unordered_map<std::string,DerivedAnnotated> annotated_cache;
+  // Bounded request identities only; no queued image buffers or extra executor.
+  std::deque<AnnotatedWaiter> annotated_waiters;
   std::vector<std::thread> workers;
   std::thread timer;
   std::mutex retention_io_mutex;
@@ -829,13 +1110,51 @@ std::string TerminalStateText(std::string_view code,std::int64_t accepted,
   return std::string(code)+"\n"+std::to_string(accepted)+"\n"+
          std::to_string(terminal)+"\n";
 }
+// Preserve the lifecycle text prefix for old readers. New readers retain the
+// exact frozen context even if a pending capture is interrupted before pixels.
+std::string LifecycleStateText(std::string_view code,std::int64_t accepted,
+    std::int64_t terminal,const std::shared_ptr<const Reference>& metadata) {
+  auto result=TerminalStateText(code,accepted,terminal);
+  if(metadata) {
+    result+="seethis-context-v1\n";
+    const auto bytes=Serialize(*metadata);result.append(bytes.begin(),bytes.end());
+  }
+  return result;
+}
+void ReadLifecycleContext(const std::filesystem::path& path,
+                           ReferenceJobSnapshot& job) {
+  if(std::filesystem::file_size(path)>4*1024*1024)return;
+  const auto bytes=ReadFile(path);
+  const std::string text(bytes.begin(),bytes.end());
+  std::istringstream input(text);std::string code,accepted,terminal,magic;
+  if(!std::getline(input,code)||!std::getline(input,accepted)||
+     !std::getline(input,terminal)||!std::getline(input,magic)||
+     magic!="seethis-context-v1")return;
+  const auto offset=input.tellg();if(offset<0)return;
+  Bytes record(bytes.begin()+static_cast<std::size_t>(offset),bytes.end());
+  auto reference=Deserialize(record);
+  if(!reference||reference->id!=job.id||reference->mark_id!=job.id)return;
+  try {
+    std::size_t consumed=0;const auto value=std::stoll(accepted,&consumed);
+    if(consumed!=accepted.size()||value<=0)return;job.accepted_utc_us=value;
+  }catch(...) {return;}
+  job.context=reference->context;job.page_identity=reference->page_identity;
+  job.captured_page=reference->captured_page;job.circle_completed=reference->circle_completed;
+  job.path=reference->path;job.regions=reference->regions;job.crop_margin=reference->crop_margin;
+  job.metadata=std::make_shared<const Reference>(std::move(*reference));
+}
 std::string ReadyStateText(const ReferenceJobSnapshot& source) {
   Writer writer;auto job=source;
   Reference metadata=job.metadata?*job.metadata:job.ready->value;
   if(job.context.bundle_id=="com.google.Chrome")job.context.window_title.clear();
   if(metadata.context.bundle_id=="com.google.Chrome")
     metadata.context.window_title.clear();
-  const std::uint64_t version=metadata.page_identity?6:5;
+  const std::uint64_t version=(metadata.context.title.policy_present || job.context.title.policy_present ||
+      metadata.context.title.version || job.context.title.version ||
+      metadata.context.title.availability!=TitleAvailability::kUnavailable ||
+      job.context.title.availability!=TitleAvailability::kUnavailable)?9:
+      (metadata.context.native_window.version?8:
+      (metadata.captured_page?7:(metadata.page_identity?6:5)));
   metadata.source.bytes.clear();metadata.crop.bytes.clear();
   writer(version,
          job.accepted_utc_us,job.terminal_utc_us,
@@ -856,8 +1175,44 @@ std::string ReadyStateText(const ReferenceJobSnapshot& source) {
   }
   writer(metadata.source.encoding,metadata.crop.encoding,
          metadata.crop.pixel_hash_contract,metadata.crop.pixel_sha256);
-  if (version >= 6) { bool has_page_identity=true; writer(has_page_identity, *metadata.page_identity); }
+  if (version >= 6) {
+    const std::uint64_t has_page_identity=metadata.page_identity?1:0;writer(has_page_identity);
+    if(has_page_identity)writer(*metadata.page_identity);
+  }
+  if(version>=7)WriteCapturedPage(writer,metadata.captured_page);
+  if(version>=8) {
+    for(auto* context:{&job.context,&metadata.context}) {
+      auto& identity=context->native_window;
+      writer(identity.version,identity.process_start_identity_us,
+             identity.observation_session,identity.incarnation);
+    }
+  }
+  if(version>=9)for(auto* context:{&job.context,&metadata.context})
+    writer(context->title.version,context->title.availability);
   return {writer.bytes.begin(),writer.bytes.end()};
+}
+// Compare every positional capture field, not just the native extension. The
+// original bytes stay on disk; a disagreement only retires live presentation.
+bool SameCaptureContext(Context a,Context b) {
+  Writer first,second;first(a);second(b);
+  return first.bytes==second.bytes &&
+      a.native_window.version==b.native_window.version &&
+      a.native_window.process_start_identity_us==b.native_window.process_start_identity_us &&
+      a.native_window.observation_session==b.native_window.observation_session &&
+      a.native_window.incarnation==b.native_window.incarnation &&
+      a.title.version==b.title.version && a.title.availability==b.title.availability;
+}
+bool CaptureProvenanceSupported(const Reference& r) {
+  return CaptureContextProvenanceSupported(r.context) &&
+      ValidStamp(r.requested) && ValidStamp(r.image_completed) && ValidStamp(r.circle_completed) &&
+      r.requested.monotonic_us>=r.context.observed.monotonic_us &&
+      r.image_completed.monotonic_us>=r.requested.monotonic_us &&
+      r.circle_completed.monotonic_us>=r.context.observed.monotonic_us &&
+      r.clock=="UTC:system_clock/us;monotonic:steady_clock/us;process-session" &&
+      (r.capture_api=="ScreenCaptureKit.SCScreenshotManager.exact-window" ||
+       r.capture_api=="ScreenCaptureKit.SCScreenshotManager.selected-display") &&
+      (r.provenance=="historical;context-before-overlay;pixels-at-async-completion;no-semantic-object-id" ||
+       r.provenance=="historical;context-before-overlay;single-selected-display;pixels-at-async-completion;multi-region;no-semantic-object-id");
 }
 bool ValidReadyMetadata(const Reference& value,std::string_view id) {
   const auto hash=[](const std::string& value) {
@@ -913,7 +1268,7 @@ std::filesystem::path AnnotatedDigestPath(const std::filesystem::path& directory
 }
 std::string AnnotatedDigestText(const Reference& metadata,
                                 std::string_view digest) {
-  return "seethis-annotated-png-v1\n"+metadata.id+"\n"+
+  return "seethis-annotated-png-v3-callouts\n"+metadata.id+"\n"+
       metadata.source.sha256+"\n"+std::string(digest)+"\n";
 }
 bool ReadReadyState(const std::filesystem::path& path,
@@ -922,7 +1277,7 @@ bool ReadReadyState(const std::filesystem::path& path,
     if(std::filesystem::file_size(path)>4*1024*1024)return false;
     const auto bytes=ReadFile(path);Reader reader{bytes};std::uint64_t version=0;
     Reference metadata;reader(version);
-    if(version!=2&&version!=3&&version!=4&&version!=5&&version!=6)return false;
+    if(version!=2&&version!=3&&version!=4&&version!=5&&version!=6&&version!=7&&version!=8&&version!=9)return false;
     reader(job->accepted_utc_us,job->terminal_utc_us,
            job->key_down_monotonic_ms,job->key_up_monotonic_ms,
            job->circle_completed,job->crop_margin,job->context,job->path);
@@ -955,15 +1310,44 @@ bool ReadReadyState(const std::filesystem::path& path,
       metadata.crop.pixel_sha256.clear();
     }
     if (version >= 6) {
-      bool has_page_identity = false; reader(has_page_identity);
-      if (!has_page_identity) return false;
-      PageIdentity identity; reader(identity); metadata.page_identity=std::move(identity);
+      std::uint64_t has_page_identity=0;reader(has_page_identity);
+      if(has_page_identity>1||(version==6&&!has_page_identity))return false;
+      if(has_page_identity) {
+        PageIdentity identity;reader(identity);metadata.page_identity=std::move(identity);
+      }
       job->page_identity=metadata.page_identity;
     }
-    if(!ValidReadyMetadata(metadata,job->id))return false;
+    if(version>=7&&(!ReadCapturedPage(reader,metadata.captured_page)||
+       (metadata.captured_page&&!CapturedPageMatches(*metadata.captured_page,metadata.page_identity,metadata.context))))return false;
+    if(version>=8) {
+      for(auto* context:{&job->context,&metadata.context}) {
+        auto& identity=context->native_window;
+        reader(identity.version,identity.process_start_identity_us,
+               identity.observation_session,identity.incarnation);
+        if(identity.observation_session.size()>128)return false;
+      }
+    }
+    if(!ValidReadyMetadata(metadata,job->id)||(version<9 && reader.offset!=bytes.size())||
+       job->accepted_utc_us<=0||job->terminal_utc_us<=0)return false;
+    if(version>=9)for(auto* context:{&job->context,&metadata.context}) {
+      reader(context->title.version,context->title.availability);
+      context->title.policy_present=true;
+    }
+    if(reader.offset!=bytes.size())return false;
+    const bool native_policy_supported=version!=8 ||
+        (job->context.native_window.version==1 && metadata.context.native_window.version==1);
+    const bool capture_consistent=native_policy_supported && SameCaptureContext(job->context,metadata.context) &&
+        job->circle_completed.utc_us==metadata.circle_completed.utc_us &&
+        job->circle_completed.monotonic_us==metadata.circle_completed.monotonic_us &&
+        job->crop_margin==metadata.crop_margin;
+    if(!capture_consistent || (metadata.context.bundle_id!="com.google.Chrome" &&
+        !CaptureProvenanceSupported(metadata))) {
+      for(auto* context:{&job->context,&metadata.context})
+        context->title={1,TitleAvailability::kInconsistent};
+    }
+    job->captured_page=metadata.captured_page;
     job->metadata=std::make_shared<const Reference>(std::move(metadata));
-    return reader.offset==bytes.size()&&job->accepted_utc_us>0&&
-           job->terminal_utc_us>0;
+    return true;
   } catch(...) {return false;}
 }
 void TrimReadyPayloads(auto& impl) {
@@ -987,13 +1371,15 @@ void TrimReadyPayloads(auto& impl) {
 // on every poll. Both count and retained PNG bytes remain bounded.
 void TrimAnnotatedCache(auto& impl) {
   for(auto entry=impl.annotated_cache.begin();entry!=impl.annotated_cache.end();) {
-    const auto job=impl.jobs.find(entry->first);
+    const auto job=impl.jobs.find(entry->second.id);
     if(job==impl.jobs.end()||job->second.state!=ReferenceJobState::kReady)
       entry=impl.annotated_cache.erase(entry);
     else ++entry;
   }
-  const auto limit=std::min(impl.maximum_visible,
-                            ReferenceStore::kMaximumCachedReadyPayloads)-1;
+  // A single retained reference can own several marks. Retention still prunes
+  // their entries by reference ID above, so do not shrink this cache to zero
+  // when maximum_visible is one.
+  const auto limit=ReferenceStore::kMaximumCachedReadyPayloads-1;
   while(!impl.annotated_cache.empty()) {
     std::size_t bytes=0;
     auto oldest=impl.annotated_cache.begin();
@@ -1003,6 +1389,12 @@ void TrimAnnotatedCache(auto& impl) {
     }
     if(impl.annotated_cache.size()<=limit&&bytes<=kMaxBytes)return;
     impl.annotated_cache.erase(oldest);
+  }
+}
+void EraseAnnotatedCacheForId(auto& impl,std::string_view id) {
+  for(auto entry=impl.annotated_cache.begin();entry!=impl.annotated_cache.end();) {
+    if(entry->second.id==id)entry=impl.annotated_cache.erase(entry);
+    else ++entry;
   }
 }
 Image PreparedImage(const Pixels& pixels,bool sdk_codec) {
@@ -1041,6 +1433,445 @@ bool PersistSmall(const std::filesystem::path& target,std::string_view value) {
 bool PersistAsset(const std::filesystem::path& target,const Bytes& bytes) {
   return PersistSmall(target,std::string_view(
       reinterpret_cast<const char*>(bytes.data()),bytes.size()));
+}
+constexpr std::string_view kNotesMagic="seethis-mark-notes\n";
+constexpr std::size_t kMaxNoteBytes=4096;
+struct NotesSidecar {
+  MarkNotesStatus status=MarkNotesStatus::kReady;
+  std::uint64_t revision=0;
+  std::vector<std::string> notes;
+  std::vector<bool> visible;
+};
+bool ValidNote(std::string_view note) {
+  if(note.size()>kMaxNoteBytes)return false;
+  for(std::size_t i=0;i<note.size();) {
+    const auto byte=static_cast<unsigned char>(note[i]);
+    if(byte<0x80) {
+      if((byte<0x20&&byte!='\n'&&byte!='\t')||byte==0x7f)return false;
+      ++i;continue;
+    }
+    const int length=byte>=0xc2&&byte<=0xdf?2:
+        byte>=0xe0&&byte<=0xef?3:byte>=0xf0&&byte<=0xf4?4:0;
+    if(!length||i+length>note.size())return false;
+    std::uint32_t code=byte&((1U<<(7-length))-1);
+    for(int j=1;j<length;++j) {
+      const auto tail=static_cast<unsigned char>(note[i+j]);
+      if((tail&0xc0)!=0x80)return false;
+      code=(code<<6)|(tail&0x3f);
+    }
+    if((length==2&&code<0x80)||(length==3&&code<0x800)||
+       (length==4&&code<0x10000)||code>0x10ffff||
+       (code>=0xd800&&code<=0xdfff))return false;
+    i+=length;
+  }
+  return true;
+}
+void PutU32(std::string& out,std::uint32_t value) {
+  for(int index=0;index<4;++index)out.push_back(char(value>>(index*8)));
+}
+void PutU64(std::string& out,std::uint64_t value) {
+  for(int index=0;index<8;++index)out.push_back(char(value>>(index*8)));
+}
+bool GetU32(std::string_view data,std::size_t& offset,std::uint32_t& value) {
+  if(data.size()-offset<4)return false;
+  value=0;for(int index=0;index<4;++index)
+    value|=std::uint32_t(static_cast<unsigned char>(data[offset++]))<<(index*8);
+  return true;
+}
+bool GetU64(std::string_view data,std::size_t& offset,std::uint64_t& value) {
+  if(data.size()-offset<8)return false;
+  value=0;for(int index=0;index<8;++index)
+    value|=std::uint64_t(static_cast<unsigned char>(data[offset++]))<<(index*8);
+  return true;
+}
+std::filesystem::path NotesPath(const std::filesystem::path& directory,
+                                std::string_view id) {
+  return directory/(std::string(id)+".notes");
+}
+NotesSidecar ReadNotes(const std::filesystem::path& directory,
+                       const Reference& reference,std::size_t count) {
+  NotesSidecar result;result.notes.resize(count);result.visible.resize(count,true);
+  const auto path=NotesPath(directory,reference.id);
+  std::error_code ec;
+  if(!std::filesystem::exists(path,ec)) {
+    if(ec)result.status=MarkNotesStatus::kIOError;
+    return result;
+  }
+  const auto size=std::filesystem::file_size(path,ec);
+  if(ec){result.status=MarkNotesStatus::kIOError;return result;}
+  if(size>1024*1024){result.status=MarkNotesStatus::kCorrupt;return result;}
+  Bytes file;
+  try {file=ReadFile(path);} catch(...) {
+    result.status=MarkNotesStatus::kIOError;return result;
+  }
+  const std::string_view data(reinterpret_cast<const char*>(file.data()),file.size());
+  if(!data.starts_with(kNotesMagic)) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  std::size_t offset=kNotesMagic.size();
+  std::uint32_t version=0,stored_count=0;
+  if(!GetU32(data,offset,version)) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  if(version!=1&&version!=2) {
+    result.status=MarkNotesStatus::kUnsupported;return result;
+  }
+  if(data.size()-offset<reference.id.size()+reference.source.sha256.size()||
+     data.substr(offset,reference.id.size())!=reference.id) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  offset+=reference.id.size();
+  if(data.substr(offset,reference.source.sha256.size())!=reference.source.sha256) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  offset+=reference.source.sha256.size();
+  if(!GetU64(data,offset,result.revision)||
+     !GetU32(data,offset,stored_count)||stored_count!=count||
+     result.revision==0||stored_count>1024) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  for(std::size_t slot=0;slot<count;++slot) {
+    std::uint32_t note_size=0;
+    if(!GetU32(data,offset,note_size)||note_size>kMaxNoteBytes||
+       data.size()-offset<note_size) {
+      result.status=MarkNotesStatus::kCorrupt;return result;
+    }
+    result.notes[slot]=std::string(data.substr(offset,note_size));
+    if(!ValidNote(result.notes[slot])) {
+      result.status=MarkNotesStatus::kCorrupt;return result;
+    }
+    offset+=note_size;
+    if(version==2) {
+      const auto mark_id=StableMarkId(reference.id,slot);
+      if(data.size()-offset<mark_id.size()+1 ||
+         data.substr(offset,mark_id.size())!=mark_id) {
+        result.status=MarkNotesStatus::kCorrupt;return result;
+      }
+      offset+=mark_id.size();
+      const auto flag=static_cast<unsigned char>(data[offset++]);
+      if(flag>1){result.status=MarkNotesStatus::kCorrupt;return result;}
+      result.visible[slot]=flag==1;
+    }
+  }
+  if(offset!=data.size())result.status=MarkNotesStatus::kCorrupt;
+  return result;
+}
+std::string EncodeNotes(const Reference& reference,const NotesSidecar& sidecar) {
+  std::string bytes(kNotesMagic);
+  PutU32(bytes,2);bytes+=reference.id;bytes+=reference.source.sha256;
+  PutU64(bytes,sidecar.revision);
+  PutU32(bytes,static_cast<std::uint32_t>(sidecar.notes.size()));
+  for(std::size_t slot=0;slot<sidecar.notes.size();++slot) {
+    const auto& note=sidecar.notes[slot];
+    PutU32(bytes,static_cast<std::uint32_t>(note.size()));bytes+=note;
+    bytes+=StableMarkId(reference.id,slot);
+    bytes.push_back(sidecar.visible[slot]?1:0);
+  }
+  return bytes;
+}
+enum class NotesWriteResult { kSaved, kIOError, kCommitUncertain };
+NotesWriteResult PersistNotes(const std::filesystem::path& target,
+                              std::string_view data,bool fail_after_rename) {
+  int fd=-1;std::filesystem::path temporary;bool renamed=false;
+  try {
+    std::string pattern=(target.parent_path()/".notes-XXXXXX").string();
+    std::vector<char> name(pattern.begin(),pattern.end());name.push_back(0);
+    fd=mkstemp(name.data());if(fd<0)return NotesWriteResult::kIOError;
+    temporary=name.data();
+    for(std::size_t offset=0;offset<data.size();) {
+      const auto count=write(fd,data.data()+offset,data.size()-offset);
+      if(count<=0)throw std::runtime_error("note sidecar write failed");
+      offset+=static_cast<std::size_t>(count);
+    }
+    if(fsync(fd)!=0)throw std::runtime_error("note sidecar sync failed");
+    if(close(fd)!=0)throw std::runtime_error("note sidecar close failed");
+    fd=-1;
+    if(rename(temporary.c_str(),target.c_str())!=0)
+      throw std::runtime_error("note sidecar publish failed");
+    renamed=true;
+    if(fail_after_rename)return NotesWriteResult::kCommitUncertain;
+    const int directory=open(target.parent_path().c_str(),O_RDONLY|O_DIRECTORY);
+    if(directory<0)return NotesWriteResult::kCommitUncertain;
+    const bool synced=fsync(directory)==0;close(directory);
+    return synced?NotesWriteResult::kSaved:NotesWriteResult::kCommitUncertain;
+  } catch(...) {
+    if(fd>=0)close(fd);
+    if(!renamed&&!temporary.empty())unlink(temporary.c_str());
+    return renamed?NotesWriteResult::kCommitUncertain:NotesWriteResult::kIOError;
+  }
+}
+// A manifest is the sole publication point for collection membership and notes.
+// The first shot continues to refer to the original root payload, byte for byte.
+std::filesystem::path CollectionPath(const std::filesystem::path& dir, std::string_view id) {
+  return dir/(std::string(id)+".collection");
+}
+std::filesystem::path ShotPath(const std::filesystem::path& dir, std::string_view root,
+                              std::string_view shot) {
+  return dir/(std::string(root)+".shot-"+std::string(shot)+".png");
+}
+std::string EncodeCollection(const Reference& root, const ReferenceCollection& source) {
+  Writer w;
+  std::string magic="seethis-collection-v1",id=root.id,binding=root.source.sha256;
+  auto revision=source.revision,notes_revision=source.notes_revision;
+  auto count=source.shots.size();w(magic,id,binding,revision,notes_revision,count);
+  for(const auto& shot:source.shots) {
+    auto shot_id=shot.id;auto first=shot.first_mark_slot;
+    auto metadata=Serialize(*shot.metadata);
+    auto source_encoding=shot.metadata->source.encoding,crop_encoding=shot.metadata->crop.encoding;
+    auto pixel_contract=shot.metadata->crop.pixel_hash_contract,pixel_hash=shot.metadata->crop.pixel_sha256;
+    w(shot_id,first,metadata,source_encoding,crop_encoding,pixel_contract,pixel_hash);
+  }
+  auto notes=source.notes;w(notes);
+  for(bool flag:source.visible){std::uint64_t value=flag?1:0;w(value);}
+  return {w.bytes.begin(),w.bytes.end()};
+}
+ReferenceCollection ReadCollection(const std::filesystem::path& dir,const Reference& root) {
+  ReferenceCollection result;result.status=MarkNotesStatus::kReady;
+  try {
+    const auto path=CollectionPath(dir,root.id);
+    if(!std::filesystem::exists(path)) {
+      auto metadata=root;metadata.source.bytes.clear();metadata.crop.bytes.clear();
+      result.shots.push_back({root.id,0,std::make_shared<const Reference>(std::move(metadata))});
+      const auto notes=ReadNotes(dir,root,EffectiveRegions(root).size());
+      result.status=notes.status;result.notes_revision=notes.revision;
+      result.notes=notes.notes;result.visible=notes.visible;return result;
+    }
+    if(std::filesystem::file_size(path)>8*1024*1024)throw std::runtime_error("manifest too large");
+    const auto bytes=ReadFile(path);Reader r{bytes};
+    std::string magic,id,binding;std::uint64_t count=0;
+    r(magic,id,binding,result.revision,result.notes_revision,count);
+    if(magic!="seethis-collection-v1"||id!=root.id||binding!=root.source.sha256||
+       count<2||count>64||result.revision!=count||!result.notes_revision)
+      throw std::runtime_error("invalid collection");
+    std::size_t total=0;
+    for(std::uint64_t index=0;index<count;++index) {
+      std::string shot_id;std::size_t first=0;Bytes record;r(shot_id,first,record);
+      std::string source_encoding,crop_encoding,pixel_contract,pixel_hash;
+      r(source_encoding,crop_encoding,pixel_contract,pixel_hash);
+      auto metadata=Deserialize(record);
+      if(metadata) {
+        metadata->source.encoding=source_encoding;metadata->crop.encoding=crop_encoding;
+        metadata->crop.pixel_hash_contract=pixel_contract;metadata->crop.pixel_sha256=pixel_hash;
+      }
+      if((source_encoding!="png-zlib-v1"&&source_encoding!="png-zlib-stored-v1")||
+         !SafeID(shot_id)||!metadata||metadata->id!=root.id||first!=total||
+         !metadata->source.bytes.empty()||!metadata->crop.bytes.empty()||
+         metadata->source.sha256.size()!=64||metadata->source.width==0||metadata->source.height==0||
+         (index==0&&(shot_id!=root.id||metadata->source.sha256!=root.source.sha256))||
+         std::any_of(result.shots.begin(),result.shots.end(),[&](const auto& old){return old.id==shot_id;}))
+        throw std::runtime_error("invalid shot");
+      total+=EffectiveRegions(*metadata).size();if(total>1024)throw std::runtime_error("too many marks");
+      metadata->first_mark_slot=first;
+      result.shots.push_back({shot_id,first,std::make_shared<const Reference>(std::move(*metadata))});
+    }
+    r(result.notes);if(result.notes.size()!=total)throw std::runtime_error("invalid notes");
+    for(const auto& note:result.notes)if(!ValidNote(note))throw std::runtime_error("invalid note");
+    for(std::size_t index=0;index<total;++index) {
+      std::uint64_t flag=0;r(flag);if(flag>1)throw std::runtime_error("invalid visibility");
+      result.visible.push_back(flag==1);
+    }
+    if(r.offset!=bytes.size())throw std::runtime_error("manifest trailing data");
+  } catch(...) {result={};result.status=MarkNotesStatus::kCorrupt;}
+  return result;
+}
+bool RemoveCollectionFiles(const std::filesystem::path& dir,std::string_view id,
+    const std::function<bool(const std::filesystem::path&)>& remove={}) {
+  bool success=true;
+  const auto erase=[&](const std::filesystem::path& path) {
+    if(remove)return remove(path);
+    errno=0;return unlink(path.c_str())==0||errno==ENOENT;
+  };
+  const std::string prefix=std::string(id)+".shot-";
+  for(const auto& item:std::filesystem::directory_iterator(dir))
+    if(item.path().filename().string().starts_with(prefix))success=erase(item.path())&&success;
+  return erase(CollectionPath(dir,id))&&success;
+}
+std::optional<DisplayPoint> FirstPoint(const ReferenceRegion& region) {
+  if(!region.subpaths.empty()&&!region.subpaths.front().empty())
+    return region.subpaths.front().front();
+  if(!region.path.empty())return region.path.front();
+  return {};
+}
+std::optional<Point2D> SourcePoint(const Reference& reference,
+                                   const DisplayPoint& point) {
+  const auto display=std::find_if(reference.context.displays.begin(),
+      reference.context.displays.end(),[&](const FrozenDisplay& item) {
+        return item.id==point.display_id;
+      });
+  if(display==reference.context.displays.end()||!point.IsValid()||
+     point.unit!=CoordinateUnit::kLogicalPoints||
+     point.backing_scale!=display->scale)return {};
+  const double global_x=display->logical.x+point.position.x;
+  const double global_y=display->logical.y+point.position.y;
+  const auto& t=reference.global_to_source;
+  return Point2D{t.a*global_x+t.tx,t.d*global_y+t.ty};
+}
+// Source labels have ten logical-pixel glyphs at ordinary 1x/2x capture.
+// Export labels never grow in response to a small preview frame; display
+// consumers use the separate stroke-only representation and their own labels.
+int NumberPixelUnit(const Reference& reference) {
+  return int(std::clamp(std::lround(2*std::min(
+      std::abs(reference.global_to_source.a),
+      std::abs(reference.global_to_source.d))),1L,8L));
+}
+struct NumberPlacement {
+  Point2D anchor,endpoint;
+  Rect badge;
+  int unit=2;
+};
+bool BadgeContains(Rect rect,Point2D point,double margin=0) {
+  return point.x>=rect.x-margin&&point.x<=rect.x+rect.width+margin&&
+      point.y>=rect.y-margin&&point.y<=rect.y+rect.height+margin;
+}
+bool BadgesIntersect(Rect a,Rect b,double margin) {
+  return a.x<b.x+b.width+margin&&b.x<a.x+a.width+margin&&
+      a.y<b.y+b.height+margin&&b.y<a.y+a.height+margin;
+}
+// Closed segment/expanded rectangle intersection, including the endpoint.
+bool LeaderIntersects(Point2D a,Point2D b,Rect rect,double margin) {
+  double first=0,last=1;
+  const auto clip=[&](double origin,double delta,double low,double high) {
+    if(delta==0)return origin>=low&&origin<=high;
+    double lo=(low-origin)/delta,hi=(high-origin)/delta;
+    if(lo>hi)std::swap(lo,hi);
+    first=std::max(first,lo);last=std::min(last,hi);return first<=last;
+  };
+  return clip(a.x,b.x-a.x,rect.x-margin,rect.x+rect.width+margin)&&
+      clip(a.y,b.y-a.y,rect.y-margin,rect.y+rect.height+margin);
+}
+double LeaderDistance(Point2D point,Point2D a,Point2D b) {
+  const double dx=b.x-a.x,dy=b.y-a.y,length=dx*dx+dy*dy;
+  const double t=length?std::clamp(((point.x-a.x)*dx+(point.y-a.y)*dy)/length,0.0,1.0):0;
+  return std::hypot(point.x-a.x-t*dx,point.y-a.y-t*dy);
+}
+std::optional<std::vector<NumberPlacement>> PlaceNumbers(
+    const Reference& reference,const std::vector<ReferenceRegion>& regions) {
+  std::vector<NumberPlacement> result;
+  std::vector<Point2D> anchors;
+  for(const auto& region:regions) {
+    const auto start=FirstPoint(region);
+    const auto anchor=start?SourcePoint(reference,*start):std::nullopt;
+    if(!anchor||!Finite(anchor->x)||!Finite(anchor->y))return {};
+    anchors.push_back(*anchor);
+  }
+  const int unit=NumberPixelUnit(reference);
+  const double gap=2*unit,rim=std::max(1,unit/2);
+  const double leader_extent=rim+std::max(0.75,unit/3.0);
+  for(std::size_t slot=0;slot<regions.size();++slot) {
+    const auto anchor=anchors[slot];
+    const double width=std::min(double(reference.source.width),double(std::max(
+        11*unit,(int(std::to_string(reference.first_mark_slot+slot+1).size())*4+3)*unit)));
+    const double height=std::min(double(reference.source.height),double(11*unit));
+    NumberPlacement best{anchor,anchor,{0,0,width,height},unit};
+    double best_distance=std::numeric_limits<double>::infinity();
+    const auto consider=[&](double cx,double cy) {
+      Rect badge{std::clamp(std::round(cx-width/2),0.0,double(reference.source.width)-width),
+                 std::clamp(std::round(cy-height/2),0.0,double(reference.source.height)-height),
+                 width,height};
+      const Point2D endpoint{std::clamp(anchor.x,badge.x,badge.x+width),
+                             std::clamp(anchor.y,badge.y,badge.y+height)};
+      const double distance=std::hypot(endpoint.x-anchor.x,endpoint.y-anchor.y);
+      if(distance>=best_distance)return;
+      for(const auto point:anchors) {
+        if(BadgeContains(badge,point,gap))return;
+        // A leader must not appear to originate on another drawing-start point.
+        if(std::hypot(point.x-anchor.x,point.y-anchor.y)>rim&&
+           LeaderDistance(point,anchor,endpoint)<leader_extent+0.5)return;
+      }
+      for(const auto& placed:result)
+        if(BadgesIntersect(badge,placed.badge,gap)||
+           LeaderIntersects(anchor,endpoint,placed.badge,leader_extent)||
+           LeaderIntersects(placed.anchor,placed.endpoint,badge,leader_extent))return;
+      best={anchor,endpoint,badge,unit};best_distance=distance;
+    };
+    // Stable nearest-first rings cover adjacent/dense anchors without depending
+    // on selection, visibility, note revisions, or the requested crop slot.
+    for(int ring=1;ring<=32;++ring) {
+      for(int dy=-ring;dy<=ring;++dy)for(int dx=-ring;dx<=ring;++dx) {
+        if(std::max(std::abs(dx),std::abs(dy))!=ring)continue;
+        consider(anchor.x+dx*(width/2+gap),anchor.y+dy*(height/2+gap));
+      }
+      if(Finite(best_distance)&&ring*(std::min(width,height)/2+gap)>
+          best_distance+std::max(width,height))break;
+    }
+    if(!Finite(best_distance)) {
+      // Deterministic packing fallback for crowded sets; a physically smaller
+      // image than one glyph still produces a valid bounded derived PNG.
+      for(double y=0;y+height<=reference.source.height;y+=height+gap)
+        for(double x=0;x+width<=reference.source.width;x+=width+gap)
+          consider(x+width/2,y+height/2);
+      if(!Finite(best_distance)) {
+        best.badge.x=std::clamp(std::round(anchor.x+gap),0.0,double(reference.source.width)-width);
+        best.badge.y=std::clamp(std::round(anchor.y+gap),0.0,double(reference.source.height)-height);
+        best.endpoint={std::clamp(anchor.x,best.badge.x,best.badge.x+width),
+                       std::clamp(anchor.y,best.badge.y,best.badge.y+height)};
+      }
+    }
+    result.push_back(best);
+  }
+  return result;
+}
+std::optional<Rect> NumberedMarkBounds(const Reference& reference,
+    std::size_t slot,const std::vector<ReferenceRegion>& regions,
+    const std::vector<NumberPlacement>& placements) {
+  if(slot>=regions.size()||slot>=placements.size())return {};
+  const auto& crop=regions[slot].crop_pixels;
+  const auto& p=placements[slot];
+  const double margin=std::max(1,p.unit/2)+1;
+  const double x0=std::max(0.0,std::floor(std::min({crop.x,p.badge.x,
+      p.anchor.x-margin,p.endpoint.x-margin})));
+  const double y0=std::max(0.0,std::floor(std::min({crop.y,p.badge.y,
+      p.anchor.y-margin,p.endpoint.y-margin})));
+  const double x1=std::min(double(reference.source.width),std::ceil(std::max({
+      crop.x+crop.width,p.badge.x+p.badge.width,p.anchor.x+margin,p.endpoint.x+margin})));
+  const double y1=std::min(double(reference.source.height),std::ceil(std::max({
+      crop.y+crop.height,p.badge.y+p.badge.height,p.anchor.y+margin,p.endpoint.y+margin})));
+  const Rect bounds{x0,y0,x1-x0,y1-y0};
+  return ValidRect(bounds)?std::optional<Rect>(bounds):std::nullopt;
+}
+void SetNumberPixel(Pixels& pixels,int x,int y,std::array<std::uint8_t,3> rgb) {
+  if(x<0||y<0||x>=int(pixels.width)||y>=int(pixels.height))return;
+  const auto offset=(std::size_t(y)*pixels.width+x)*4;
+  for(std::size_t channel=0;channel<3;++channel)pixels.rgba[offset+channel]=rgb[channel];
+  pixels.rgba[offset+3]=255;
+}
+void DrawNumberLeader(Pixels& pixels,const NumberPlacement& p) {
+  const double ink=std::max(0.75,p.unit/3.0),rim=std::max(1,p.unit/2);
+  const int x0=std::max(0,int(std::floor(std::min(p.anchor.x,p.endpoint.x)-ink-rim)));
+  const int y0=std::max(0,int(std::floor(std::min(p.anchor.y,p.endpoint.y)-ink-rim)));
+  const int x1=std::min(int(pixels.width),int(std::ceil(std::max(p.anchor.x,p.endpoint.x)+ink+rim)));
+  const int y1=std::min(int(pixels.height),int(std::ceil(std::max(p.anchor.y,p.endpoint.y)+ink+rim)));
+  for(int y=y0;y<y1;++y)for(int x=x0;x<x1;++x) {
+    const double distance=LeaderDistance({x+0.5,y+0.5},p.anchor,p.endpoint);
+    if(distance<=ink+rim)SetNumberPixel(pixels,x,y,distance<=ink?
+        std::array<std::uint8_t,3>{45,45,45}:std::array<std::uint8_t,3>{255,255,255});
+  }
+}
+void DrawNumberBadge(Pixels& pixels,std::size_t slot,const NumberPlacement& p) {
+  static constexpr std::array<std::array<std::uint8_t,5>,10> digits={{
+      {{7,5,5,5,7}},{{2,6,2,2,7}},{{7,1,7,4,7}},{{7,1,7,1,7}},
+      {{5,5,7,1,1}},{{7,4,7,1,7}},{{7,4,7,5,7}},{{7,1,1,1,1}},
+      {{7,5,7,5,7}},{{7,5,7,1,7}}
+  }};
+  const auto b=p.badge;const double corner=2*p.unit,rim=std::max(1,p.unit/2);
+  for(int y=b.y;y<b.y+b.height;++y)for(int x=b.x;x<b.x+b.width;++x) {
+    const double dx=std::max({b.x+corner-(x+0.5),0.0,x+0.5-(b.x+b.width-corner)});
+    const double dy=std::max({b.y+corner-(y+0.5),0.0,y+0.5-(b.y+b.height-corner)});
+    if(std::hypot(dx,dy)>corner)continue;
+    const bool border=x<b.x+rim||x>=b.x+b.width-rim||y<b.y+rim||
+        y>=b.y+b.height-rim||std::hypot(dx,dy)>corner-rim;
+    SetNumberPixel(pixels,x,y,border?std::array<std::uint8_t,3>{255,255,255}:
+        std::array<std::uint8_t,3>{226,35,63});
+  }
+  const std::string text=std::to_string(slot+1);
+  const int width=(int(text.size())*4-1)*p.unit;
+  const int x=int(b.x+(b.width-width)/2),y=int(b.y+(b.height-5*p.unit)/2);
+  for(std::size_t n=0;n<text.size();++n)for(int row=0;row<5;++row)
+    for(int column=0;column<3;++column)
+      if(digits[text[n]-'0'][row]&(1<<(2-column)))
+        for(int yy=0;yy<p.unit;++yy)for(int xx=0;xx<p.unit;++xx)
+          SetNumberPixel(pixels,x+int(n)*4*p.unit+column*p.unit+xx,
+                         y+row*p.unit+yy,{255,255,255});
 }
 std::optional<Bytes> DerivedCropBytes(const Reference& metadata,
                                      const Bytes& source_bytes) {
@@ -1085,7 +1916,9 @@ std::optional<Bytes> DerivedCropBytes(const Reference& metadata,
   return bytes;
 }
 std::optional<Bytes> AnnotatedBytes(const Reference& metadata,
-                                    const Bytes& source_bytes) {
+                                    const Bytes& source_bytes,
+                                    std::optional<std::size_t> region_index={},
+                                    bool include_numbers=true) {
   if(source_bytes.size()<8||Sha256(source_bytes)!=metadata.source.sha256)return {};
   Image source=metadata.source;source.bytes=source_bytes;
   const auto inspected=InspectPng(source,{0,0,double(source.width),
@@ -1111,7 +1944,15 @@ std::optional<Bytes> AnnotatedBytes(const Reference& metadata,
        result.x>pixels.width||result.y>pixels.height)return {};
     return result;
   };
-  for(const auto& region:EffectiveRegions(metadata)) {
+  const auto regions=EffectiveRegions(metadata);
+  if(region_index&&*region_index>=regions.size())return {};
+  if(regions.empty()&&!region_index)return source_bytes;
+  const auto placements=include_numbers?PlaceNumbers(metadata,regions):
+      std::optional<std::vector<NumberPlacement>>{};
+  if(include_numbers&&!placements)return {};
+  for(std::size_t region_number=0;region_number<regions.size();++region_number) {
+    if(region_index&&*region_index!=region_number)continue;
+    const auto& region=regions[region_number];
     ForEachSubpath(region,[&](const auto& path) {
       if(!valid||path.size()<2){valid=false;return;}
       auto previous=source_point(path.front());
@@ -1162,6 +2003,35 @@ std::optional<Bytes> AnnotatedBytes(const Reference& metadata,
     if(!valid)return {};
   }
   if(segments==0)return {};
+  // Draw all leaders before labels so a leader cannot erase a numeral. The
+  // placement set is identical for full images and independently derived crops.
+  for(std::size_t slot=0;slot<regions.size();++slot)
+    if(include_numbers&&(!region_index||*region_index==slot))DrawNumberLeader(pixels,(*placements)[slot]);
+  for(std::size_t slot=0;slot<regions.size();++slot)
+    if(include_numbers&&(!region_index||*region_index==slot))DrawNumberBadge(pixels,metadata.first_mark_slot+slot,(*placements)[slot]);
+  if(region_index) {
+    const auto numbered=NumberedMarkBounds(metadata,*region_index,regions,*placements);
+    if(!numbered)return {};
+    const auto& bounds=*numbered;
+    if(!ValidRect(bounds)||bounds.x<0||bounds.y<0||
+       bounds.x>pixels.width||bounds.y>pixels.height||
+       bounds.width>pixels.width||bounds.height>pixels.height)return {};
+    const auto x=static_cast<std::size_t>(bounds.x);
+    const auto y=static_cast<std::size_t>(bounds.y);
+    const auto width=static_cast<std::size_t>(bounds.width);
+    const auto height=static_cast<std::size_t>(bounds.height);
+    if(bounds.x!=x||bounds.y!=y||bounds.width!=width||bounds.height!=height||
+       x+width>pixels.width||y+height>pixels.height)return {};
+    Pixels cropped;
+    cropped.width=static_cast<std::uint32_t>(width);
+    cropped.height=static_cast<std::uint32_t>(height);
+    cropped.rgba.reserve(width*height*4);
+    for(std::size_t row=0;row<height;++row) {
+      const auto begin=pixels.rgba.begin()+((y+row)*pixels.width+x)*4;
+      cropped.rgba.insert(cropped.rgba.end(),begin,begin+width*4);
+    }
+    pixels=std::move(cropped);
+  }
   auto bytes=EncodeSdkPng(pixels);
   if(bytes.size()<8||bytes.size()>kMaxBytes)return {};
   return bytes;
@@ -1170,8 +2040,26 @@ std::optional<StoredReference> FinalizeReference(Reference reference,
                                                  Pixels pixels,
                                                  std::string* error,
     const std::function<void(std::string_view,std::string_view)>& stage = {},
-                                                 std::string_view id = {}) {
+                                                 std::string_view id = {},bool allow_empty=false) {
   const auto notify=[&](std::string_view name) {if(stage)stage(name,id);};
+  if(allow_empty&&EffectiveRegions(reference).empty()) {
+    const auto display=std::find_if(reference.context.displays.begin(),reference.context.displays.end(),
+        [&](const auto& value){return value.id==reference.capture_display_id;});
+    if(reference.context.pid<=0||reference.context.pid!=reference.context.window_pid||
+       display==reference.context.displays.end()||display->pixels.width!=pixels.width||
+       display->pixels.height!=pixels.height||!ValidPixels(pixels)||!ValidRect(display->logical)) {
+      if(error)*error="empty_shot_display_unavailable";return {};
+    }
+    reference.schema=2;reference.source=PreparedImage(pixels,true);
+    const auto& rect=display->logical;
+    const double sx=pixels.width/rect.width,sy=pixels.height/rect.height;
+    reference.global_to_source={sx,-sy,-rect.x*sx,(rect.y+rect.height)*sy};
+    reference.crop_pixels={0,0,double(pixels.width),double(pixels.height)};
+    reference.region=rect;reference.crop.width=pixels.width;reference.crop.height=pixels.height;
+    reference.crop.pixel_hash_contract="rgba8-sha256-v1";
+    reference.crop.pixel_sha256=*RgbaHash(pixels,reference.crop_pixels);
+    return Canonical(reference);
+  }
   Context geometry=reference.context;
   std::vector<DisplayPoint> all_path=reference.path;
   if(reference.schema==2&&!reference.regions.empty()&&
@@ -1276,6 +2164,172 @@ std::optional<StoredReference> FinalizeReference(Reference reference,
 }
 }  // namespace
 
+ReferenceCollection ReferenceStore::Collection(std::string_view id) const {
+  const auto job=LookupMetadata(id);
+  ReferenceCollection result;
+  if(!job)return result;
+  if(job->state!=ReferenceJobState::kReady||!job->metadata) {
+    result.status=job->state==ReferenceJobState::kDeleted?MarkNotesStatus::kDeleted:
+      job->state==ReferenceJobState::kExpired?MarkNotesStatus::kExpired:MarkNotesStatus::kFailed;
+    return result;
+  }
+  std::lock_guard io_lock(impl_->retention_io_mutex);
+  return ReadCollection(directory_,*job->metadata);
+}
+void ReferenceStore::AppendReferenceAsync(std::string root,std::uint64_t expected,
+    std::string operation,Reference metadata,CaptureResult capture,AppendCompletion completion) {
+  AppendAsync(std::move(root),{},expected,std::move(operation),std::move(metadata),
+      std::move(capture),std::move(completion));
+}
+void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_id,
+    std::uint64_t expected,std::string operation,Reference metadata,CaptureResult capture,
+    AppendCompletion completion) {
+  const auto report=[&](AppendStatus status) {
+    if(completion)completion({status,root_id,operation,0});
+  };
+  if(!SafeID(root_id)||!SafeID(operation)||operation==root_id||
+     (!selected_mark_id.empty()&&!SafeID(selected_mark_id))||!ValidPixels(capture.pixels)||!capture.error.empty()) {
+    report(AppendStatus::kInvalid);return;
+  }
+  Prune();
+  std::unique_lock lock(impl_->mutex);
+  if(impl_->stopping||impl_->unfinished>=kMaximumUnfinishedJobs||
+     impl_->reserved+kPerJobReservation>kMaximumReservedBytes) {
+    lock.unlock();report(AppendStatus::kBusy);return;
+  }
+  if(impl_->append_operations.contains(operation)){lock.unlock();report(AppendStatus::kBusy);return;}
+  auto active=std::make_shared<std::atomic_bool>(true);impl_->append_operations[operation]=active;
+  ++impl_->unfinished;impl_->reserved+=kPerJobReservation;
+  const auto began=metadata.operation_started.monotonic_us>0?metadata.operation_started:Now();
+  impl_->work.push_back([this,root_id,selected_mark_id,expected,operation,
+      metadata=std::move(metadata),capture=std::move(capture),completion=std::move(completion),began,active]() mutable {
+    AppendResult result{AppendStatus::kInvalid,root_id,operation,0};
+    const auto release=std::shared_ptr<void>(nullptr,[&](void*) {
+      {std::lock_guard guard(impl_->mutex);--impl_->unfinished;impl_->reserved-=kPerJobReservation;impl_->append_operations.erase(operation);}
+      if(completion)completion(result);
+    });
+    ReferenceStoreTestHooks hooks;
+    {std::lock_guard guard(impl_->mutex);hooks=impl_->hooks;}
+    metadata.id=root_id;metadata.mark_id=root_id;
+    metadata.requested=capture.requested;metadata.image_completed=capture.completed;
+    std::string error;
+    auto stored=FinalizeReference(std::move(metadata),std::move(capture.pixels),&error,hooks.stage,root_id,true);
+    if(!stored||hooks.fail_save){result.status=AppendStatus::kIOError;return;}
+    if(hooks.stage)hooks.stage("append_payload",root_id);
+    if(!active->load()){result.status=AppendStatus::kCancelled;return;}
+    const auto payload=ShotPath(directory_,root_id,operation);
+    // IO serialization covers payload through membership publication. Notes can
+    // change during capture/encoding; the latest notes are read inside this lock.
+    std::lock_guard io_lock(impl_->retention_io_mutex);
+    std::unique_lock guard(impl_->mutex);
+    const auto job=impl_->jobs.find(root_id);
+    const auto now=hooks.now?hooks.now():Now();
+    if(job==impl_->jobs.end()||job->second.state!=ReferenceJobState::kReady||
+       !job->second.metadata||std::filesystem::exists(directory_/(root_id+".deleted"))||
+       now.utc_us-job->second.accepted_utc_us>impl_->retention_ttl_us) {
+      result.status=AppendStatus::kUnavailable;return;
+    }
+    const auto root_metadata=job->second.metadata;
+    auto collection=ReadCollection(directory_,*root_metadata);
+    if(collection.status!=MarkNotesStatus::kReady){result.status=AppendStatus::kInvalid;return;}
+    for(const auto& shot:collection.shots)if(shot.id==operation) {
+      const int directory=open(directory_.c_str(),O_RDONLY|O_DIRECTORY);
+      const bool synced=directory>=0&&fsync(directory)==0;if(directory>=0)close(directory);
+      result.status=synced?AppendStatus::kIdempotent:AppendStatus::kCommitUncertain;
+      result.revision=collection.revision;return;
+    }
+    if(collection.revision!=expected){result.status=AppendStatus::kStale;return;}
+    bool owner=selected_mark_id.empty(); // Explicit reference target has no mark prerequisite.
+    for(std::size_t slot=0;slot<collection.notes.size();++slot)
+      if(StableMarkId(root_id,slot)==selected_mark_id)owner=true;
+    const auto count=EffectiveRegions(stored->value).size();
+    if(!owner||collection.shots.size()>=64||collection.notes.size()+count>1024||
+       now.monotonic_us-began.monotonic_us>kJobTimeoutUs) {
+      result.status=AppendStatus::kInvalid;return;
+    }
+    guard.unlock();
+    if(!PersistAsset(payload,stored->value.source.bytes)||
+       Sha256File(payload)!=stored->value.source.sha256) {
+      result.status=AppendStatus::kIOError;return;
+    }
+    auto shot=stored->value;shot.source.bytes.clear();shot.crop.bytes.clear();
+    shot.first_mark_slot=collection.notes.size();
+    collection.shots.push_back({operation,shot.first_mark_slot,
+        std::make_shared<const Reference>(std::move(shot))});
+    collection.notes.resize(collection.notes.size()+count);
+    collection.visible.resize(collection.notes.size(),true);
+    ++collection.revision;++collection.notes_revision;
+    if(hooks.stage)hooks.stage("append_before_publish",root_id);
+    if(hooks.fail_append_before_publish){result.status=AppendStatus::kIOError;return;}
+    guard.lock();
+    const auto current_job=impl_->jobs.find(root_id);
+    if(current_job==impl_->jobs.end()||current_job->second.state!=ReferenceJobState::kReady||
+       std::filesystem::exists(directory_/(root_id+".deleted"))) {
+      result.status=AppendStatus::kUnavailable;return;
+    }
+    if(!active->load()){result.status=AppendStatus::kCancelled;return;}
+    const auto persisted=PersistNotes(CollectionPath(directory_,root_id),
+        EncodeCollection(*root_metadata,collection),hooks.fail_append_after_rename);
+    result.revision=collection.revision;
+    result.status=persisted==NotesWriteResult::kSaved?AppendStatus::kCommitted:
+      persisted==NotesWriteResult::kCommitUncertain?AppendStatus::kCommitUncertain:AppendStatus::kIOError;
+    // An uncertain rename is reconciled by the same operation ID on readback.
+  });
+  lock.unlock();impl_->work_ready.notify_one();
+}
+void ReferenceStore::CancelAppend(std::string_view operation) {
+  std::lock_guard lock(impl_->mutex);
+  const auto found=impl_->append_operations.find(std::string(operation));
+  if(found!=impl_->append_operations.end())found->second->store(false);
+}
+ReadyAssetResult ReferenceStore::RequestShotAnnotated(std::string_view id,
+    std::string_view shot_id,bool numbers) {
+  const auto collection=Collection(id);
+  if(collection.status!=MarkNotesStatus::kReady)return {ReadyAssetState::kFailed,{},"collection_unavailable",{}};
+  const auto shot=std::find_if(collection.shots.begin(),collection.shots.end(),
+      [&](const auto& value){return value.id==shot_id;});
+  if(shot==collection.shots.end())return {ReadyAssetState::kFailed,{},"unknown_shot",{}};
+  if(!collection.multi())return numbers?RequestReadyAnnotated(id):RequestReadyDisplayUnderlay(id);
+  const std::string root(id),shot_identity(shot_id);
+  const auto metadata=shot->metadata;
+  const auto revision=collection.revision;
+  const std::string key=root+":shot:"+shot_identity+":"+metadata->source.sha256+":"+
+      std::to_string(shot->first_mark_slot)+":"+std::to_string(revision)+(numbers?":numbers":":strokes");
+  const auto path=shot==collection.shots.begin()?AssetPath(directory_,id,false):ShotPath(directory_,id,shot_id);
+  {
+    std::lock_guard lock(impl_->mutex);
+    if(auto entry=impl_->annotated_cache.find(key);entry!=impl_->annotated_cache.end()) {
+      entry->second.last_access=++impl_->access_clock;
+      return {entry->second.state,entry->second.bytes,entry->second.code,entry->second.byte_sha256};
+    }
+    if(impl_->stopping||impl_->annotated_cache.size()>=32)
+      return {ReadyAssetState::kPending,{},"queued",{}};
+    auto& pending=impl_->annotated_cache[key];pending.id=root;pending.cache_key=key;
+    pending.last_access=++impl_->access_clock;
+    impl_->work.push_back([this,root,shot_identity,metadata,revision,numbers,key,path] {
+      std::optional<Bytes> bytes;
+      try {
+        if(std::filesystem::file_size(path)<=kMaxBytes)
+          bytes=AnnotatedBytes(*metadata,ReadFile(path),{},numbers);
+      } catch(...) {}
+      const auto current=Collection(root);
+      std::lock_guard lock(impl_->mutex);
+      const auto entry=impl_->annotated_cache.find(key);if(entry==impl_->annotated_cache.end())return;
+      if(current.status!=MarkNotesStatus::kReady||current.revision!=revision) {
+        impl_->annotated_cache.erase(entry);return;
+      }
+      entry->second.state=bytes?ReadyAssetState::kReady:ReadyAssetState::kFailed;
+      entry->second.code=bytes?"":"asset_corrupt";
+      if(bytes) {
+        entry->second.byte_sha256=Sha256(*bytes);
+        entry->second.bytes=std::make_shared<const Bytes>(std::move(*bytes));
+      }
+      TrimAnnotatedCache(*impl_);
+    });
+  }
+  impl_->work_ready.notify_one();return {ReadyAssetState::kPending,{},"deriving",{}};
+}
+
 ReferenceStore::ReferenceStore(std::filesystem::path directory)
     :directory_(std::move(directory)),impl_(std::make_unique<Impl>()) {
   std::filesystem::create_directories(directory_);
@@ -1344,12 +2398,13 @@ ReferenceStore::ReferenceStore(std::filesystem::path directory)
       (void)(input>>job.accepted_utc_us>>job.terminal_utc_us);
       if(job.code.empty())job.code="interrupted";
     }
+    try {ReadLifecycleContext(item.path(),job);}catch(...) {}
     if(job.accepted_utc_us<=0)job.accepted_utc_us=FileUtcUs(item.path());
     if(job.terminal_utc_us<=0)job.terminal_utc_us=job.accepted_utc_us;
     impl_->jobs[id]=job;
     if(extension==".pending") {
-      (void)PersistSmall(directory_/(id+".failed"),TerminalStateText(
-          job.code,job.accepted_utc_us,job.terminal_utc_us));
+      (void)PersistSmall(directory_/(id+".failed"),LifecycleStateText(
+          job.code,job.accepted_utc_us,job.terminal_utc_us,job.metadata));
       unlink(item.path().c_str());
     }
   }
@@ -1515,6 +2570,7 @@ void ReferenceStore::MigrateLegacyReady(std::string id) {
     migrated.context=loaded->value.context;migrated.path=loaded->value.path;
     migrated.regions=loaded->value.regions;
     migrated.page_identity=loaded->value.page_identity;
+    migrated.captured_page=loaded->value.captured_page;
     migrated.key_down_monotonic_ms=0;migrated.key_up_monotonic_ms=0;
     migrated.circle_completed=loaded->value.circle_completed;
     migrated.crop_margin=loaded->value.crop_margin;
@@ -1658,6 +2714,8 @@ void ReferenceStore::Prune() {
           unlink(AssetPath(directory_,id,true).c_str());
           unlink(AnnotatedAssetPath(directory_,id).c_str());
           unlink(AnnotatedDigestPath(directory_,id).c_str());
+          unlink(NotesPath(directory_,id).c_str());
+          RemoveCollectionFiles(directory_,id);
         }
       });
     }
@@ -1668,12 +2726,14 @@ void ReferenceStore::Prune() {
 ReferenceJobSnapshot ReferenceStore::AcceptPending(
     Reference reference,std::int64_t key_down_monotonic_ms,
     std::int64_t key_up_monotonic_ms) {
+  NormalizeCapturedPage(reference);
   std::function<Stamp()> clock;
   {std::lock_guard lock(impl_->mutex);clock=impl_->hooks.now;}
   const Stamp accepted=clock?clock():Now();
   ReferenceJobSnapshot job;job.id=reference.id;job.context=reference.context;
   job.path=reference.path;job.regions=reference.regions;
   job.page_identity=reference.page_identity;
+  job.captured_page=reference.captured_page;
   job.metadata=std::make_shared<const Reference>(reference);
   job.accepted_utc_us=accepted.utc_us;
   job.deadline_utc_us=job.accepted_utc_us+kJobTimeoutUs;
@@ -1712,8 +2772,9 @@ ReferenceJobSnapshot ReferenceStore::AcceptPending(
     impl_->jobs.emplace(job.id,job);
   }
   if(job.state==ReferenceJobState::kPending) {
-    {std::lock_guard lock(impl_->mutex);impl_->work.push_back([this,id=job.id] {
-      (void)PersistSmall(directory_/(id+".pending"),"pending\n");
+    {std::lock_guard lock(impl_->mutex);impl_->work.push_back([this,id=job.id,metadata=job.metadata,accepted=job.accepted_utc_us] {
+      (void)PersistSmall(directory_/(id+".pending"),
+          LifecycleStateText("pending",accepted,0,metadata));
       std::lock_guard lock(impl_->mutex);auto found=impl_->jobs.find(id);
       if(found==impl_->jobs.end()||found->second.state!=ReferenceJobState::kPending)
         unlink((directory_/(id+".pending")).c_str());
@@ -1844,6 +2905,7 @@ void ReferenceStore::FinalizeAsync(std::string id,CaptureResult capture,
         } else {
         found->second.state=ReferenceJobState::kReady;found->second.code.clear();
         found->second.page_identity=stored->value.page_identity;
+        found->second.captured_page=stored->value.captured_page;
         found->second.ready=std::make_shared<const StoredReference>(std::move(*stored));
         found->second.terminal_utc_us=prepared.terminal_utc_us;
         found->second.context=std::move(prepared.context);
@@ -1895,9 +2957,9 @@ void ReferenceStore::Fail(std::string_view id,std::string code,
     result=found->second;changed=true;
     impl_->work.push_back([this,job_id=found->first,reason=found->second.code,
                            accepted=found->second.accepted_utc_us,
-                           terminal=found->second.terminal_utc_us] {
+                           terminal=found->second.terminal_utc_us,metadata=found->second.metadata] {
       (void)PersistSmall(directory_/(job_id+".failed"),
-          TerminalStateText(reason,accepted,terminal));
+          LifecycleStateText(reason,accepted,terminal,metadata));
       unlink((directory_/(job_id+".pending")).c_str());
       Prune();
     });}
@@ -1907,13 +2969,14 @@ void ReferenceStore::Fail(std::string_view id,std::string code,
 bool ReferenceStore::CleanupDeletedFiles(std::string_view id) {
   ReferenceStoreTestHooks hooks;
   {std::lock_guard lock(impl_->mutex);hooks=impl_->hooks;}
-  const std::array<std::filesystem::path,8> paths={
+  const std::array<std::filesystem::path,9> paths={
       directory_/(std::string(id)+".pending"),
       directory_/(std::string(id)+".failed"),
       directory_/(std::string(id)+".ready"),
       directory_/(std::string(id)+".stref"),
       AssetPath(directory_,id,false),AssetPath(directory_,id,true),
-      AnnotatedAssetPath(directory_,id),AnnotatedDigestPath(directory_,id)};
+      AnnotatedAssetPath(directory_,id),AnnotatedDigestPath(directory_,id),
+      NotesPath(directory_,id)};
   bool success=true;std::lock_guard io_lock(impl_->retention_io_mutex);
   for(const auto& path:paths) {
     bool removed=false;
@@ -1921,6 +2984,7 @@ bool ReferenceStore::CleanupDeletedFiles(std::string_view id) {
     else {errno=0;removed=unlink(path.c_str())==0||errno==ENOENT;}
     success=removed&&success;
   }
+  success=RemoveCollectionFiles(directory_,id,hooks.remove_owned_file)&&success;
   return success;
 }
 
@@ -1948,7 +3012,7 @@ DeleteResult ReferenceStore::Delete(std::string_view id) {
       found->second.code="deleted_reference";
       found->second.terminal_utc_us=terminal.utc_us;
       found->second.ready.reset();found->second.metadata.reset();
-      impl_->annotated_cache.erase(found->first);
+      EraseAnnotatedCacheForId(*impl_,found->first);
       found->second.context={};found->second.path.clear();found->second.regions.clear();
       impl_->ready_access.erase(found->first);
       if(impl_->derived_crop&&impl_->derived_crop->id==found->first&&
@@ -2075,6 +3139,9 @@ ReadyAssetResult ReferenceStore::RequestReadyCrop(std::string_view id) {
   }
 
   const std::string identity(id);
+  const std::string binding=indexed->metadata->source.sha256+":"+
+      Sha256(Serialize(*indexed->metadata));
+  const std::string cache_key=identity+":source-crop-v1:"+binding;
   std::shared_ptr<const StoredReference> live;
   std::shared_ptr<const Reference> metadata;
   bool scheduled=false;
@@ -2082,22 +3149,50 @@ ReadyAssetResult ReferenceStore::RequestReadyCrop(std::string_view id) {
     std::lock_guard lock(impl_->mutex);
     const auto job=impl_->jobs.find(identity);
     if(job==impl_->jobs.end()||job->second.state!=ReferenceJobState::kReady||
-       !job->second.metadata||job->second.metadata->schema!=2)
+       !job->second.metadata||job->second.metadata->schema!=2||
+       job->second.metadata!=indexed->metadata)
       return {ReadyAssetState::kFailed,{},"asset_unavailable",{}};
     metadata=job->second.metadata;live=job->second.ready;
     if(!live||live->value.crop.bytes.empty()) {
-      if(impl_->derived_crop&&impl_->derived_crop->id==identity)
+      if(auto cached=impl_->annotated_cache.find(cache_key);
+         cached!=impl_->annotated_cache.end()&&
+         cached->second.representation==AnnotatedRepresentation::kSourceCrop&&
+         cached->second.metadata_binding==binding) {
+        cached->second.last_access=++impl_->access_clock;
+        return {cached->second.state,cached->second.bytes,
+                cached->second.code,cached->second.byte_sha256};
+      }
+      if(impl_->derived_crop&&impl_->derived_crop->id==identity&&
+         impl_->derived_crop->cache_key==cache_key&&
+         impl_->derived_crop->metadata_binding==binding&&
+         impl_->derived_crop->metadata==metadata)
         return {impl_->derived_crop->state,impl_->derived_crop->bytes,
                 impl_->derived_crop->code,impl_->derived_crop->byte_sha256};
-      if(impl_->derived_crop&&
-         impl_->derived_crop->state==ReadyAssetState::kPending)
+      if(impl_->derived_crop&&impl_->derived_crop->state==ReadyAssetState::kPending)
         return {ReadyAssetState::kPending,{},"queued",{}};
       if(impl_->stopping)
         return {ReadyAssetState::kFailed,{},"shutdown",{}};
+      // A completed crop requested by metadata must not pin the slot. Preserve
+      // its owned bytes in the SAME typed/count/byte-bounded LRU used by the
+      // other derived representations; abandoned clients consume no new budget.
+      if(impl_->derived_crop&&impl_->derived_crop->state==ReadyAssetState::kReady&&
+         impl_->derived_crop->bytes) {
+        const auto& previous=*impl_->derived_crop;
+        auto& cached=impl_->annotated_cache[previous.cache_key];
+        cached=Impl::DerivedAnnotated{};
+        cached.id=previous.id;cached.generation=previous.generation;
+        cached.state=previous.state;cached.bytes=previous.bytes;
+        cached.code=previous.code;cached.byte_sha256=previous.byte_sha256;
+        cached.representation=AnnotatedRepresentation::kSourceCrop;
+        cached.cache_key=previous.cache_key;cached.metadata_binding=previous.metadata_binding;
+        cached.last_access=++impl_->access_clock;TrimAnnotatedCache(*impl_);
+      }
       const auto generation=++impl_->derived_crop_generation;
       impl_->derived_crop=Impl::DerivedCrop{
           identity,generation,ReadyAssetState::kPending,{},"deriving",{}};
-      impl_->work.push_back([this,identity,metadata,generation] {
+      impl_->derived_crop->cache_key=cache_key;
+      impl_->derived_crop->metadata_binding=binding;impl_->derived_crop->metadata=metadata;
+      impl_->work.push_back([this,identity,metadata,generation,cache_key,binding] {
         ReferenceStoreTestHooks hooks;
         {std::lock_guard lock(impl_->mutex);hooks=impl_->hooks;}
         std::optional<Bytes> bytes;
@@ -2108,11 +3203,13 @@ ReadyAssetResult ReferenceStore::RequestReadyCrop(std::string_view id) {
         } catch(...) {}
         std::lock_guard lock(impl_->mutex);
         if(!impl_->derived_crop||impl_->derived_crop->id!=identity||
-           impl_->derived_crop->generation!=generation)return;
+           impl_->derived_crop->generation!=generation||
+           impl_->derived_crop->cache_key!=cache_key||
+           impl_->derived_crop->metadata_binding!=binding||
+           impl_->derived_crop->metadata!=metadata)return;
         const auto job=impl_->jobs.find(identity);
         if(job==impl_->jobs.end()||job->second.state!=ReferenceJobState::kReady||
-           !job->second.metadata||
-           job->second.metadata->crop.sha256!=metadata->crop.sha256) {
+           job->second.metadata!=metadata) {
           impl_->derived_crop.reset();return;
         }
         if(bytes) {
@@ -2143,46 +3240,292 @@ ReadyAssetResult ReferenceStore::RequestReadyCrop(std::string_view id) {
 }
 
 ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
+  return RequestAnnotated(id,{});
+}
+ReadyAssetResult ReferenceStore::RequestReadyDisplayUnderlay(std::string_view id) {
+  return RequestAnnotated(id,{},AnnotatedRepresentation::kDisplayUnderlay);
+}
+ReadyAssetResult ReferenceStore::RequestReadyMark(std::string_view id,
+                                                  std::size_t region_index) {
+  return RequestAnnotated(id,region_index);
+}
+MarkNotesSnapshot ReferenceStore::MarkSnapshots(std::string_view id) const {
+  MarkNotesSnapshot result;
+  if(!SafeID(std::string(id)))return result;
+  const auto job=LookupMetadata(id);
+  if(!job)return result;
+  if(job->state==ReferenceJobState::kDeleted) {
+    result.status=MarkNotesStatus::kDeleted;return result;
+  }
+  if(job->state==ReferenceJobState::kExpired) {
+    result.status=MarkNotesStatus::kExpired;return result;
+  }
+  if(job->state==ReferenceJobState::kFailed) {
+    result.status=MarkNotesStatus::kFailed;return result;
+  }
+  if(!job->metadata) {
+    result.status=MarkNotesStatus::kCorrupt;return result;
+  }
+  if(job->state==ReferenceJobState::kPending) {
+    result.status=MarkNotesStatus::kPending;
+    const auto regions=EffectiveRegions(*job->metadata);
+    for(std::size_t slot=0;slot<regions.size();++slot) {
+      const auto anchor=FirstPoint(regions[slot]);if(!anchor)continue;
+      result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
+          *anchor,{},"",true,0,std::string(id),slot});
+    }
+    return result;
+  }
+  const auto collection=Collection(id);
+  if(collection.status!=MarkNotesStatus::kReady) {result.status=collection.status;return result;}
+  result.status=MarkNotesStatus::kReady;result.revision=collection.notes_revision;
+  for(const auto& shot:collection.shots) {
+    const auto& reference=*shot.metadata;const auto regions=EffectiveRegions(reference);
+    const auto placements=PlaceNumbers(reference,regions);
+    if(!placements){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
+    for(std::size_t local=0;local<regions.size();++local) {
+      const auto slot=shot.first_mark_slot+local;
+      const auto anchor=FirstPoint(regions[local]);
+      const auto bounds=NumberedMarkBounds(reference,local,regions,*placements);
+      if(!anchor||!bounds){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
+      result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
+          *anchor,*bounds,collection.notes[slot],collection.visible[slot],collection.notes_revision,
+          shot.id,local});
+    }
+  }
+  return result;
+}
+
+MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
+    std::string_view id,std::string_view mark_id,std::string note,
+    std::uint64_t expected_revision) {
+  if(!SafeID(std::string(id))||!SafeID(std::string(mark_id))||
+     !ValidNote(note))return {MarkNoteUpdateStatus::kInvalid,0};
+  std::lock_guard io_lock(impl_->retention_io_mutex);
+  std::lock_guard lock(impl_->mutex);
+  const auto found=impl_->jobs.find(std::string(id));
+  if(found==impl_->jobs.end())return {MarkNoteUpdateStatus::kNotFound,0};
+  if(found->second.state==ReferenceJobState::kDeleted)
+    return {MarkNoteUpdateStatus::kDeleted,0};
+  if(found->second.state==ReferenceJobState::kExpired)
+    return {MarkNoteUpdateStatus::kExpired,0};
+  if(found->second.state!=ReferenceJobState::kReady||!found->second.metadata)
+    return {MarkNoteUpdateStatus::kInvalid,0};
+  if(std::filesystem::exists(CollectionPath(directory_,id))) {
+    auto collection=ReadCollection(directory_,*found->second.metadata);
+    if(collection.status!=MarkNotesStatus::kReady)return {MarkNoteUpdateStatus::kCorrupt,0};
+    if(collection.notes_revision!=expected_revision)
+      return {MarkNoteUpdateStatus::kRevisionConflict,collection.notes_revision};
+    std::size_t slot=collection.notes.size();
+    for(std::size_t index=0;index<collection.notes.size();++index)
+      if(StableMarkId(id,index)==mark_id){slot=index;break;}
+    if(slot==collection.notes.size())return {MarkNoteUpdateStatus::kInvalid,0};
+    collection.notes[slot]=std::move(note);
+    if(collection.notes_revision==std::numeric_limits<std::uint64_t>::max())return {MarkNoteUpdateStatus::kInvalid,collection.notes_revision};
+    ++collection.notes_revision;
+    const auto persisted=PersistNotes(CollectionPath(directory_,id),
+        EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
+      persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
+      MarkNoteUpdateStatus::kIOError,collection.notes_revision};
+  }
+  const auto& reference=*found->second.metadata;
+  const auto regions=EffectiveRegions(reference);
+  if(regions.empty()||regions.size()>1024)
+    return {MarkNoteUpdateStatus::kCorrupt,0};
+  std::size_t slot=regions.size();
+  for(std::size_t index=0;index<regions.size();++index)
+    if(StableMarkId(id,index)==mark_id){slot=index;break;}
+  if(slot==regions.size())return {MarkNoteUpdateStatus::kInvalid,0};
+  auto sidecar=ReadNotes(directory_,reference,regions.size());
+  if(sidecar.status==MarkNotesStatus::kCorrupt)
+    return {MarkNoteUpdateStatus::kCorrupt,0};
+  if(sidecar.status==MarkNotesStatus::kUnsupported)
+    return {MarkNoteUpdateStatus::kUnsupported,0};
+  if(sidecar.status==MarkNotesStatus::kIOError)
+    return {MarkNoteUpdateStatus::kIOError,0};
+  if(sidecar.revision!=expected_revision)
+    return {MarkNoteUpdateStatus::kRevisionConflict,sidecar.revision};
+  if(sidecar.revision==std::numeric_limits<std::uint64_t>::max())
+    return {MarkNoteUpdateStatus::kInvalid,sidecar.revision};
+  sidecar.notes[slot]=std::move(note);++sidecar.revision;
+  const auto bytes=EncodeNotes(reference,sidecar);
+  const auto persisted=PersistNotes(NotesPath(directory_,id),bytes,
+                                     impl_->hooks.fail_note_after_rename);
+  if(persisted==NotesWriteResult::kIOError)
+    return {MarkNoteUpdateStatus::kIOError,expected_revision};
+  if(persisted==NotesWriteResult::kCommitUncertain)
+    return {MarkNoteUpdateStatus::kCommitUncertain,sidecar.revision};
+  return {MarkNoteUpdateStatus::kUpdated,sidecar.revision};
+}
+MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
+    std::string_view id,std::string_view mark_id,bool visible,
+    std::uint64_t expected_revision) {
+  if(!SafeID(std::string(id))||!SafeID(std::string(mark_id)))
+    return {MarkNoteUpdateStatus::kInvalid,0};
+  std::lock_guard io_lock(impl_->retention_io_mutex);
+  // Keep the lifecycle state stable through publication. Delete and expiry
+  // must follow this write and then remove the sidecar, or precede it and win.
+  std::lock_guard lock(impl_->mutex);
+  const auto found=impl_->jobs.find(std::string(id));
+  if(found==impl_->jobs.end())return {MarkNoteUpdateStatus::kNotFound,0};
+  if(found->second.state==ReferenceJobState::kDeleted)
+    return {MarkNoteUpdateStatus::kDeleted,0};
+  if(found->second.state==ReferenceJobState::kExpired)
+    return {MarkNoteUpdateStatus::kExpired,0};
+  if(found->second.state!=ReferenceJobState::kReady||!found->second.metadata)
+    return {MarkNoteUpdateStatus::kInvalid,0};
+  if(std::filesystem::exists(CollectionPath(directory_,id))) {
+    auto collection=ReadCollection(directory_,*found->second.metadata);
+    if(collection.status!=MarkNotesStatus::kReady)return {MarkNoteUpdateStatus::kCorrupt,0};
+    if(collection.notes_revision!=expected_revision)
+      return {MarkNoteUpdateStatus::kRevisionConflict,collection.notes_revision};
+    std::size_t slot=collection.notes.size();
+    for(std::size_t index=0;index<collection.notes.size();++index)
+      if(StableMarkId(id,index)==mark_id){slot=index;break;}
+    if(slot==collection.notes.size())return {MarkNoteUpdateStatus::kInvalid,0};
+    collection.visible[slot]=visible;
+    if(collection.notes_revision==std::numeric_limits<std::uint64_t>::max())return {MarkNoteUpdateStatus::kInvalid,collection.notes_revision};
+    ++collection.notes_revision;
+    const auto persisted=PersistNotes(CollectionPath(directory_,id),
+        EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
+      persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
+      MarkNoteUpdateStatus::kIOError,collection.notes_revision};
+  }
+  const auto& reference=*found->second.metadata;
+  const auto regions=EffectiveRegions(reference);
+  if(regions.empty()||regions.size()>1024)
+    return {MarkNoteUpdateStatus::kCorrupt,0};
+  std::size_t slot=regions.size();
+  for(std::size_t index=0;index<regions.size();++index)
+    if(StableMarkId(id,index)==mark_id){slot=index;break;}
+  if(slot==regions.size())return {MarkNoteUpdateStatus::kInvalid,0};
+  auto sidecar=ReadNotes(directory_,reference,regions.size());
+  if(sidecar.status==MarkNotesStatus::kCorrupt)
+    return {MarkNoteUpdateStatus::kCorrupt,0};
+  if(sidecar.status==MarkNotesStatus::kUnsupported)
+    return {MarkNoteUpdateStatus::kUnsupported,0};
+  if(sidecar.status==MarkNotesStatus::kIOError)
+    return {MarkNoteUpdateStatus::kIOError,0};
+  if(sidecar.revision!=expected_revision)
+    return {MarkNoteUpdateStatus::kRevisionConflict,sidecar.revision};
+  if(sidecar.revision==std::numeric_limits<std::uint64_t>::max())
+    return {MarkNoteUpdateStatus::kInvalid,sidecar.revision};
+  sidecar.visible[slot]=visible;
+  ++sidecar.revision;
+  const auto persisted=PersistNotes(NotesPath(directory_,id),
+      EncodeNotes(reference,sidecar),found->second.state==ReferenceJobState::kReady&&
+      impl_->hooks.fail_note_after_rename);
+  if(persisted==NotesWriteResult::kIOError)
+    return {MarkNoteUpdateStatus::kIOError,expected_revision};
+  if(persisted==NotesWriteResult::kCommitUncertain)
+    return {MarkNoteUpdateStatus::kCommitUncertain,sidecar.revision};
+  return {MarkNoteUpdateStatus::kUpdated,sidecar.revision};
+}
+ReadyAssetResult ReferenceStore::RequestAnnotated(
+    std::string_view id,std::optional<std::size_t> region_index,
+    AnnotatedRepresentation representation) {
   const auto indexed=LookupMetadata(id);
   if(!indexed||indexed->state!=ReferenceJobState::kReady||!indexed->metadata)
     return {ReadyAssetState::kFailed,{},"asset_unavailable",{}};
-  const std::string identity(id);
+  const auto region_count=indexed->metadata->regions.empty()?
+      (indexed->metadata->path.empty()?0U:1U):
+      indexed->metadata->regions.size();
+  if(region_index&&*region_index>=region_count)
+    return {ReadyAssetState::kFailed,{},"invalid_mark",{}};
+  bool underlay=representation==AnnotatedRepresentation::kDisplayUnderlay;
+  if(underlay&&indexed->metadata->schema!=2)
+    return {ReadyAssetState::kFailed,{},"unsupported",{}};
+  std::string binding=indexed->metadata->source.sha256+":"+
+      Sha256(Serialize(*indexed->metadata));
+  std::string identity(id);
+  std::string cache_key=underlay?
+      identity+":display-underlay:"+std::string(kDisplayUnderlayGeometryVersion)+":"+binding:
+      region_index?
+      identity+":mark-numbered-v3:"+std::to_string(*region_index):identity;
   std::shared_ptr<const Reference> metadata;
+  bool requested_started=false;
   {
     std::lock_guard lock(impl_->mutex);
     const auto job=impl_->jobs.find(identity);
     if(job==impl_->jobs.end()||job->second.state!=ReferenceJobState::kReady||
-       !job->second.metadata)
+       !job->second.metadata||job->second.metadata!=indexed->metadata)
       return {ReadyAssetState::kFailed,{},"asset_unavailable",{}};
-    if(auto cached=impl_->annotated_cache.find(identity);
-       cached!=impl_->annotated_cache.end()) {
+    const auto remove_waiter=[&] {
+      std::erase_if(impl_->annotated_waiters,[&](const auto& w) {return w.cache_key==cache_key;});
+    };
+    if(auto cached=impl_->annotated_cache.find(cache_key);
+       cached!=impl_->annotated_cache.end()&&
+       cached->second.metadata_binding==binding&&
+       cached->second.representation==representation) {
+      remove_waiter();
       cached->second.last_access=++impl_->access_clock;
       return {cached->second.state,cached->second.bytes,
               cached->second.code,cached->second.byte_sha256};
     }
-    if(impl_->derived_annotated&&impl_->derived_annotated->id==identity)
+    if(impl_->derived_annotated&&impl_->derived_annotated->id==identity&&
+       impl_->derived_annotated->region_index==region_index&&
+       impl_->derived_annotated->cache_key==cache_key&&
+       impl_->derived_annotated->metadata_binding==binding&&
+       impl_->derived_annotated->representation==representation) {
+      remove_waiter();
       return {impl_->derived_annotated->state,
               impl_->derived_annotated->bytes,
               impl_->derived_annotated->code,
               impl_->derived_annotated->byte_sha256};
+    }
+    // FIFO descriptors contain no image bytes. Any cold poll advances the oldest
+    // valid request, even if a metadata-only requester never comes back. A ready
+    // result moves to the same bounded LRU rather than blocking the active slot.
+    std::erase_if(impl_->annotated_waiters,[&](const auto& w) {
+      const auto found=impl_->jobs.find(w.id);
+      return found==impl_->jobs.end()||found->second.state!=ReferenceJobState::kReady||
+             found->second.metadata!=w.metadata;
+    });
+    Impl::AnnotatedWaiter requested{identity,cache_key,binding,region_index,
+                                    representation,job->second.metadata};
+    const bool already_queued=std::any_of(impl_->annotated_waiters.begin(),
+        impl_->annotated_waiters.end(),[&](const auto& w) {return w.cache_key==cache_key;});
     if(impl_->derived_annotated&&
-       impl_->derived_annotated->state==ReadyAssetState::kPending)
+       impl_->derived_annotated->state==ReadyAssetState::kPending) {
+      if(!already_queued&&impl_->annotated_waiters.size()<32)
+        impl_->annotated_waiters.push_back(std::move(requested));
       return {ReadyAssetState::kPending,{},"queued",{}};
+    }
+    auto next=requested;
+    if(!impl_->annotated_waiters.empty()) {
+      // Drain before capacity admission: even32 abandoned waiters must advance
+      // when a new client polls. Popping first leaves room without growing32.
+      next=std::move(impl_->annotated_waiters.front());
+      impl_->annotated_waiters.pop_front();
+      if(!already_queued&&next.cache_key!=cache_key)
+        impl_->annotated_waiters.push_back(std::move(requested));
+    }
+    requested_started=next.cache_key==cache_key;
+    identity=std::move(next.id);cache_key=std::move(next.cache_key);
+    binding=std::move(next.metadata_binding);region_index=next.region_index;
+    representation=next.representation;metadata=std::move(next.metadata);
+    underlay=representation==AnnotatedRepresentation::kDisplayUnderlay;
     if(impl_->stopping)
       return {ReadyAssetState::kFailed,{},"shutdown",{}};
-    metadata=job->second.metadata;
     if(impl_->derived_annotated&&
        impl_->derived_annotated->state==ReadyAssetState::kReady&&
        impl_->derived_annotated->bytes) {
-      auto& cached=impl_->annotated_cache[impl_->derived_annotated->id];
+      const auto& previous=*impl_->derived_annotated;
+      const std::string& previous_key=previous.cache_key;
+      auto& cached=impl_->annotated_cache[previous_key];
       cached=*impl_->derived_annotated;
       cached.last_access=++impl_->access_clock;
       TrimAnnotatedCache(*impl_);
     }
     const auto generation=++impl_->derived_annotated_generation;
     impl_->derived_annotated=Impl::DerivedAnnotated{
-        identity,generation,ReadyAssetState::kPending,{},"deriving",{}};
-    impl_->work.push_back([this,identity,metadata,generation] {
+        identity,region_index,generation,ReadyAssetState::kPending,{},"deriving",{}};
+    impl_->derived_annotated->representation=representation;
+    impl_->derived_annotated->cache_key=cache_key;
+    impl_->derived_annotated->metadata_binding=binding;
+    impl_->work.push_back([this,identity,metadata,generation,region_index,representation,cache_key,binding,underlay] {
       ReferenceStoreTestHooks hooks;
       {std::lock_guard lock(impl_->mutex);hooks=impl_->hooks;}
       std::optional<Bytes> bytes;
@@ -2191,7 +3534,7 @@ ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
         if(hooks.before_derive_annotated)hooks.before_derive_annotated(identity);
         const auto annotated_path=AnnotatedAssetPath(directory_,identity);
         const auto digest_path=AnnotatedDigestPath(directory_,identity);
-        if(std::filesystem::exists(annotated_path)&&
+        if(!underlay&&!region_index&&std::filesystem::exists(annotated_path)&&
            std::filesystem::exists(digest_path)&&
            std::filesystem::file_size(annotated_path)<=kMaxBytes&&
            std::filesystem::file_size(digest_path)<=256) {
@@ -2211,11 +3554,11 @@ ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
       if(!bytes) try {
           const auto source_path=AssetPath(directory_,identity,false);
           if(std::filesystem::file_size(source_path)<=kMaxBytes) {
-            bytes=AnnotatedBytes(*metadata,ReadFile(source_path));
+            bytes=AnnotatedBytes(*metadata,ReadFile(source_path),region_index,!underlay);
             generated=bytes.has_value();
           }
       } catch(...) {}
-      if(generated&&bytes) {
+      if(generated&&bytes&&!underlay&&!region_index) {
         std::lock_guard io_lock(impl_->retention_io_mutex);
         bool still_ready=false;
         {
@@ -2223,7 +3566,11 @@ ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
           const auto job=impl_->jobs.find(identity);
           still_ready=impl_->derived_annotated&&
               impl_->derived_annotated->id==identity&&
+              impl_->derived_annotated->region_index==region_index&&
               impl_->derived_annotated->generation==generation&&
+              impl_->derived_annotated->cache_key==cache_key&&
+              impl_->derived_annotated->metadata_binding==binding&&
+              impl_->derived_annotated->representation==representation&&
               job!=impl_->jobs.end()&&job->second.state==ReferenceJobState::kReady&&
               job->second.metadata==metadata;
         }
@@ -2237,7 +3584,11 @@ ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
       std::lock_guard lock(impl_->mutex);
       if(!impl_->derived_annotated||
          impl_->derived_annotated->id!=identity||
-         impl_->derived_annotated->generation!=generation)return;
+         impl_->derived_annotated->region_index!=region_index||
+         impl_->derived_annotated->generation!=generation||
+         impl_->derived_annotated->cache_key!=cache_key||
+         impl_->derived_annotated->metadata_binding!=binding||
+         impl_->derived_annotated->representation!=representation)return;
       const auto job=impl_->jobs.find(identity);
       if(job==impl_->jobs.end()||job->second.state!=ReferenceJobState::kReady||
          job->second.metadata!=metadata) {
@@ -2256,7 +3607,7 @@ ReadyAssetResult ReferenceStore::RequestReadyAnnotated(std::string_view id) {
     });
   }
   impl_->work_ready.notify_one();
-  return {ReadyAssetState::kPending,{},"deriving",{}};
+  return {ReadyAssetState::kPending,{},requested_started?"deriving":"queued",{}};
 }
 
 std::optional<ReferenceJobSnapshot> ReferenceStore::Lookup(std::string_view id) const {
@@ -2292,12 +3643,20 @@ std::optional<ReferenceJobSnapshot> ReferenceStore::Lookup(std::string_view id) 
       if(found==impl_->jobs.end())return {};
       if(found->second.state!=ReferenceJobState::kReady)return found->second;
       found->second.ready=std::move(ready);
-      found->second.context=found->second.ready->value.context;
+      // Hydrating an immutable payload must not erase a failed read-time
+      // consistency gate established from duplicate sidecar Contexts.
+      if(!found->second.metadata)found->second.context=found->second.ready->value.context;
       found->second.path=found->second.ready->value.path;
       found->second.regions=found->second.ready->value.regions;
       found->second.page_identity=found->second.ready->value.page_identity;
       impl_->ready_access[found->first]=++impl_->access_clock;
       result=found->second;TrimReadyPayloads(*impl_);
+    } else if(result.metadata && result.context.bundle_id!="com.google.Chrome" &&
+              !CaptureProvenanceSupported(*result.metadata)) {
+      // Readable metadata/notes are still history when capture evidence cannot
+      // satisfy live presentation. Do not convert title rejection into deletion
+      // or an inaccessible failed job merely because full hydration is invalid.
+      return result;
     } else {
       const auto terminal=Now().utc_us;
       std::lock_guard lock(impl_->mutex);auto found=impl_->jobs.find(result.id);

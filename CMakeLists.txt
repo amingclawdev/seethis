@@ -22,7 +22,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{CMAKE_TOOLCHAIN_FILE}
   endif()
 endif()
 
-project(seethis VERSION 0.1.1 LANGUAGES CXX)
+project(seethis VERSION 0.1.5 LANGUAGES CXX)
 
 option(SEETHIS_APP_STORE "Build the separate sandboxed Mac App Store candidate" OFF)
 set(SEETHIS_STORE_BUNDLE_ID "" CACHE STRING "Registered Store bundle ID (must be supplied explicitly)")
@@ -162,6 +162,24 @@ if(BUILD_TESTING)
     target_compile_options(inspector_feedback_test PRIVATE -fobjc-arc)
     target_link_libraries(inspector_feedback_test PRIVATE seethis_core "-framework AppKit")
     add_test(NAME inspector_feedback_actions COMMAND inspector_feedback_test)
+    add_executable(inspector_reference_actions_test
+      tests/inspector_reference_actions_test.mm)
+    target_compile_options(inspector_reference_actions_test PRIVATE -fobjc-arc)
+    target_link_libraries(inspector_reference_actions_test PRIVATE
+      seethis_core "-framework AppKit")
+    add_test(NAME inspector_reference_actions COMMAND inspector_reference_actions_test)
+    add_executable(inspector_mark_notes_test
+      tests/inspector_mark_notes_test.mm)
+    target_compile_options(inspector_mark_notes_test PRIVATE -fobjc-arc)
+    target_link_libraries(inspector_mark_notes_test PRIVATE
+      seethis_core "-framework AppKit")
+    add_test(NAME inspector_mark_notes COMMAND inspector_mark_notes_test)
+    add_executable(inspector_mark_visibility_test
+      tests/inspector_mark_visibility_test.mm)
+    target_compile_options(inspector_mark_visibility_test PRIVATE -fobjc-arc)
+    target_link_libraries(inspector_mark_visibility_test PRIVATE
+      seethis_core "-framework AppKit")
+    add_test(NAME inspector_mark_visibility COMMAND inspector_mark_visibility_test)
     add_executable(capture_exclusion_test tests/capture_exclusion_test.mm)
     target_compile_options(capture_exclusion_test PRIVATE -fobjc-arc)
     target_link_libraries(capture_exclusion_test PRIVATE seethis_core "-framework AppKit")

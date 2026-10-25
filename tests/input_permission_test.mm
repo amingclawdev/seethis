@@ -42,6 +42,123 @@ std::string Read(const std::filesystem::path& path) {
           std::istreambuf_iterator<char>()};
 }
 
+std::string_view Between(std::string_view source, std::string_view begin,
+                         std::string_view end) {
+  const auto first = source.find(begin);
+  if (first == std::string_view::npos) return {};
+  const auto last = source.find(end, first + begin.size());
+  if (last == std::string_view::npos) return {};
+  return source.substr(first, last - first);
+}
+
+template <typename Status>
+bool HasReadyChromeLabel() {
+  if constexpr (requires { Status::kReady; }) {
+    return seethis::platform::ChromeCompactStatusLabel(Status::kReady) ==
+           "Chrome — Ready";
+  }
+  return false;
+}
+
+void CheckNativeCompactMenu() {
+  // This target links seethis_core only. Read the production AppKit source to
+  // catch menu wiring regressions that pure permission helpers cannot see.
+  const auto source_path = std::filesystem::path(__FILE__).parent_path()
+                               .parent_path() / "src/platform/mac/input_mac.mm";
+  const std::string source = Read(source_path);
+  Check(!source.empty(), "native menu source is available to this test");
+  const auto menu = Between(source, "NSMenu* menu=[NSMenu new];",
+                            "_statusItem.menu=menu;");
+  Check(!menu.empty(), "native outward menu construction is present");
+  Check(menu.find("menu.delegate=self") != std::string_view::npos &&
+            source.find("- (void)menuWillOpen:(NSMenu*)menu {") !=
+                std::string_view::npos,
+        "CRD-06: opening the menu refreshes compact state");
+  const auto ready_item = Between(menu, "_startupStateItem=[[NSMenuItem alloc]",
+                                  "[menu addItem:_startupStateItem];");
+  Check(ready_item.find("action:@selector(showPermissionEntry:)") !=
+                std::string_view::npos &&
+            ready_item.find("_startupStateItem.target=self") !=
+                std::string_view::npos &&
+            ready_item.find("action:nil") == std::string_view::npos &&
+            source.find("_startupStateItem.enabled=NO") ==
+                std::string_view::npos,
+        "CRD-02/06: actual Ready row opens Show in both states");
+  const auto chrome_item = Between(menu, "_chromeStateItem=[[NSMenuItem alloc]",
+                                   "[menu addItem:_chromeStateItem];");
+  Check(chrome_item.find("Chrome — Not ready") !=
+                std::string_view::npos &&
+            chrome_item.find("_chromeStateItem.target=self") !=
+                std::string_view::npos,
+        "MUI-02: Chrome has its own compact Ready/Not ready outward item");
+  const auto inspector_title = menu.find("@\"Show Inspector");
+  const auto inspector_end = inspector_title == std::string_view::npos
+      ? std::string_view::npos : menu.find("[menu addItem:", inspector_title);
+  const auto inspector_item = inspector_end == std::string_view::npos
+      ? std::string_view{} : menu.substr(inspector_title,
+                                         inspector_end - inspector_title);
+  Check(inspector_item.find("action:@selector(showInspector:)") !=
+                std::string_view::npos &&
+            inspector_item.find("target=self") != std::string_view::npos &&
+            inspector_item.find("action:nil") == std::string_view::npos,
+        "MUI-01: outward menu has a directly actionable Show Inspector item");
+  const auto inspector_show = Between(source,
+      "- (void)showInspector:(id)sender {", "- (void)");
+  Check(!inspector_show.empty() &&
+            inspector_show.find("InspectorVisible()") !=
+                std::string_view::npos &&
+            inspector_show.find("ToggleInspector()") !=
+                std::string_view::npos &&
+            inspector_show.find("RequestChromeAutomationPermission") ==
+                std::string_view::npos,
+        "MUI-01/04: direct Inspector action guards the toggle and does not request Chrome access");
+  Check(menu.find("initWithTitle:@\"Quit SeeThis\"") !=
+                std::string_view::npos &&
+            menu.find("action:@selector(quit:)") != std::string_view::npos,
+        "MUI-04: Quit SeeThis remains directly available in the menu");
+  for (const auto diagnostic : {"[menu addItem:_inputStateItem]",
+                                "[menu addItem:_screenStateItem]",
+                                "[menu addItem:_captureStateItem]",
+                                "[menu addItem:_deleteStateItem]",
+                                "[menu addItem:_settingsStateItem]",
+                                "[menu addItem:_guidanceItem]"}) {
+    Check(menu.find(diagnostic) == std::string_view::npos,
+          "CRD-01/06: long diagnostics are absent from the outward menu");
+  }
+
+  const auto refresh = Between(source, "- (void)refreshPermissionMenu {",
+                               "- (void)presentPermissionEntry:");
+  Check(!refresh.empty(), "native permission refresh is present");
+  const auto compact_refresh = Between(refresh, "- (void)refreshPermissionMenu {",
+                                       "if(!_entryDetails)return;");
+  Check(compact_refresh.find("_startupStateItem.title=") !=
+                std::string_view::npos &&
+            compact_refresh.find("_chromeStateItem.title=") !=
+                std::string_view::npos &&
+            compact_refresh.find("ChromeAutomationPreflight(") !=
+                std::string_view::npos,
+        "CRD-06/07: both compact items update before Show details exist");
+  Check(refresh.find("CGRequestListenEventAccess") == std::string_view::npos &&
+            refresh.find("RequestChromeAutomationPermission") ==
+                std::string_view::npos &&
+            refresh.find("RetryInputMonitoring(") == std::string_view::npos,
+        "CRD-05/07: reading compact status does not prompt or retry");
+  const auto details = refresh.substr(compact_refresh.size());
+  for (const auto heading : {"BASE PERMISSIONS", "KEYBOARD AND SHORTCUTS",
+                             "SETTINGS", "CHROME (OPTIONAL)", "THIS APP"}) {
+    Check(details.find(heading) != std::string_view::npos,
+          "CRD-03: expanded diagnostics remain in Show");
+  }
+  const auto show = Between(source, "- (void)showPermissionEntry:(id)sender {",
+                            "- (BOOL)applicationShouldHandleReopen:");
+  Check(show.find("PermissionEntryTrigger::kExplicitOpen") !=
+            std::string_view::npos &&
+            show.find("RetryInputMonitoring(") == std::string_view::npos &&
+            show.find("RequestChromeAutomationPermission") ==
+                std::string_view::npos,
+        "CRD-02/05: Show is explicit and does not recover automatically");
+}
+
 void Write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream output(path, std::ios::binary);
   output << bytes;
@@ -143,6 +260,38 @@ void CheckSettingsPreservation() {
             corrupt.ReferenceCapability(reference_id).empty() &&
             Read(corrupt_path) == corrupt_bytes,
         "corrupt settings stay preserved and expose no replacement capability");
+  using namespace seethis::core;
+  Check(supported.Visibility().permits_presentation() &&
+        newer.Visibility().state==GlobalVisibilityState::kUnavailable &&
+        unknown.Visibility().state==GlobalVisibilityState::kUnavailable &&
+        corrupt.Visibility().state==GlobalVisibilityState::kUnavailable,
+        "only a durably initialized valid settings document permits global presentation");
+  const auto uninitialized_path=temp.path/"uninitialized.json";
+  Write(uninitialized_path,StoredSettings(4,",\"visibility_initialized\":0,\"global_reference_visible\":0"));
+  SettingsStore uninitialized(uninitialized_path);
+  Check(uninitialized.Visibility().permits_presentation()&&
+        uninitialized.Visibility().initialized_this_session&&
+        uninitialized.ReferenceCapability(reference_id)==supported.ReferenceCapability(reference_id),
+        "valid uninitialized schema4 defaults Visible durably while retaining its secret");
+  const auto failed_path=temp.path/"failed-init.json";
+  SettingsStore failed(failed_path,[](SettingsPersistPoint p){return p!=SettingsPersistPoint::kBeforeRename;});
+  Check(failed.Visibility().state==GlobalVisibilityState::kUnavailable &&
+        !std::filesystem::exists(failed_path),
+        "pre-rename initialization failure cannot expose unconfirmed default Visible");
+  SettingsStore retry(failed_path);
+  Check(retry.Visibility().permits_presentation()&&retry.Visibility().initialized_this_session,
+        "normal retry durably initializes default Visible once");
+  const auto uncertain_path=temp.path/"uncertain-init.json";
+  SettingsStore uncertain(uncertain_path,[](SettingsPersistPoint p){return p!=SettingsPersistPoint::kDirectorySync;});
+  Check(uncertain.Visibility().state==GlobalVisibilityState::kUncertain&&
+        std::filesystem::exists(uncertain_path),"post-rename initialization is uncertain and hidden");
+  SettingsStore uncertain_restart(uncertain_path,[](SettingsPersistPoint p){return p!=SettingsPersistPoint::kDirectorySync;});
+  Check(uncertain_restart.Visibility().state==GlobalVisibilityState::kUncertain,
+        "restart must actually establish durability before exposing renamed initialization");
+  SettingsStore durable_restart(uncertain_path);
+  Check(durable_restart.Visibility().permits_presentation()&&
+        !durable_restart.Visibility().initialized_this_session,
+        "successful restart sync confirms existing initialized Visible without repeating migration");
   Check(newer.load_error().find(std::string(64, 'a')) == std::string::npos &&
             seethis::core::SettingsLoadStateName(newer.load_state()) ==
                 std::string_view("unsupported"),
@@ -224,11 +373,268 @@ void CheckReadinessLatch() {
         "cleared user-input cause permits one fresh recovered state");
 }
 
+void CheckCompactPermissionEntry() {
+  using seethis::platform::BasePermissionReady;
+  using seethis::platform::InputMonitoringPermissionState;
+  using seethis::platform::PermissionEntryShouldPresent;
+  using seethis::platform::PermissionEntryTrigger;
+  using seethis::platform::PermissionStartupStatus;
+  using seethis::platform::ScreenRecordingState;
+  using seethis::platform::ChromeCompactStatus;
+  using seethis::platform::ChromeCompactStatusLabel;
+
+  for (const auto input : {InputMonitoringPermissionState::kUnknown,
+                           InputMonitoringPermissionState::kDenied,
+                           InputMonitoringPermissionState::kGranted}) {
+    for (const auto screen : {ScreenRecordingState::kUnknown,
+                              ScreenRecordingState::kDenied,
+                              ScreenRecordingState::kReady}) {
+      const bool granted = input == InputMonitoringPermissionState::kGranted &&
+                           screen == ScreenRecordingState::kReady;
+      Check(BasePermissionReady(input, screen) == granted,
+            "CRD-04: only both granted required permissions are Ready");
+      Check(PermissionStartupStatus(input, screen) ==
+                (granted ? "SeeThis — Ready" : "SeeThis — Not ready"),
+            "CRD-04: compact label follows permission authorization");
+      Check(PermissionEntryShouldPresent(
+                PermissionEntryTrigger::kExplicitOpen, input, screen),
+            "CRD-02: explicit open reaches both compact states");
+      Check(!PermissionEntryShouldPresent(
+                PermissionEntryTrigger::kPermissionRefresh, input, screen),
+            "CRD-06: quiet polling never reopens a dismissed panel");
+      Check(PermissionEntryShouldPresent(
+                PermissionEntryTrigger::kLaunch, input, screen) == !granted,
+            "CRD-06: launch stays quiet only when required grants are ready");
+    }
+  }
+
+  for (const auto chrome : {ChromeCompactStatus::kUnchecked,
+                            ChromeCompactStatus::kNotRunning,
+                            ChromeCompactStatus::kAutomationUnavailable,
+                            ChromeCompactStatus::kAutomationAllowedPageUnchecked}) {
+    Check(BasePermissionReady(InputMonitoringPermissionState::kGranted,
+                              ScreenRecordingState::kReady) &&
+              PermissionStartupStatus(InputMonitoringPermissionState::kGranted,
+                                      ScreenRecordingState::kReady) ==
+                  "SeeThis — Ready" &&
+              ChromeCompactStatusLabel(chrome) == "Chrome — Not ready",
+          "MUI-02/03: optional unready Chrome state cannot revoke base readiness");
+  }
+  Check(ChromeCompactStatusLabel(ChromeCompactStatus::kUnchecked) ==
+                "Chrome — Not ready" &&
+            ChromeCompactStatusLabel(ChromeCompactStatus::kNotRunning) ==
+                "Chrome — Not ready" &&
+            ChromeCompactStatusLabel(
+                ChromeCompactStatus::kAutomationUnavailable) ==
+                "Chrome — Not ready" &&
+            ChromeCompactStatusLabel(
+                ChromeCompactStatus::kAutomationAllowedPageUnchecked) ==
+                "Chrome — Not ready",
+        "MUI-02: outward Chrome labels stay compact and cannot treat consent as page readiness");
+  Check(HasReadyChromeLabel<ChromeCompactStatus>(),
+        "MUI-02: verified existing Chrome capability has the exact Ready label");
+
+  // Authorization is independent of whether the input tap is operational.
+  // The expanded detail must continue to carry the exact fault and remedy.
+  for (const auto tap : {InputMonitorState::kTapCreationFailed,
+                         InputMonitorState::kPartialTap,
+                         InputMonitorState::kDisabled,
+                         InputMonitorState::kRestartRequired}) {
+    seethis::platform::PermissionReadinessState snapshot;
+    snapshot.input_monitor_permission.store(
+        InputMonitoringPermissionState::kGranted);
+    snapshot.screen_recording.store(ScreenRecordingState::kReady);
+    snapshot.input_monitor.store(tap);
+    snapshot.capture_shortcut.store(
+        seethis::platform::CaptureShortcutState::kInputUnavailable);
+    snapshot.delete_shortcut.store(
+        seethis::platform::DeleteShortcutState::kInputUnavailable);
+    Check(BasePermissionReady(InputMonitoringPermissionState::kGranted,
+                              ScreenRecordingState::kReady) &&
+              PermissionStartupStatus(snapshot.input_monitor_permission.load(),
+                                      snapshot.screen_recording.load()) ==
+                  "SeeThis — Ready" &&
+              !InputMonitorReady(snapshot.input_monitor.load()) &&
+              seethis::platform::InputMonitorStateName(
+                  snapshot.input_monitor.load()) != "granted" &&
+              !seethis::platform::InputMonitorGuidance(
+                  snapshot.input_monitor.load()).empty() &&
+              !seethis::platform::CaptureShortcutReady(
+                  snapshot.capture_shortcut.load()) &&
+              !seethis::platform::DeleteShortcutReady(
+                  snapshot.delete_shortcut.load()),
+          "CRD-04: tap faults do not change base permission grants");
+  }
+
+  using seethis::platform::CaptureShortcutReadiness;
+  using seethis::platform::CaptureShortcutState;
+  using seethis::platform::DeleteShortcutState;
+  for (const auto shortcut : {CaptureShortcutState::kSettingsUnavailable,
+                              CaptureShortcutState::kConflict,
+                              CaptureShortcutState::kRegistrationFailed,
+                              CaptureShortcutState::kInputUnavailable}) {
+    Check(!seethis::platform::CaptureShortcutReady(shortcut) &&
+              !seethis::platform::CaptureShortcutGuidance(shortcut).empty() &&
+              BasePermissionReady(InputMonitoringPermissionState::kGranted,
+                                  ScreenRecordingState::kReady),
+          "CRD-04: shortcut fault does not revoke grants");
+  }
+  Check(CaptureShortcutReadiness(false, false, false, true) ==
+            CaptureShortcutState::kSettingsUnavailable &&
+            CaptureShortcutReadiness(true, true, false, true) ==
+                CaptureShortcutState::kConflict &&
+            CaptureShortcutReadiness(true, false, false, true) ==
+                CaptureShortcutState::kRegistrationFailed &&
+            CaptureShortcutReadiness(true, false, true, false) ==
+                CaptureShortcutState::kInputUnavailable,
+        "capture shortcut faults remain distinct");
+  for (const auto shortcut : {DeleteShortcutState::kSettingsUnavailable,
+                              DeleteShortcutState::kConflict,
+                              DeleteShortcutState::kRegistrationFailed,
+                              DeleteShortcutState::kInputUnavailable}) {
+    Check(!seethis::platform::DeleteShortcutReady(shortcut) &&
+              !seethis::platform::DeleteShortcutGuidance(shortcut).empty() &&
+              BasePermissionReady(InputMonitoringPermissionState::kGranted,
+                                  ScreenRecordingState::kReady),
+          "delete shortcut fault has detail without changing grants");
+  }
+}
+
+void CheckPrefixReadinessIngress() {
+  using namespace seethis::platform;
+  CapturePrefixReadiness good;
+  good.running=good.settings_usable=good.registered=good.handler_ready=true;
+  good.monitor_ready=good.screen_ready=good.shortcut_ready=good.native_binding_matches=true;
+  good.configured_key=good.registered_key=0;
+  good.configured_modifiers=good.registered_modifiers=3;good.registration_generation=7;
+  for(unsigned fault=0;fault<14;++fault) {
+    auto unavailable=good;
+    switch(fault) {
+      case 0:unavailable.settings_usable=false;break;
+      case 1:unavailable.registered=false;break;
+      case 2:++unavailable.configured_key;break;
+      case 3:++unavailable.configured_modifiers;break;
+      case 4:unavailable.native_binding_matches=false;break;
+      case 5:unavailable.registration_generation=0;break;
+      case 6:unavailable.handler_ready=false;break;
+      case 7:unavailable.monitor_ready=false;break;
+      case 8:unavailable.screen_ready=false;break;
+      case 9:unavailable.shortcut_ready=false;break;
+      case 10:unavailable.conflict=true;break;
+      case 11:unavailable.secure_input=true;break;
+      case 12:unavailable.running=false;break;
+      case 13:++unavailable.registration_generation;break;
+    }
+    CapturePrefixIngress ingress;unsigned begins=0,confirms=0,cancels=0;
+    bool paint=true,hit=true;ViewportContinuity epoch;epoch.Observe(ViewportInput::kHealthy);
+    ingress.SetActions({[&]{++begins;hit=false;return true;},[&]{++confirms;hit=true;},
+      [&]{++cancels;paint=hit=false;},[&]{epoch.Observe(ViewportInput::kKeyboard);},{}});
+    // A generation mismatch is meaningful only after a prefix froze generation7.
+    if(fault!=13) {
+      Check(!ingress.ModifierEvent(unavailable,1,3,100)&&begins==0&&!ingress.pending(),
+          "actual prefix ingress refuses unavailable modifier before calling Begin");
+      ingress.Confirm(unavailable,101);
+      Check(confirms==0,"unavailable matching key cannot call prefix Confirm");
+      ingress.Released(0);
+    }
+    Check(ingress.ModifierEvent(good,1,3,200)&&begins==1&&paint&&!hit,
+        "healthy exact binding begins pending carry with paint kept and hit suspended");
+    const auto prior=epoch.epoch();
+    Check(!ingress.Readiness(unavailable)&&!ingress.pending()&&cancels==1&&
+        epoch.epoch()>prior&&!paint&&!hit,
+        "live readiness loss immediately cancels pending carry and retires presentation epoch without another event/deadline");
+    ingress.Confirm(good,201);
+    Check(confirms==0&&begins==1&&!paint,"readiness recovery cannot confirm or restore old carry");
+    ingress.Released(0);
+    Check(ingress.ModifierEvent(good,1,3,300)&&begins==2,"ready fresh modifier after actual release can start a new prefix");
+    ingress.Confirm(good,301);
+    Check(confirms==1&&!ingress.pending(),"ready exact fresh hotkey reaches confirmation after readiness loss");
+  }
+  {
+    CapturePrefixIngress ingress;unsigned cancels=0,retirements=0;
+    ingress.SetActions({[]{return true;},{},[&]{++cancels;},[&]{++retirements;},{}});
+    Check(ingress.ModifierEvent(good,1,3,100),"binding teardown fixture is pending");
+    ingress.LoseReadiness();
+    Check(!ingress.pending()&&cancels==1&&retirements==1,
+        "actual unregister/stop/config replacement ingress retires without waiting for input");
+  }
+  // Source binding proves the production caller uses this tested ingress BEFORE
+  // provisional preservation; this is not an OS event-delivery assertion.
+  const auto source=Read(std::filesystem::path(__FILE__).parent_path().parent_path()/"src/platform/mac/input_mac.mm");
+  const auto event=Between(source,"void HandleEvent(CGEventType type", "    ReconcileCaptureHold();");
+  Check(event.find("RefreshPrefixReadiness()")<event.find("prefix_ingress_.ModifierEvent")&&
+      event.find("ModifierEvent(PrefixReadinessSnapshot()")!=std::string_view::npos,
+      "production raw modifier ingress uses live readiness before tested Begin ordering");
+  const auto registration=Between(source,"void RegisterCaptureHotKey()", "void RegisterDeleteHotKey()");
+  Check(registration.find("RetirePrefixReadiness()")<registration.find("UnregisterEventHotKey"),
+      "production binding replacement retires carry before unregistering");
+  const auto watchdog=Between(source,"void RunWatchdog()", "    const auto requested_retry");
+  const auto stop=Between(source,"void Stop() override", "    interruption_state_.Clear();");
+  Check(watchdog.find("RefreshPrefixReadiness()")!=std::string_view::npos&&
+      stop.find("RetirePrefixReadiness()")!=std::string_view::npos,
+      "production watchdog and stop publish loss without another user input");
+  Check(source.find("prefix_ingress_.Confirm(self->PrefixReadinessSnapshot(),observed_ms)")!=std::string::npos,
+      "production existing hotkey confirms only through readiness-gated tested ingress");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc,char** argv) {
+  if(argc==2&&std::string_view(argv[1])=="--p4-component-only") {
+    using namespace seethis::platform;
+    CheckPrefixReadinessIngress();
+    CapturePrefixContinuity prefix;
+    Check(prefix.Modifiers(1,3,100)==CapturePrefixAction::kStarted&&prefix.PhysicalModifiersValid(1),
+        "legal partial multi-modifier prefix survives the production watchdog predicate");
+    Check(prefix.Modifiers(3,3,400)==CapturePrefixAction::kPending&&prefix.PhysicalModifiersValid(3)&&
+        prefix.Confirm(599)==CapturePrefixAction::kConfirmed,"stepwise modifiers confirm before first-edge deadline without extension");
+    prefix.Released(0);
+    Check(prefix.Modifiers(1,3,1000)==CapturePrefixAction::kStarted&&
+        prefix.Modifiers(3,3,1499)==CapturePrefixAction::kPending&&
+        prefix.Tick(1500)==CapturePrefixAction::kRetired,"500ms first-edge deadline cannot be extended by another modifier");
+    Check(prefix.Confirm(1501)==CapturePrefixAction::kNone,"late hotkey has no retired carry checkpoint");
+    prefix.Released(0);
+    Check(prefix.Modifiers(1,3,2000)==CapturePrefixAction::kStarted&&
+        prefix.Modifiers(0,3,2001)==CapturePrefixAction::kRetired,"abandoned prefix keyup retires");
+    prefix.Released(0);
+    Check(prefix.Modifiers(1,3,3000)==CapturePrefixAction::kStarted&&
+        prefix.Modifiers(5,3,3001)==CapturePrefixAction::kRetired,"extra modifier retires carry");
+    for(const auto cause:{"pointer","scroll","nonmatch","context","permission","monitor"}) {
+      (void)cause;prefix.Released(0);
+      Check(prefix.Modifiers(1,3,4000)==CapturePrefixAction::kStarted&&
+          prefix.Retire()==CapturePrefixAction::kRetired&&prefix.Confirm(4001)==CapturePrefixAction::kNone,
+          "production invalidating-event transition irreversibly rejects prefix carry");
+    }
+    ViewportContinuity continuity;
+    Check(!continuity.healthy(),"restart cannot inherit input health or lease");
+    continuity.Observe(ViewportInput::kHealthy);const auto initial=continuity.epoch();
+    continuity.Observe(ViewportInput::kPointer,true);continuity.Observe(ViewportInput::kKeyboard,true);
+    Check(continuity.healthy()&&continuity.epoch()==initial,"positively owned badge and note input preserve observed continuity");
+    for(const auto event:{ViewportInput::kScroll,ViewportInput::kScroll,ViewportInput::kPointer,ViewportInput::kKeyboard}) {
+      const auto before=continuity.epoch();continuity.Observe(event);
+      Check(continuity.epoch()>before,"scroll momentum unknown pointer and noncapture keyboard invalidate");
+    }
+    continuity.Observe(ViewportInput::kInterrupted);const auto retired=continuity.epoch();
+    Check(!continuity.healthy(),"tap interruption loses health");continuity.Observe(ViewportInput::kHealthy);
+    Check(continuity.epoch()==retired&&continuity.healthy(),"recovery changes health without restoring capture epoch");
+    for(bool modifier_first:{false,true}) {
+      CaptureReleaseContinuity release;release.Begin(3);
+      ViewportContinuity epoch;epoch.Observe(ViewportInput::kHealthy);const auto began=epoch.epoch();
+      const auto observe=[&](bool key,bool up,bool flags,std::uint64_t modifiers) {
+        if(!release.Observe(key,up,flags,modifiers))epoch.Observe(ViewportInput::kKeyboard);
+      };
+      if(modifier_first) {observe(false,false,true,2);observe(false,false,true,0);observe(true,true,false,0);}
+      else {observe(true,true,false,3);observe(false,false,true,2);observe(false,false,true,0);}
+      Check(epoch.epoch()==began,"both physical release orders including idle trailing modifier preserve capture epoch");
+      observe(false,false,false,0);
+      Check(epoch.epoch()!=began,"later unrelated key still retires continuity");
+    }
+    std::cout<<checks<<" P4 continuity pure component checks passed\n";return 0;
+  }
   try {
     CheckReadinessLatch();
+    CheckCompactPermissionEntry();
+    CheckNativeCompactMenu();
     Check(ClassifyInputMonitor({}) == InputMonitorState::kDenied,
           "missing listen authorization is denied");
     Check(ClassifyInputMonitor({.listen_authorized = true}) ==
@@ -281,54 +687,7 @@ int main() {
     Check(!InputMonitorReady(InputMonitorState::kPartialTap) &&
               !InputMonitorReady(InputMonitorState::kRestartRequired),
           "non-null and restart-required states never imply readiness");
-    Check(seethis::platform::PermissionStartupStatus(
-              InputMonitorState::kGranted,
-              seethis::platform::ScreenRecordingState::kReady) == "SeeThis",
-          "ready startup keeps the menu-bar label unobtrusive");
-    Check(seethis::platform::PermissionStartupStatus(
-              InputMonitorState::kPartialTap,
-              seethis::platform::ScreenRecordingState::kReady)
-                  .find("Input Monitoring not ready") != std::string_view::npos,
-          "input-only blocked startup is discoverable before opening the menu");
-    Check(seethis::platform::PermissionStartupStatus(
-              InputMonitorState::kGranted,
-              seethis::platform::ScreenRecordingState::kDenied)
-                  .find("Screen Recording not ready") != std::string_view::npos,
-          "screen-only blocked startup is discoverable before opening the menu");
-    Check(seethis::platform::PermissionStartupStatus(
-              InputMonitorState::kDenied,
-              seethis::platform::ScreenRecordingState::kDenied)
-                  .find("permissions not ready") != std::string_view::npos,
-          "both blocked permissions are discoverable before opening the menu");
-    using seethis::platform::PermissionEntryShouldPresent;
-    using seethis::platform::PermissionEntryTrigger;
     using seethis::platform::ScreenRecordingState;
-    for(const auto input : {InputMonitorState::kUnknown,InputMonitorState::kDenied,
-        InputMonitorState::kTapCreationFailed,InputMonitorState::kPartialTap,
-        InputMonitorState::kDisabled,InputMonitorState::kRestartRequired,
-        InputMonitorState::kGranted,InputMonitorState::kRecovered}) {
-      for(const auto screen : {ScreenRecordingState::kUnknown,
-          ScreenRecordingState::kDenied,ScreenRecordingState::kReady}) {
-        Check(!PermissionEntryShouldPresent(
-            PermissionEntryTrigger::kPermissionRefresh,input,screen),
-            "permission polling never reopens a dismissed entry window");
-        Check(PermissionEntryShouldPresent(
-            PermissionEntryTrigger::kExplicitOpen,input,screen),
-            "Finder reopen can reach the entry regardless of permission state");
-      }
-    }
-    Check(!PermissionEntryShouldPresent(PermissionEntryTrigger::kLaunch,
-              InputMonitorState::kGranted,ScreenRecordingState::kReady) &&
-          !PermissionEntryShouldPresent(PermissionEntryTrigger::kLaunch,
-              InputMonitorState::kRecovered,ScreenRecordingState::kReady),
-          "ready startup preserves quiet behavior");
-    Check(PermissionEntryShouldPresent(PermissionEntryTrigger::kLaunch,
-              InputMonitorState::kUnknown,ScreenRecordingState::kUnknown) &&
-          PermissionEntryShouldPresent(PermissionEntryTrigger::kLaunch,
-              InputMonitorState::kPartialTap,ScreenRecordingState::kReady) &&
-          PermissionEntryShouldPresent(PermissionEntryTrigger::kLaunch,
-              InputMonitorState::kGranted,ScreenRecordingState::kDenied),
-          "first launch offers guidance for unknown or blocked permissions");
     Check(seethis::platform::InputMonitorStateName(
               InputMonitorState::kRestartRequired) == "restart_required" &&
               seethis::platform::InputMonitorGuidance(
