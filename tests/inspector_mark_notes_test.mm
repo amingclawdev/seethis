@@ -20,6 +20,143 @@ static void Check(bool condition,const char* message) {
   if(!condition)throw std::runtime_error(message);
 }
 
+// This focused fixture runs the real editor and NSTextView without ordering a
+// window, changing the active app, posting input or touching any pasteboard.
+@interface STUnshownNotePanel : STMarkNotePanel
+@end
+@implementation STUnshownNotePanel
+- (void)makeKeyAndOrderFront:(id)sender {(void)sender;}
+- (BOOL)makeFirstResponder:(NSResponder*)responder {(void)responder;return YES;}
+- (void)orderOut:(id)sender {(void)sender;}
+@end
+
+static void CheckCloseCommitBoundary() {
+  using Key=std::pair<std::string,std::string>;
+  const Key first{"reference", "shot-one-mark"}, second{"reference", "shot-two-mark"};
+  std::map<Key,std::string> saved{{first,"Published"},{second,"Second shot"}};
+  std::vector<Key> writes;
+  std::vector<std::string> copied;
+  std::uint64_t revision=0;
+  STNoteSaveStatus result=STNoteSaveStatus::kUpdated;
+  std::function<void()> duringSave;
+  STMarkNoteEditor* editor=[[STMarkNoteEditor alloc] initWithRead:
+      [&](std::string_view ref,std::string_view mark)->STNoteReadResult {
+        return {STNoteReadStatus::kReady,saved.at({std::string(ref),std::string(mark)}),revision};
+      } save:[&](std::string_view ref,std::string_view mark,std::string_view text,
+                 std::uint64_t expected)->STNoteSaveResult {
+        const Key owner{std::string(ref),std::string(mark)};writes.push_back(owner);
+        if(duringSave)duringSave();
+        if(expected!=revision)return {STNoteSaveStatus::kConflict,revision};
+        if(result==STNoteSaveStatus::kUpdated) {saved[owner]=text;++revision;}
+        return {result,revision};
+      } copy:[&](std::string_view ref)->STNoteCopyStatus {
+        copied.emplace_back(ref);return STNoteCopyStatus::kCopied;
+      }];
+  STUnshownNotePanel* quiet=[[STUnshownNotePanel alloc]
+      initWithContentRect:NSMakeRect(0,0,340,224)
+      styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskNonactivatingPanel
+      backing:NSBackingStoreBuffered defer:NO];
+  quiet.releasedWhenClosed=NO;quiet.contentView=editor.panel.contentView;
+  quiet.noteTextView=editor.textView;
+  [editor setValue:quiet forKey:@"panel"];
+  NSButton* close=[quiet standardWindowButton:NSWindowCloseButton];
+  close.target=editor;close.action=@selector(complete:);
+  const auto open=[&](const Key& owner) {
+    [editor toggleReference:owner.first mark:owner.second number:owner==first?1:2 screenPoint:NSZeroPoint];
+    Check(!editor.panel.isVisible,"focused fixture never presents a native window");
+  };
+  const auto type=[&](NSString* value) {
+    editor.textView.string=value;
+    [editor textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:editor.textView]];
+  };
+  open(first);type(@"Intermediate");
+  [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.45]];
+  Check(writes.empty() && !editor.saveTimer && saved[first]=="Published",
+        "pause beyond the old debounce interval cannot publish the intermediate note");
+  [editor.textView setMarkedText:@"组合" selectedRange:NSMakeRange(2,0) replacementRange:NSMakeRange(0,0)];
+  Check(editor.textView.hasMarkedText && ![editor flushForAppend:first.first],
+        "active IME composition is not committed by append");
+  [editor saveNow];[editor retrySave:nil];
+  Check(writes.empty() && editor.textView.hasMarkedText,"observation and unsolicited retry preserve uncommitted IME");
+  [editor.textView unmarkText];type(@"Final 世界 📝");
+  NSTimer* legacy=[NSTimer timerWithTimeInterval:1 repeats:NO block:^(NSTimer*){}];
+  [editor autosaveTimer:legacy generation:editor.presentationGeneration];
+  [editor saveNow];[editor retrySave:nil];
+  Check(![editor saveDraft:YES] && !legacy.valid && writes.empty(),
+        "legacy timers and direct save requests cannot bypass the close boundary");
+  const auto generation=editor.presentationGeneration;
+  [editor dismissOutsideForGeneration:generation];
+  Check([editor flushForAppend:first.first] && [editor flushForAppend:"other"] && writes.empty(),
+        "outside observations and append retain the exact draft without publishing");
+  [editor hide];
+  Check(!editor.presentationOpen && writes.empty(),"temporary retirement is not a committed close");
+  open(first);
+  Check([editor.textView.string isEqualToString:@"Final 世界 📝"] && editor.retryButton.hidden && writes.empty(),
+        "reopening restores the in-memory draft without inventing a save failure");
+  open(first);
+  Check(!editor.presentationOpen && writes==std::vector<Key>{first} &&
+        saved[first]=="Final 世界 📝" && copied==std::vector<std::string>{first.first},
+        "number completion commits only the final text to its exact owner before copying");
+  open(first);type(@"Abandoned intermediate");type(@"Final 世界 📝");
+  Check(writes.size()==1,"edit then revert is still unpublished while editing");
+  [close performClick:nil];
+  Check(!editor.presentationOpen && writes.size()==2 && saved[first]=="Final 世界 📝",
+        "X completion submits the final unchanged content; store no-op history is tested separately");
+  open(first);type(@"New first final");
+  const auto copyCount=copied.size();open(second);
+  Check(editor.presentationOpen && editor.markID==second.second && writes.back()==first &&
+        saved[first]=="New first final" && copied.size()==copyCount,
+        "switching notes closes and saves the previous exact owner without copying");
+  type(@"Second final");const auto beforeAppend=writes.size();
+  Check([editor flushForAppend:first.first] && writes.size()==beforeAppend && saved[second]=="Second shot",
+        "multi-shot editor retains the old saved note until its own close");
+  // Append changes the aggregate revision. Preserve optimistic conflict
+  // handling instead of silently overwriting an externally changed note.
+  ++revision;[editor complete:nil];
+  Check(editor.presentationOpen && !editor.retryButton.hidden && copied.size()==copyCount &&
+        saved[second]=="Second shot","append revision conflict remains explicit and cannot report completion");
+  [editor retrySave:nil];
+  Check(!editor.presentationOpen && saved[second]=="Second final" && copied.size()==copyCount+1,
+        "explicit retry closes the same second-shot owner with its retained final text");
+  open(first);type(@"Local hidden draft");[editor hide];
+  saved[first]="External change while hidden";++revision;open(first);
+  const auto beforeHiddenClose=copied.size();[editor complete:nil];
+  Check(editor.presentationOpen && copied.size()==beforeHiddenClose &&
+        saved[first]=="External change while hidden" &&
+        [editor.statusLabel.stringValue containsString:@"Changed elsewhere"],
+        "retained draft keeps its base revision and cannot silently overwrite an edit made while hidden");
+  [editor retrySave:nil];
+  Check(!editor.presentationOpen && saved[first]=="Local hidden draft" && copied.size()==beforeHiddenClose+1,
+        "only explicit conflict retry replaces the external edit with the retained final draft");
+  for(const auto failure:{STNoteSaveStatus::kFailed,STNoteSaveStatus::kUnavailable,
+                         STNoteSaveStatus::kConflict,STNoteSaveStatus::kCommitUncertain}) {
+    open(first);type(@"Failed close draft");result=failure;
+    const auto prior=saved[first];const auto copiesBefore=copied.size();
+    [editor complete:nil];
+    Check(editor.presentationOpen && !editor.retryButton.hidden && saved[first]==prior &&
+          copied.size()==copiesBefore,"unsuccessful close retains the owner and cannot copy or claim completion");
+    const auto attempts=writes.size();type(@"Changed after failure");result=STNoteSaveStatus::kUpdated;
+    [editor retrySave:nil];[editor saveNow];
+    Check(writes.size()==attempts && editor.presentationOpen,"typing cancels old close intent; retry cannot publish new editing text");
+    [editor complete:nil];
+    Check(!editor.presentationOpen && saved[first]=="Changed after failure","renewed explicit close saves the new final draft");
+  }
+  open(first);type(@"Switch final");result=STNoteSaveStatus::kFailed;open(second);
+  Check(editor.markID==first.second && editor.presentationOpen,"failed switch retains original owner");
+  result=STNoteSaveStatus::kUpdated;const auto switchCopies=copied.size();[editor retrySave:nil];
+  Check(!editor.presentationOpen && saved[first]=="Switch final" && copied.size()==switchCopies,
+        "switch-close retry ends the original edit without adding a clipboard effect");
+  open(first);type(@"Submitted final");duringSave=[&]{type(@"New concurrent draft");};
+  const auto beforeReentrant=copied.size();[editor complete:nil];duringSave={};
+  Check(editor.presentationOpen && copied.size()==beforeReentrant &&
+        [editor.textView.string isEqualToString:@"New concurrent draft"],
+        "a stale save receipt cannot close a newer edit or copy its reference");
+  const auto beforeDiscard=writes.size();[editor discardOwner];open(first);
+  Check([editor.textView.string isEqualToString:@"Submitted final"] && writes.size()==beforeDiscard,
+        "discard removes unpublished draft without recreating it or writing a history event");
+  [editor hide];
+}
+
 // Component-only command target. Plain selected strings use a private named
 // board; native delete/insert retain text editing and undo bookkeeping.
 // These overrides never call super's clipboard actions.
@@ -155,7 +292,7 @@ static void CheckNativeEditingWithoutClipboard() {
     Check([editor.textView.string isEqualToString:@"Alpha 世界 📝 Beta追加"],
           "native redo restores the exact Unicode insertion");
     SendNoteKey(editor,@"z");[editor saveNow];
-    Check(notes["no-clipboard"]=="Alpha 世界 📝 Beta","undo saves the correct owner's restored text");
+    Check(notes["no-clipboard"]=="Alpha 世界 📝 Beta","undo keeps the saved text unchanged until close");
     [editor toggleReference:"other-owner" mark:"one" number:1 screenPoint:NSMakePoint(400,400)];
     SendNoteKey(editor,@"z");
     Check([editor.textView.string isEqualToString:@"Other owner"] && !editor.textView.undoManager.canUndo,
@@ -218,8 +355,8 @@ static void CheckNativeEditingOnNamedBoard() {
           "CmdC keeps native selection and does not save");
     clipboard.copied([&]{SendNoteKey(editor,@"x");},@"世界 📝");
     Check([editor.textView.string isEqualToString:@"Alpha  Beta"] &&
-          editor.textView.selectedRange.location==selection.location && editor.saveTimer.valid,
-          "CmdX cuts selected Unicode and notifies autosave");
+          editor.textView.selectedRange.location==selection.location && !editor.saveTimer && writes.empty(),
+          "CmdX cuts selected Unicode without publishing a draft");
     [editor.textView breakUndoCoalescing];
     SendNoteKey(editor,@"z");
     Check([editor.textView.string isEqualToString:@"Alpha 世界 📝 Beta"],
@@ -250,9 +387,10 @@ static void CheckNativeEditingOnNamedBoard() {
     [editor.textView unmarkText];
     [editor.textView breakUndoCoalescing];
     [editor saveNow];
-    Check(!writes.empty() && writes.back().first=="A" && writes.back().second==notes["A"],
-          "native mutations save to the original reference");
+    Check(writes.empty(),"native mutations remain drafts until the edit is closed");
     [editor toggleReference:"B" mark:"one" number:1 screenPoint:NSMakePoint(400,400)];
+    Check(writes.size()==1 && writes.back().first=="A" && writes.back().second==notes["A"],
+          "switching note commits the previous owner's final text once");
     SendNoteKey(editor,@"z");
     Check([editor.textView.string isEqualToString:@"Other owner"] && !editor.textView.undoManager.canUndo,
           "switching references with the same number isolates native undo history");
@@ -399,7 +537,7 @@ static void CheckPersistentCompletion() {
   [editor.panel cancelOperation:nil];Check(editor.presentationOpen && copies()==0,"marked-text Escape cannot complete note");
   [editor.textView unmarkText];type(@"Draft 世界 📝");
   NSTimer* stale=editor.saveTimer;[editor saveNow];
-  Check(copies()==0 && notes[{"A","one"}]=="Draft 世界 📝","typing/autosave only saves immutable owner");
+  Check(calls.empty() && notes[{"A","one"}].empty(),"typing and legacy saveNow never publish an intermediate draft");
   calls.clear();open("A");
   Check(!editor.presentationOpen && calls==std::vector<std::string>{"save:A/one:Draft 世界 📝","copy:A"},
         "same exact pair confirms durable save then original ID copy then closes");
@@ -414,8 +552,8 @@ static void CheckPersistentCompletion() {
     Check(editor.referenceID=="A" && calls.size()==before+1 && copies()==0,
           "different reference with ordinal one cannot abandon failed A or copy");
     saveStatus=STNoteSaveStatus::kUpdated;[editor retrySave:nil];
-    Check(editor.presentationOpen && copies()==0,"failed switch cancels older finish intent so save retry cannot copy");
-    open("A");
+    Check(!editor.presentationOpen && copies()==0,"failed switch retry closes its original owner without copy");
+    open("A");open("A");
     Check(!editor.presentationOpen && calls.back()=="copy:A","renewed explicit same-pair completion saves then copies original A");
   }
   for(const auto status:{STNoteCopyStatus::kFailed,STNoteCopyStatus::kUnavailable}) {
@@ -461,7 +599,7 @@ static void CheckPersistentCompletion() {
   }];
   calls.clear();[editor complete:nil];
   Check(validations==2 && copies()==0 && calls.size()==1 && notes[{"A","one"}]=="Draft 世界 📝" &&
-        editor.presentationOpen && [editor.textView.string isEqualToString:@"New unsaved draft"] && editor.saveTimer.valid,
+        editor.presentationOpen && [editor.textView.string isEqualToString:@"New unsaved draft"] && !editor.saveTimer,
         "pre-copy validation edit invalidates saved draft receipt before any clipboard effect");
   [editor setOwnerValidation:STNoteOwnerValid{}];
   type(@"Draft 世界 📝");duringCopy=[&]{[editor hide];open("B");};calls.clear();[editor complete:nil];duringCopy={};
@@ -603,6 +741,10 @@ int main(int argc,char** argv) {
 
   @autoreleasepool {
     [NSApplication sharedApplication];
+    if(argc==2&&std::string_view(argv[1])=="--note-close-only") {
+      CheckCloseCommitBoundary();
+      std::cout<<"Note close boundary component checks passed: "<<checks<<" checks\n";return 0;
+    }
     if(std::getenv("SEETHIS_NOTE_KEYBOARD_ONLY")) {
       [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
       Check(NSApp.mainMenu==nil,"editing fixture models the accessory app without an Edit main menu");

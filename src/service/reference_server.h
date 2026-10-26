@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,10 +27,12 @@ class ReferenceServer {
  public:
   static constexpr std::size_t kMaximumClipboardTextBytes = 2048;
 
+  using AgentReader = std::function<std::string(std::string_view,std::string_view)>;
   ReferenceServer(core::ReferenceStore& references,
                   core::SettingsStore& settings,
                   std::filesystem::path settings_web_root,
-                  std::shared_ptr<platform::PermissionReadinessState> readiness);
+                  std::shared_ptr<platform::PermissionReadinessState> readiness,
+                  AgentReader agent_reader = {});
   ~ReferenceServer();
 
   ReferenceServer(const ReferenceServer&) = delete;
@@ -47,6 +50,7 @@ class ReferenceServer {
   [[nodiscard]] std::string ClipboardText(
       const core::StoredReference& reference) const;
   [[nodiscard]] std::string ClipboardText(std::string_view id) const;
+  [[nodiscard]] std::string RunsUrl(std::string_view id = {}) const;
   [[nodiscard]] std::string ViewerUrl(std::string_view id) const;
 
  private:
@@ -58,6 +62,8 @@ class ReferenceServer {
   std::filesystem::path settings_web_root_;
   std::shared_ptr<platform::PermissionReadinessState> readiness_;
   std::string settings_capability_;
+  std::string runs_capability_;
+  AgentReader agent_reader_;
   std::atomic<bool> stopping_{false};
   int listener_ = -1;
   std::uint16_t port_ = 0;

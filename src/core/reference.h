@@ -320,6 +320,8 @@ struct MarkSnapshot {
   std::uint64_t revision = 0;
   std::string shot_id;
   std::size_t local_slot = 0;
+  // Last recorded content edit, not the current global notes revision.
+  std::optional<std::uint64_t> note_revision;
 };
 struct MarkNotesSnapshot {
   MarkNotesStatus status = MarkNotesStatus::kNotFound;
@@ -340,13 +342,34 @@ struct ReferenceShot {
   std::size_t first_mark_slot = 0;
   std::shared_ptr<const Reference> metadata;
 };
+struct NoteRevision {
+  std::uint64_t revision = 0;
+  std::size_t slot = 0;
+  std::int64_t edited_utc_us = 0;
+  std::string before, after;
+};
 struct ReferenceCollection {
   MarkNotesStatus status = MarkNotesStatus::kNotFound;
   std::uint64_t revision = 1, notes_revision = 0;
   std::vector<ReferenceShot> shots;
   std::vector<std::string> notes;
   std::vector<bool> visible;
+  std::vector<NoteRevision> note_history;
   [[nodiscard]] bool multi() const { return shots.size() > 1; }
+  [[nodiscard]] std::optional<std::uint64_t> NoteVersion(std::size_t slot) const {
+    for(auto it=note_history.rbegin();it!=note_history.rend();++it)
+      if(it->slot==slot)return it->revision;
+    // No edit at the initial revision; older unrecorded edits remain unknown.
+    return notes_revision==0?std::optional<std::uint64_t>(0):std::nullopt;
+  }
+};
+struct NoteDelivery {
+  std::uint64_t notes_revision = 0;
+  std::int64_t delivered_utc_us = 0;
+};
+struct NoteDeliveryLog {
+  bool available = false;
+  std::vector<NoteDelivery> records;
 };
 enum class AppendStatus { kCommitted, kIdempotent, kStale, kUnavailable, kCancelled,
   kInvalid, kBusy, kIOError, kCommitUncertain };
@@ -396,6 +419,11 @@ class ReferenceStore {
   // The index is the stored drawing order, never a filtered presentation index.
   [[nodiscard]] ReadyAssetResult RequestReadyMark(std::string_view id,
                                                    std::size_t region_index);
+  static constexpr std::size_t kMaximumNoteDeliveries = 256;
+  [[nodiscard]] NoteDeliveryLog NoteDeliveries(std::string_view id) const;
+  // Best-effort observation after sending JSON. Saturation/IO never gates delivery.
+  void RecordNoteDelivery(std::string_view id, std::uint64_t revision,
+                          std::int64_t delivered_utc_us) noexcept;
   [[nodiscard]] MarkNotesSnapshot MarkSnapshots(std::string_view id) const;
   [[nodiscard]] MarkNoteUpdateResult UpdateMarkNote(
       std::string_view id, std::string_view mark_id, std::string note,

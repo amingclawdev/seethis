@@ -2657,6 +2657,64 @@ void ChromePageVisibility() {
   observation.generation=accepted_generation+12; observation.observed=future; marks.SetPageObservation(observation);
   Check(marks.marks().empty(), "future Chrome page observation fails closed");
 }
+void NoteDeliveryLifecycle() {
+  TempDirectory temp;const auto mark=StableMarkId(idA,0);
+  Bytes saturated;
+  {
+    ReferenceStore store(temp.path);MarkController marks(store,[](const auto&){return true;});Commit(store,marks);
+    Check(store.MarkSnapshots(idA).marks[0].note_revision==0,"initial note version zero");
+    Check(store.NoteDeliveries(idA).available&&store.NoteDeliveries(idA).records.empty(),"new reference has no invented delivery history");
+    for(std::size_t i=0;i<ReferenceStore::kMaximumNoteDeliveries;++i)
+      store.RecordNoteDelivery(idA,0,1000000+i);
+    saturated=FileBytes(temp.path/(std::string(idA)+".deliveries"));
+    store.RecordNoteDelivery(idA,99,9999999);
+    Check(saturated==FileBytes(temp.path/(std::string(idA)+".deliveries")),"saturated delivery log never rotates or rewrites");
+    Check(store.UpdateMarkNote(idA,mark,"after log full",0).status==MarkNoteUpdateStatus::kUpdated,"full delivery log does not prevent note edits");
+    Check(store.MarkSnapshots(idA).marks[0].note_revision==1,"note edit uses shared revision");
+    Check(store.UpdateMarkVisibility(idA,mark,false,1).revision==2&&store.MarkSnapshots(idA).marks[0].note_revision==1,"visibility revision does not change note edit revision");
+  }
+  {
+    ReferenceStore store(temp.path);const auto log=store.NoteDeliveries(idA);
+    Check(log.available&&log.records.size()==256&&log.records.front().delivered_utc_us==1000000&&log.records.back().delivered_utc_us==1000255,"all delivery observations survive restart at fixed capacity");
+    Check(store.MarkSnapshots(idA).marks[0].note_revision==1,"last note version survives restart");
+    const auto path=temp.path/(std::string(idA)+".deliveries");
+    {std::ofstream out(path,std::ios::trunc);out<<"corrupt";}
+    store.RecordNoteDelivery(idA,3,99999999);
+    Check(!store.NoteDeliveries(idA).available&&FileBytes(path)==Bytes({'c','o','r','r','u','p','t'}),"corrupt recording is unavailable and not overwritten");
+    Check(store.Delete(idA)==DeleteResult::kDeleted&&!std::filesystem::exists(path),"reference deletion cleans only its owned delivery log");
+  }
+}
+
+void NoteHistoryLifecycle() {
+  TempDirectory temp;const auto mark=StableMarkId(idA,0);
+  {
+    ReferenceStore store(temp.path);MarkController marks(store,[](const auto&){return true;});Commit(store,marks);
+    const auto edited=Now();ReferenceStoreTestHooks hooks;hooks.now=[edited](){return edited;};store.SetTestHooks(hooks);
+    Check(store.UpdateMarkNote(idA,mark,"first",0).status==MarkNoteUpdateStatus::kUpdated,"history first saved");
+    Check(store.UpdateMarkNote(idA,mark,"first",1).revision==1&&store.Collection(idA).note_history.size()==1,"identical save does not invent revision");
+    Check(store.UpdateMarkNote(idA,mark,"second",1).revision==2,"second note saved");
+    Check(store.UpdateMarkNote(idA,mark,"",2).revision==3,"clear saved");
+    const auto events=store.Collection(idA).note_history;
+    Check(events.size()==3&&events[0].before.empty()&&events[0].after=="first"&&events[1].before=="first"&&events[1].after=="second"&&events[2].before=="second"&&events[2].after.empty(),"ordered immutable edits and clear");
+    Check(events[0].edited_utc_us==edited.utc_us&&events[0].slot==0&&events[2].revision==3,"history time and stable mark slot");
+    store.SetTestHooks({});
+    AppendResult result;store.AppendAsync(idA,mark,1,idB,PendingReference(idA),Capture(),[&](auto r){result=r;});store.WaitForIdleForTesting();
+    Check(result.status==AppendStatus::kCommitted&&store.Collection(idA).note_history.size()==3,"append carries single-image history atomically");
+    Check(store.MarkSnapshots(idA).marks[0].note_revision==3,"append preserves prior last note edit revision");
+    Check(store.UpdateMarkNote(idA,StableMarkId(idA,1),"shot two",4).revision==5,"second-shot note recorded");
+    Check(store.UpdateMarkVisibility(idA,mark,false,5).revision==6&&store.Collection(idA).note_history.size()==4,"visibility changes preserve note history without adding an edit");
+    hooks={};hooks.fail_note_after_rename=true;store.SetTestHooks(hooks);
+    Check(store.UpdateMarkNote(idA,mark,"uncertain",6).status==MarkNoteUpdateStatus::kCommitUncertain,"history uncertain publication reported truthfully");
+    store.SetTestHooks({});
+    Check(store.UpdateMarkNote(idA,mark,"uncertain",7).revision==7&&store.Collection(idA).note_history.size()==5,"uncertain retry preserves exact history");
+  }
+  {
+    ReferenceStore store(temp.path);const auto collection=store.Collection(idA);
+    Check(collection.shots.size()==2&&collection.note_history.size()==5&&collection.note_history[3].slot==1&&collection.notes[0]=="uncertain","restart retains current text and all history across shots");
+    Check(store.Delete(idA)==DeleteResult::kDeleted&&store.Collection(idA).note_history.empty(),"deleted reference does not expose note history");
+  }
+}
+
 void NumberedNotesLifecycle() {
   TempDirectory temp;
   const std::string id(32,'8');
@@ -2695,7 +2753,7 @@ void NumberedNotesLifecycle() {
           "notes leave immutable reference and source bytes untouched");
     // A v1 notes sidecar has no per-mark identity or visibility byte.
     auto legacy=FileBytes(temp.path/(id+".notes"));
-    legacy.resize(legacy.size()-mark_id.size()-1);
+    legacy.resize(std::string("seethis-mark-notes\n").size()+4+32+64+8+4+4+std::string("Review this\nsoon").size());
     legacy[std::string("seethis-mark-notes\n").size()]=1;
     {std::ofstream out(temp.path/(id+".notes"),std::ios::binary|std::ios::trunc);
       out.write(reinterpret_cast<const char*>(legacy.data()),legacy.size());}
@@ -2719,11 +2777,11 @@ void NumberedNotesLifecycle() {
     store.SetTestHooks({});
     const auto retried=store.UpdateMarkNote(id,mark_id,"Needs follow-up",2);
     Check(retried.status==MarkNoteUpdateStatus::kUpdated&&
-              retried.revision==3&&store.MarkSnapshots(id).revision==3,
-          "retrying the same note after uncertainty performs a durable write");
+              retried.revision==2&&store.MarkSnapshots(id).revision==2,
+          "same-content retry re-publishes durably without inventing a note revision");
     const auto path=temp.path/(id+".notes");
     auto bytes=FileBytes(path);
-    bytes[std::string("seethis-mark-notes\n").size()]=3;
+    bytes[std::string("seethis-mark-notes\n").size()]=99;
     {std::ofstream out(path,std::ios::binary|std::ios::trunc);
       out.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());}
     Check(store.MarkSnapshots(id).status==MarkNotesStatus::kUnsupported&&
@@ -4130,6 +4188,8 @@ void RejectedPrivateObservationCoordinates() {
 }
 int main(int argc,char** argv) {
   try {
+    NoteDeliveryLifecycle();NoteHistoryLifecycle();
+    if(argc==2&&std::string_view(argv[1])=="--note-history-only"){std::cout<<checks<<" note history checks passed\n";return 0;}
     if(argc==2&&std::string_view(argv[1])=="--own-source-component-only"){OwnUIPresentationContinuity();return 0;}
     RejectedPrivateObservationCoordinates();
     if(argc==2&&std::string_view(argv[1])=="--rejected-private-component-only")return 0;

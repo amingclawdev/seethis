@@ -229,6 +229,7 @@ static NSURL* STFeedbackMailURL() {
 @property(nonatomic,strong) STInspectorFeedbackView* feedbackView;
 @property(nonatomic,strong) NSView<STInspectorHeaderLayout>* chromeView;
 @property(nonatomic,strong) STInspectorReferenceSelector* referenceSelector;
+@property(nonatomic,strong) NSButton* runsButton;
 @property(nonatomic,strong) NSScrollView* referenceScrollView;
 @property(nonatomic,strong) NSButton* markVisibilityButton;
 @property(nonatomic,strong) NSButton* deleteAllButton;
@@ -264,6 +265,7 @@ static NSURL* STFeedbackMailURL() {
     const CGFloat deleteWidth=ceil(self.deleteAllButton.fittingSize.width)+12;
     const CGFloat visibilityWidth=ceil(self.markVisibilityButton.fittingSize.width)+12;
     const CGFloat trailing=width-16;
+    self.runsButton.frame=NSMakeRect(16,header+7,MAX(80,trailing-deleteWidth-visibilityWidth-40),34);
     self.deleteAllButton.frame=NSMakeRect(trailing-deleteWidth,header+7,deleteWidth,34);
     self.markVisibilityButton.frame=NSMakeRect(trailing-deleteWidth-8-visibilityWidth,
         header+7,visibilityWidth,34);
@@ -607,6 +609,7 @@ using STNoteSave = std::function<STNoteSaveResult(
   STNoteCopy _copy;
   STNoteOwnerValid _ownerValid;
   bool _completionRequested;
+  bool _saveOnlyCloseRequested;
   bool _saving;
   std::uint64_t _draftGeneration;
   std::string _referenceID;
@@ -616,7 +619,8 @@ using STNoteSave = std::function<STNoteSaveResult(
   bool _dirty;
   bool _presentationOpen;
   std::uint64_t _presentationGeneration;
-  std::unordered_map<std::string,std::string> _unsavedDrafts;
+  struct RetainedDraft {std::string text;std::uint64_t revision;};
+  std::unordered_map<std::string,RetainedDraft> _unsavedDrafts;
 }
 @property(nonatomic,strong,readonly) STMarkNotePanel* panel;
 @property(nonatomic,strong,readonly) NSTextView* textView;
@@ -740,8 +744,8 @@ using STNoteSave = std::function<STNoteSaveResult(
   if(_textView.hasMarkedText)[_textView unmarkText];
   const std::string live=_textView.string.UTF8String?:"";
   if(live!=_draft) {
-    ++_draftGeneration;_completionRequested=false;
-    _draft=live;_dirty=true;_unsavedDrafts[[self draftKey]]=_draft;
+    ++_draftGeneration;_completionRequested=false;_saveOnlyCloseRequested=false;
+    _draft=live;_dirty=true;_unsavedDrafts[[self draftKey]]={_draft,_revision};
   }
 }
 - (std::string)draftKey {
@@ -769,12 +773,13 @@ using STNoteSave = std::function<STNoteSaveResult(
   }
   if(_presentationOpen) {
     // A switch is save-only, including its failure/retry path.
-    _completionRequested=false;_retryButton.title=@"Retry save";
+    _completionRequested=false;_retryButton.title=@"Retry close";
     [self captureLiveDraft];
+    _saveOnlyCloseRequested=true;
     const auto generation=_presentationGeneration;
     if(![self saveDraft:YES] || !_presentationOpen || generation!=_presentationGeneration)return;
   }
-  _completionRequested=false;
+  _completionRequested=false;_saveOnlyCloseRequested=false;
   [_saveTimer invalidate];_saveTimer=nil;
   ++_presentationGeneration;
   _referenceID=referenceID;_markID=markID;
@@ -782,7 +787,10 @@ using STNoteSave = std::function<STNoteSaveResult(
   _revision=loaded.revision;
   const auto retained=_unsavedDrafts.find([self draftKey]);
   _dirty=retained!=_unsavedDrafts.end();
-  _draft=_dirty?retained->second:loaded.note;
+  _draft=_dirty?retained->second.text:loaded.note;
+  // Reopening a local draft must not silently authorize replacing a saved
+  // edit (or Append revision) that appeared while its panel was hidden.
+  if(_dirty)_revision=retained->second.revision;
   _textView.delegate=nil;
   // The view is reused across reference/mark owners. Its prior undo records
   // must never insert another owner's bytes into this newly loaded note.
@@ -791,7 +799,7 @@ using STNoteSave = std::function<STNoteSaveResult(
   _textView.string=[NSString stringWithUTF8String:_draft.c_str()]?:@"";
   _textView.delegate=self;
   _panel.title=[NSString stringWithFormat:@"Note %u",number];
-  if(_dirty)[self setStatus:@"Not saved. Your text is retained." retry:YES];
+  if(_dirty)[self setStatus:@"Draft retained. Close to save." retry:NO];
   else if(loaded.status==STNoteReadStatus::kPending)
     [self setStatus:@"Reference is preparing." retry:NO];
   else if(loaded.status==STNoteReadStatus::kUnavailable)
@@ -813,43 +821,40 @@ using STNoteSave = std::function<STNoteSaveResult(
 }
 - (void)textDidChange:(NSNotification*)notification {
   if(notification.object!=_textView || !_presentationOpen)return;
-  ++_draftGeneration;_completionRequested=false;
-  _retryButton.title=@"Retry save";
+  ++_draftGeneration;_completionRequested=false;_saveOnlyCloseRequested=false;
+  _retryButton.title=@"Retry close";
   _draft=_textView.string.UTF8String?:"";
-  _unsavedDrafts[[self draftKey]]=_draft;
+  _unsavedDrafts[[self draftKey]]={_draft,_revision};
   _dirty=true;
-  [self setStatus:@"Pending save…" retry:NO];
-  [_saveTimer invalidate];
-  const auto generation=_presentationGeneration;
-  __weak STMarkNoteEditor* weakSelf=self;
-  _saveTimer=[NSTimer scheduledTimerWithTimeInterval:0.35 repeats:NO
-      block:^(NSTimer* timer) {
-        [weakSelf autosaveTimer:timer generation:generation];
-      }];
+  [self setStatus:@"Draft — close to save." retry:NO];
+  [_saveTimer invalidate];_saveTimer=nil;
 }
 - (void)autosaveTimer:(NSTimer*)timer generation:(std::uint64_t)generation {
-  if(_presentationOpen && _saveTimer==timer &&
-     _presentationGeneration==generation)[self saveNow];
+  // Historical callbacks are inert. Pausing typing is not a commit boundary.
+  (void)generation;[timer invalidate];
 }
 - (BOOL)flushForAppend:(const std::string&)reference {
   if(_referenceID!=reference)return YES;
   if(_textView.hasMarkedText)return NO;
-  [self captureLiveDraft];return [self saveDraft:NO];
+  [self captureLiveDraft];return YES;
 }
 - (void)saveNow {
+  // Retain compatibility with old observation callers without publishing an
+  // intermediate note. Only an explicit close intent may reach the store.
   if(_textView.hasMarkedText)return;
-  [self captureLiveDraft];[self saveDraft:NO];
+  [self captureLiveDraft];
 }
 - (BOOL)saveDraft:(BOOL)force {
   [_saveTimer invalidate];_saveTimer=nil;
-  if(_saving || _referenceID.empty() || _markID.empty())return NO;
+  if(_saving || !_presentationOpen || (!_completionRequested && !_saveOnlyCloseRequested) ||
+     _referenceID.empty() || _markID.empty())return NO;
   if(!_dirty && !force)return YES;
   const auto generation=_presentationGeneration;
   const auto reference=_referenceID,mark=_markID,draft=_draft;
   const auto before=_revision,draftGeneration=_draftGeneration;
   // Even a clean completion must obtain a durable success result. A pending
   // read or matching bytes after an uncertain commit are not such a receipt.
-  _dirty=true;_unsavedDrafts[[self draftKey]]=_draft;
+  _dirty=true;_unsavedDrafts[[self draftKey]]={_draft,_revision};
   [self setStatus:@"Saving…" retry:NO];
   STNoteSaveResult outcome;
   _saving=true;
@@ -884,7 +889,7 @@ using STNoteSave = std::function<STNoteSaveResult(
 - (void)complete:(id)sender {
   (void)sender;
   if(!_presentationOpen)return;
-  [self captureLiveDraft];_completionRequested=true;
+  [self captureLiveDraft];_completionRequested=true;_saveOnlyCloseRequested=false;
   _retryButton.title=@"Retry finish";
   const auto generation=_presentationGeneration;
   const auto reference=_referenceID,mark=_markID;
@@ -910,11 +915,18 @@ using STNoteSave = std::function<STNoteSaveResult(
         @"Saved. Copy unavailable; retry finish.":@"Saved. Copy failed; retry finish." retry:YES];
     return;
   }
-  _completionRequested=false;_presentationOpen=false;++_presentationGeneration;
+  _completionRequested=false;_saveOnlyCloseRequested=false;_presentationOpen=false;++_presentationGeneration;
   [self stopMouseMonitoring];[_panel orderOut:nil];
 }
 - (void)retrySave:(id)sender {
-  if(_completionRequested)[self complete:sender];else [self saveNow];
+  if(_completionRequested){[self complete:sender];return;}
+  if(!_saveOnlyCloseRequested || !_presentationOpen)return;
+  // Retry an explicitly requested owner-switch closure, without introducing
+  // the clipboard side effect reserved for the number/X completion action.
+  [self captureLiveDraft];_saveOnlyCloseRequested=true;
+  const auto generation=_presentationGeneration;
+  if([self saveDraft:YES] && _presentationOpen && generation==_presentationGeneration &&
+     _saveOnlyCloseRequested)[self hide];
 }
 - (std::string)referenceID {return _referenceID;}
 - (std::string)markID {return _markID;}
@@ -923,9 +935,9 @@ using STNoteSave = std::function<STNoteSaveResult(
 - (void)hide {
   if(!_presentationOpen)return;
   [self captureLiveDraft];
-  _completionRequested=false;_presentationOpen=false;++_presentationGeneration;
+  _completionRequested=false;_saveOnlyCloseRequested=false;_presentationOpen=false;++_presentationGeneration;
   [self stopMouseMonitoring];
-  [self saveNow];[_panel orderOut:nil];
+  [_saveTimer invalidate];_saveTimer=nil;[_panel orderOut:nil];
 }
 - (void)hideIfEditingReference:(const std::string&)referenceID
                          mark:(const std::string&)markID {
@@ -936,7 +948,7 @@ using STNoteSave = std::function<STNoteSaveResult(
   // Deletion/expiry are terminal: never retry or restore these bytes.
   [_saveTimer invalidate];_saveTimer=nil;
   _unsavedDrafts.erase([self draftKey]);_dirty=false;
-  _completionRequested=false;_presentationOpen=false;++_presentationGeneration;
+  _completionRequested=false;_saveOnlyCloseRequested=false;_presentationOpen=false;++_presentationGeneration;
   [self stopMouseMonitoring];[_panel orderOut:nil];
 }
 - (BOOL)windowShouldClose:(id)sender {(void)sender;return NO;}
@@ -2571,6 +2583,9 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     _inspectorReferenceSelector=[[STInspectorReferenceSelector alloc] initWithFrame:NSZeroRect];
     _inspectorReferenceSelector.target=(id<STInspectorReferenceTarget>)self;
     inspectorContainer.referenceSelector=_inspectorReferenceSelector;
+    inspectorContainer.runsButton=[NSButton buttonWithTitle:@"Reference runs…" target:self action:@selector(inspectorReferenceRuns:)];
+    inspectorContainer.runsButton.toolTip=@"Browse reference images, note history and Codex runs.";
+    [inspectorContainer addSubview:inspectorContainer.runsButton];
     [inspectorContainer addSubview:inspectorContainer.feedbackView];
     [inspectorContainer addSubview:_inspectorChromeView];
     [inspectorContainer addSubview:_inspectorReferenceSelector];
@@ -3093,6 +3108,13 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     _inspectorActionStatus=@"Reference JSON URL could not be copied.";
   }
   [self refreshInspector];
+}
+- (void)inspectorReferenceRuns:(id)sender {
+  (void)sender;
+  if(!_server||!_server->port())return;
+  NSString* selected=_inspectorView.selectedReferenceID;
+  const auto url=_server->RunsUrl(selected.length?selected.UTF8String:"");
+  [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:[NSString stringWithUTF8String:url.c_str()]]];
 }
 - (void)inspectorViewDetails:(id)sender {
   (void)sender;
@@ -3718,7 +3740,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     _appendPresentationGeneration=_inspectorLifecycle.selection_generation;
     if(_appendCapture) {
       if(![_noteEditor flushForAppend:_appendMode.root]) {
-        _inspectorActionStatus=@"Save the note before adding a screenshot. Draft retained.";
+        _inspectorActionStatus=@"Finish text composition before adding a screenshot. Draft retained.";
         _inspectorCaptureSelectionPending=false;_appendCapture=false;
         (void)self.controller->Cancel(seethis::core::CancelReason::kUser);
         [self refreshInspector];return;

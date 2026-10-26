@@ -1,4 +1,6 @@
 #include "service/reference_server.h"
+#include "service/agent_bridge.h"
+#include "service/runs_view.h"
 #ifdef SEETHIS_COMPILED_SETTINGS_ASSETS
 #include "seethis/settings_assets.h"
 #endif
@@ -322,7 +324,7 @@ const std::string kReferenceViewerScript = std::string(R"JS((() => {
       return shot.image?.url===expected?new URL(expected):null;
     };
     const validate = async value => {
-      if(value?.delivery_schema!==4||value.reference_id!==id||value.state!=="ready"||
+      if(![4,6].includes(value?.delivery_schema)||value.reference_id!==id||value.state!=="ready"||
          value.lifecycle?.state!=="ready"||
          !Number.isSafeInteger(value.lifecycle.expires_utc_us)||
          value.lifecycle.expires_utc_us<=Date.now()*1000||
@@ -602,7 +604,7 @@ const std::string kReferenceViewerScript = std::string(R"JS((() => {
     if (!metadataResult.response.headers.get("content-type")?.startsWith("application/json"))
       throw new Error("invalid metadata type");
     const metadata = JSON.parse(new TextDecoder().decode(metadataResult.bytes));
-    if(metadata.delivery_schema===4) {
+    if([4,6].includes(metadata.delivery_schema)) {
       if(!isCurrent())return;
       await renderCollection(metadata,metadataUrl,id);return;
     }
@@ -1114,7 +1116,7 @@ std::string CollectionJson(const core::Reference& root,std::string_view base,
     const core::ReferenceCollection& collection,
     std::int64_t expires) {
   std::ostringstream out;
-  out << "{\"delivery_schema\":4,\"reference_id\":\"" << root.id
+  out << "{\"delivery_schema\":6,\"reference_id\":\"" << root.id
       << "\",\"revision\":" << collection.revision << ",\"state\":\"ready\",\"lifecycle\":{\"state\":\"ready\",\"expires_utc_us\":"
       << expires << "},\"notes_revision\":" << collection.notes_revision << ",\"shots\":[";
   bool first=true;
@@ -1132,13 +1134,14 @@ std::string CollectionJson(const core::Reference& root,std::string_view base,
       if(!first)out << ',';first=false;
       const auto slot=shot.first_mark_slot+local;
       out << "{\"mark_id\":\"" << core::StableMarkId(root.id,slot) << "\",\"number\":" << slot+1
-          << ",\"note\":\"" << Escape(collection.notes[slot]) << "\",\"shot_id\":\"" << shot.id << "\"}";
+          << ",\"note\":\"" << Escape(collection.notes[slot]) << "\",\"shot_id\":\"" << shot.id
+          << "\",\"note_revision\":" << (collection.NoteVersion(slot)?std::to_string(*collection.NoteVersion(slot)):"null") << "}";
     }
   }
   out << "]}\n";return out.str();
 }
 
-// Schema 3 is the default agent handoff. Only the canonical full numbered PNG
+// Schema 5 adds the last note edit revision to the default agent handoff. Only the canonical full numbered PNG
 // is requested here; legacy crops and geometry remain explicit /metadata reads.
 std::string SingleImageReferenceJson(const core::Reference& reference,
                                      std::string_view agent_base,
@@ -1153,7 +1156,7 @@ std::string SingleImageReferenceJson(const core::Reference& reference,
        image.code=="asset_unavailable");
   const char* state=ready?"ready":pending?"pending":unavailable?"unavailable":"failed";
   std::ostringstream out;
-  out << "{\"delivery_schema\":3,\"reference_schema\":" << reference.schema
+  out << "{\"delivery_schema\":5,\"reference_schema\":" << reference.schema
       << ",\"reference_id\":\"" << reference.id << "\",\"state\":\"" << state
       << "\",\"lifecycle\":{\"state\":\"ready\",\"expires_utc_us\":"
       << expires_utc_us << "},\"image\":{\"representation\":\"full-annotated-v1\","
@@ -1174,7 +1177,8 @@ std::string SingleImageReferenceJson(const core::Reference& reference,
     if(!first)out << ',';
     first=false;
     out << "{\"mark_id\":\"" << mark.id << "\",\"number\":" << mark.number
-        << ",\"note\":\"" << Escape(mark.note) << "\"}";
+        << ",\"note\":\"" << Escape(mark.note) << "\",\"note_revision\":"
+        << (mark.note_revision?std::to_string(*mark.note_revision):"null") << "}";
   }
   out << "],\"details_url\":\"" << agent_base << "/details\"";
   if(pending)out << ",\"retry_ms\":25";
@@ -1375,15 +1379,16 @@ std::string ReadinessJson(
   return out.str();
 }
 
-void SendAll(int descriptor, std::string_view bytes) {
+bool SendAll(int descriptor, std::string_view bytes) {
   while (!bytes.empty()) {
     const auto count = send(descriptor, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-    if (count <= 0) return;
+    if (count <= 0) return false;
     bytes.remove_prefix(static_cast<std::size_t>(count));
   }
+  return true;
 }
 
-void Respond(int descriptor, int status, std::string_view reason,
+bool Respond(int descriptor, int status, std::string_view reason,
              std::string_view type, std::string_view body,
              std::string_view extra_headers = {}) {
   std::ostringstream header;
@@ -1394,8 +1399,7 @@ void Respond(int descriptor, int status, std::string_view reason,
          << "X-Content-Type-Options: nosniff\r\n"
          << "Referrer-Policy: no-referrer\r\n"
          << "Connection: close\r\n" << extra_headers << "\r\n";
-  SendAll(descriptor, header.str());
-  SendAll(descriptor, body);
+  return SendAll(descriptor, header.str()) && SendAll(descriptor, body);
 }
 
 void Error(int descriptor, int status, std::string_view reason,
@@ -1566,12 +1570,15 @@ std::optional<std::string> SettingsAsset(const std::filesystem::path& root,
 ReferenceServer::ReferenceServer(core::ReferenceStore& references,
                                  core::SettingsStore& settings,
                                  std::filesystem::path settings_web_root,
-                                 std::shared_ptr<platform::PermissionReadinessState> readiness)
+                                 std::shared_ptr<platform::PermissionReadinessState> readiness,
+                                 AgentReader agent_reader)
     : references_(references),
       settings_(settings),
       settings_web_root_(std::move(settings_web_root)),
       readiness_(std::move(readiness)),
-      settings_capability_(RandomCapability()) {}
+      settings_capability_(RandomCapability()),
+      runs_capability_(RandomCapability()),
+      agent_reader_(agent_reader?std::move(agent_reader):AgentReader([](auto ref,auto run){return ReadAgentRuns(ref,run);})) {}
 
 ReferenceServer::~ReferenceServer() { Stop(); }
 
@@ -1670,6 +1677,10 @@ std::string ReferenceServer::ClipboardText(std::string_view id) const {
   return text;
 }
 
+std::string ReferenceServer::RunsUrl(std::string_view id) const {
+  return base_url()+"/runs/#cap="+runs_capability_+(SafeId(id)?"&ref="+std::string(id):"");
+}
+
 std::string ReferenceServer::ViewerUrl(std::string_view id) const {
   const std::string owned_id(id);
   return base_url() + "/v1/references/" + owned_id + "/view#cap=" +
@@ -1742,6 +1753,104 @@ void ReferenceServer::Handle(int client) {
     }
     return true;
   };
+  if(request->target.starts_with("/runs/")) {
+    if(!strict_loopback_request())return;
+    if(request->method!="GET"){Error(client,405,"Method Not Allowed","method_not_allowed");return;}
+    if(request->target=="/runs/") {
+      Respond(client,200,"OK","text/html; charset=utf-8",kRunsHtml,
+        "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n");return;
+    }
+    if(request->target=="/runs/app.js") {
+      Respond(client,200,"OK","text/javascript; charset=utf-8",kRunsScript);return;
+    }
+    if(!ConstantTimeEqual(Bearer(*request),runs_capability_)){Error(client,401,"Unauthorized","invalid_runs_capability");return;}
+    const auto retention=settings_.Get();
+    references_.SetRetentionPolicy(retention.reference_ttl_seconds,retention.maximum_visible_references);
+    const std::string prefix="/runs/api/";
+    if(!request->target.starts_with(prefix)){Error(client,404,"Not Found","unknown_runs_resource");return;}
+    const auto resource=request->target.substr(prefix.size());
+    const auto quote=[](std::string_view value){return "\""+Escape(value)+"\"";};
+    const auto name=[](const core::ReferenceJobSnapshot& job) {
+      const auto source=core::ProjectSourceContext(job);
+      return source.page_url.value_or(source.window_title.value_or(source.app_name.value_or("Reference")));
+    };
+    if(resource=="references") {
+      auto jobs=references_.MetadataJobs();
+      std::sort(jobs.begin(),jobs.end(),[](const auto& a,const auto& b){return a.accepted_utc_us>b.accepted_utc_us;});
+      std::ostringstream out;out<<"{\"references\":[";bool comma=false;
+      for(const auto& job:jobs) {
+        if(job.state!=core::ReferenceJobState::kReady||!job.metadata)continue;
+        if(comma)out<<',';comma=true;
+        out<<"{\"id\":"<<quote(job.id)<<",\"title\":"<<quote(name(job))
+           <<",\"captured_at_ms\":"<<job.accepted_utc_us/1000<<"}";
+      }
+      out<<"]}";Respond(client,200,"OK","application/json; charset=utf-8",out.str());return;
+    }
+    if(resource.size()<34||resource[32]!='/'||!SafeId(std::string_view(resource).substr(0,32))) {
+      Error(client,404,"Not Found","invalid_reference");return;
+    }
+    const auto id=resource.substr(0,32),action=resource.substr(33);
+    const auto job=references_.LookupMetadata(id);
+    if(!job){Error(client,404,"Not Found","unknown_reference");return;}
+    if(job->state==core::ReferenceJobState::kDeleted||job->state==core::ReferenceJobState::kExpired) {
+      Error(client,410,"Gone","reference_unavailable");return;
+    }
+    if(job->state!=core::ReferenceJobState::kReady||!job->metadata) {
+      Error(client,409,"Conflict","reference_not_ready");return;
+    }
+    const auto collection=references_.Collection(id);
+    if(collection.status!=core::MarkNotesStatus::kReady){Error(client,422,"Unprocessable Content","collection_unavailable");return;}
+    if(action=="runs"||(action.starts_with("log/")&&SafeId(std::string_view(action).substr(4)))) {
+      Respond(client,200,"OK","application/json; charset=utf-8",agent_reader_(id,action=="runs"?"":action.substr(4)));return;
+    }
+    if(action.starts_with("shot/")&&SafeId(std::string_view(action).substr(5))) {
+      const auto shot_id=action.substr(5);
+      if(std::none_of(collection.shots.begin(),collection.shots.end(),[&](const auto& shot){return shot.id==shot_id;})) {
+        Error(client,404,"Not Found","unknown_shot");return;
+      }
+      const auto asset=references_.RequestShotAnnotated(id,shot_id);
+      if(asset.state==core::ReadyAssetState::kPending) {
+        Respond(client,202,"Accepted","application/json","{\"pending\":true}");return;
+      }
+      if(asset.state!=core::ReadyAssetState::kReady||!asset.bytes){Error(client,404,"Not Found","image_unavailable");return;}
+      Respond(client,200,"OK","image/png",std::string_view(reinterpret_cast<const char*>(asset.bytes->data()),asset.bytes->size()));return;
+    }
+    if(action!="details"){Error(client,404,"Not Found","unknown_runs_resource");return;}
+    std::ostringstream out;
+    out<<"{\"reference_id\":"<<quote(id)<<",\"title\":"<<quote(name(*job))
+       <<",\"captured_at_ms\":"<<job->accepted_utc_us/1000<<",\"notes_revision\":"<<collection.notes_revision<<",\"shots\":[";
+    for(std::size_t i=0;i<collection.shots.size();++i) {
+      if(i)out<<',';out<<"{\"id\":"<<quote(collection.shots[i].id)<<",\"index\":"<<i<<"}";
+    }
+    out<<"],\"marks\":[";
+    const auto marks=references_.MarkSnapshots(id);
+    if(marks.status!=core::MarkNotesStatus::kReady){Error(client,409,"Conflict","notes_changed_retry");return;}
+    // Concurrent note edits cannot produce a mixed current/history response.
+    if(marks.revision!=collection.notes_revision){Error(client,409,"Conflict","notes_changed_retry");return;}
+    for(std::size_t i=0;i<marks.marks.size();++i) {
+      if(i)out<<',';const auto& mark=marks.marks[i];
+      out<<"{\"id\":"<<quote(mark.id)<<",\"number\":"<<mark.number<<",\"shot_id\":"<<quote(mark.shot_id)<<",\"note\":"<<quote(mark.note)<<"}";
+    }
+    out<<"],\"note_history\":[";
+    for(std::size_t i=0;i<collection.note_history.size();++i) {
+      if(i)out<<',';const auto& event=collection.note_history[i];const auto& mark=marks.marks.at(event.slot);
+      out<<"{\"revision\":"<<event.revision<<",\"at_ms\":"<<event.edited_utc_us/1000
+         <<",\"mark_id\":"<<quote(mark.id)<<",\"number\":"<<mark.number<<",\"shot_id\":"<<quote(mark.shot_id)
+         <<",\"before\":"<<quote(event.before)<<",\"after\":"<<quote(event.after)<<"}";
+    }
+    const auto deliveries=references_.NoteDeliveries(id);
+    out<<"],\"delivery_log\":{\"available\":"<<(deliveries.available?"true":"false")
+       <<",\"limit\":"<<core::ReferenceStore::kMaximumNoteDeliveries
+       <<",\"full\":"<<(deliveries.available&&deliveries.records.size()>=core::ReferenceStore::kMaximumNoteDeliveries?"true":"false")
+       <<",\"records\":[";
+    for(std::size_t i=0;i<deliveries.records.size();++i) {
+      if(i)out<<',';const auto& entry=deliveries.records[i];
+      out<<"{\"notes_revision\":"<<entry.notes_revision<<",\"at_ms\":"
+         <<std::fixed<<std::setprecision(3)<<entry.delivered_utc_us/1000.0<<"}";
+    }
+    out<<"]},\"history_scope\":\"Saved edits since 0.1.6 only. Earlier unrecorded edits are unknown.\"}";
+    Respond(client,200,"OK","application/json; charset=utf-8",out.str());return;
+  }
   if (request->target == "/v1/reference-view.js") {
     if (!strict_loopback_request()) return;
     if (request->method != "GET") {
@@ -2012,13 +2121,18 @@ void ReferenceServer::Handle(int client) {
       "\r\nX-SeeThis-Reference-ID: "+id+"\r\nX-SeeThis-Shot-ID: "+shot_id+
       "\r\nX-SeeThis-Source-SHA256: "+shot->metadata->source.sha256+"\r\n");return;
   }
+  const auto deliver_notes=[&](int status,std::string_view reason,const std::string& body,
+                               std::uint64_t revision) {
+    if(Respond(client,status,reason,"application/json; charset=utf-8",body)&&agent_path)
+      references_.RecordNoteDelivery(id,revision,core::Now().utc_us);
+  };
   if(collection.multi()) {
     if(resource!="metadata"&&resource!="details"&&resource!="detail") {
       Error(client,409,"Conflict","explicit_shot_required");return;
     }
-    Respond(client,200,"OK","application/json; charset=utf-8",
+    deliver_notes(200,"OK",
       CollectionJson(found,base_url()+AgentPath(id,expected_capability),collection,
-        job->accepted_utc_us+settings.reference_ttl_seconds*1'000'000LL));return;
+        job->accepted_utc_us+settings.reference_ttl_seconds*1'000'000LL),collection.notes_revision);return;
   }
   if (resource == "record") {
     if(found.schema!=1) {
@@ -2147,18 +2261,17 @@ void ReferenceServer::Handle(int client) {
       const bool ready=image.state==core::ReadyAssetState::kReady && image.bytes &&
           !image.bytes->empty() && !image.byte_sha256.empty();
       const bool pending=image.state==core::ReadyAssetState::kPending;
-      Respond(client,ready?200:pending?202:422,
+      deliver_notes(ready?200:pending?202:422,
               ready?"OK":pending?"Accepted":"Unprocessable Content",
-              "application/json; charset=utf-8",
               SingleImageReferenceJson(found,agent_base,notes,image,
                   found.image_completed.utc_us+
-                  settings.reference_ttl_seconds*1'000'000LL));
+                  settings.reference_ttl_seconds*1'000'000LL),notes.revision);
       return;
     }
-    Respond(client,200,"OK","application/json; charset=utf-8",
+    deliver_notes(200,"OK",
             CompactReferenceJson(found,agent_base,references_,notes,settings_.Visibility(),
                 found.image_completed.utc_us+
-                settings.reference_ttl_seconds*1'000'000LL));
+                settings.reference_ttl_seconds*1'000'000LL),notes.revision);
   } else {
     core::ReadyAssetResult crop;
     if (agent_path) {

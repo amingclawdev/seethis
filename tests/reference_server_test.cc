@@ -579,7 +579,7 @@ void TestMultiShotDelivery() {
   const auto foreign="/r/"+other+settings.ReferenceCapability(other);
   const auto get=[&](const std::string& path){return Request(server.port(),ReferenceGet(server.port(),path));};
   const auto response=get(root);
-  Check(response.status==200&&response.body.find("\"delivery_schema\":4")!=std::string::npos&&
+  Check(response.status==200&&response.body.find("\"delivery_schema\":6")!=std::string::npos&&
       response.body.find("\"revision\":2")!=std::string::npos&&response.body.find("Second captured context")!=std::string::npos,
       "default delivers complete versioned collection");
   Check(response.body.find("\"shot_id\":\""+id+"\"")!=std::string::npos&&
@@ -734,7 +734,7 @@ async function actual(url,token=fixture.capability) {
   throw new Error("synthetic asset did not complete");
 }
 const initialResponse=await actual(base), collection=JSON.parse(Buffer.from(initialResponse.bytes).toString());
-check(collection.delivery_schema===4&&collection.revision===fixture.expectedShots&&collection.shots.length===fixture.expectedShots&&collection.marks.length===fixture.expectedShots+1,"actual collection fixture identity");
+check(collection.delivery_schema===6&&collection.revision===fixture.expectedShots&&collection.shots.length===fixture.expectedShots&&collection.marks.length===fixture.expectedShots+1,"actual collection fixture identity");
 const latest=collection.shots.length-1;
 const groups=collection.shots.map(shot=>collection.marks.filter(mark=>mark.shot_id===shot.shot_id).map(mark=>mark.number));
 const expectedGroups=[[1],[2,3],[4],[5],[6],[7],[8]];
@@ -968,7 +968,7 @@ void TestSingleImageDelivery() {
   };
   // No renderer has been requested yet: cold metadata itself queues canonical PNG.
   const auto cold=get(root);
-  Check(cold.status==202&&cold.body.find("\"delivery_schema\":3")!=std::string::npos&&
+  Check(cold.status==202&&cold.body.find("\"delivery_schema\":5")!=std::string::npos&&
         cold.body.find("\"state\":\"pending\"")!=std::string::npos&&
         cold.body.find("\"lifecycle\":{\"state\":\"ready\"")!=std::string::npos&&
         cold.body.find("\"sha256\":null")!=std::string::npos&&
@@ -1068,12 +1068,12 @@ function decode(bytes) {
 const ready=await get(fixture.origin+fixture.root);
 assert(ready.status===200,"steady ready JSON request must succeed");
 const json=JSON.parse(ready.body.toString("utf8"));
-assert(json.delivery_schema===3&&json.reference_schema===2&&json.reference_id===fixture.id,"schema and reference identity");
+assert(json.delivery_schema===5&&json.reference_schema===2&&json.reference_id===fixture.id,"schema and reference identity");
 assert(json.state==="ready"&&json.lifecycle.state==="ready"&&json.lifecycle.expires_utc_us>fixture.image_completed,"ready lifecycle/expiry");
 assert(json.notes_revision===2&&json.marks.length===3,"ordered three-mark notes revision");
 const expectedNotes=["","世界 🌍\nsecond line\n\"quoted\"\\","line\tthree"];
 for(let i=0;i<3;++i) {
-  assert(JSON.stringify(Object.keys(json.marks[i]).sort())===JSON.stringify(["mark_id","note","number"]),"only compact mark fields");
+  assert(JSON.stringify(Object.keys(json.marks[i]).sort())===JSON.stringify(["mark_id","note","note_revision","number"]),"only compact mark fields");
   assert(json.marks[i].mark_id===fixture.marks[i].mark_id&&json.marks[i].number===fixture.marks[i].number&&json.marks[i].note===expectedNotes[i],"authoritative ID/number/exact decoded note");
 }
 assert(json.source_context.version===1&&json.source_context.app_name==="Capture fixture 世界"&&json.source_context.window_title==="Three gestures"&&
@@ -2317,10 +2317,71 @@ void TestSettingsAssets() {
   server.Stop();
 }
 
+void TestReferenceRuns() {
+  TempDirectory temp;const std::string id(32,'a'),run(32,'b'),foreign(32,'c');
+  ReferenceStore references(temp.path/"refs");MakeReference(references,id,0,false,true);
+  SettingsStore settings(temp.path/"settings.json");
+  auto readiness=std::make_shared<seethis::platform::PermissionReadinessState>();
+  int calls=0;
+  seethis::service::ReferenceServer server(references,settings,temp.path/"web",readiness,
+    [&](std::string_view ref,std::string_view rid) {
+      Check(ref==id&&(rid.empty()||rid==run),"helper receives only exact validated IDs");++calls;
+      return rid.empty()?"{\"available\":true,\"runs\":[]}":"{\"available\":true,\"messages\":[]}";
+    });
+  std::string error;Check(server.Start(&error),"runs service starts");
+  const auto url=server.RunsUrl(id);const auto start=url.find("#cap=")+5,end=url.find('&',start);
+  const auto cap=url.substr(start,end-start);
+  const auto get=[&](std::string path,std::string token) {return Request(server.port(),ReferenceGet(server.port(),path,token));};
+  const std::string root="/runs/api/"+id;
+  auto response=get("/runs/","");
+  Check(response.status==200&&response.body.find("Reference runs")!=std::string::npos&&response.body.find(cap)==std::string::npos,"static page contains no embedded capability");
+  Check(Header(response,"Content-Security-Policy").find("frame-ancestors 'none'")!=std::string::npos,"runs page cannot be framed");
+  Check(get("/runs/api/references","").status==401&&get("/runs/api/references",settings.ReferenceCapability(id)).status==401,"reference capability does not authorize local log browser");
+  Check(Request(server.port(),ReferenceGet(server.port(),"/runs/api/references",cap,"https://foreign.test")).status==403,"foreign origin cannot read local runs");
+  Check(Request(server.port(),ReferenceGet(server.port(),"/runs/api/references",cap,std::nullopt,"foreign.test")).status==400,"DNS rebinding host rejected");
+  response=get("/runs/api/references",cap);
+  Check(response.status==200&&response.body.find(id)!=std::string::npos&&Header(response,"Cache-Control")=="no-store","authenticated list and no-store");
+  const auto marks=references.MarkSnapshots(id);
+  Check(references.UpdateMarkNote(id,marks.marks[0].id,"first <script>",0).status==MarkNoteUpdateStatus::kUpdated,"runs note created");
+  Check(references.UpdateMarkNote(id,marks.marks[0].id,"updated",1).status==MarkNoteUpdateStatus::kUpdated,"runs note revised");
+  response=get(root+"/details",cap);
+  Check(response.status==200&&response.body.find("\"note_history\":[{")!=std::string::npos&&response.body.find("\"before\":\"first <script>\"")!=std::string::npos&&response.body.find("\"after\":\"updated\"")!=std::string::npos,"details carry saved revisions and current notes");
+  Check(response.body.find("\"delivery_log\":{\"available\":true")!=std::string::npos&&references.NoteDeliveries(id).records.empty(),"viewing history never records a reference delivery");
+  const auto reference_cap=settings.ReferenceCapability(id);
+  const auto delivery_path="/r/"+id+reference_cap;
+  response=get(delivery_path,"");references.WaitForIdleForTesting();response=get(delivery_path,"");
+  Check(response.status==200&&response.body.find("\"note_revision\":2")!=std::string::npos&&response.body.find("note_history")==std::string::npos&&response.body.find("delivery_log")==std::string::npos,"agent JSON has only current note and its edit revision");
+  // Fill through the real HTTP endpoint, then change notes and deliver again.
+  for(std::size_t i=0;i<ReferenceStore::kMaximumNoteDeliveries;++i)
+    Check(get(delivery_path,"").status==200,"r delivery remains successful through capacity");
+  response=get(root+"/details",cap);
+  Check(response.body.find("\"full\":true")!=std::string::npos&&references.NoteDeliveries(id).records.size()==256,"private page reports saturated delivery history");
+  const auto bytes=FileBytes(temp.path/"refs"/(id+".deliveries"));
+  Check(std::string(bytes.begin(),bytes.end()).find(reference_cap)==std::string::npos,"delivery log does not persist capability");
+  Check(references.UpdateMarkNote(id,marks.marks[0].id,"after capacity",2).revision==3,"note save remains independent of delivery saturation");
+  response=get(delivery_path,"");
+  Check(response.status==200&&response.body.find("\"notes_revision\":3")!=std::string::npos&&response.body.find("after capacity")!=std::string::npos,"saturated r returns newest reference normally");
+  (void)get(root+"/details",cap);
+  Check(FileBytes(temp.path/"refs"/(id+".deliveries"))==bytes,"saturation preserves exact old delivery bytes");
+  {std::ofstream out(temp.path/"refs"/(id+".deliveries"),std::ios::trunc);out<<"unreadable";}
+  Check(get(delivery_path,"").status==200,"recording failure never blocks r delivery");
+  response=get(root+"/details",cap);
+  Check(response.body.find("\"delivery_log\":{\"available\":false")!=std::string::npos,"recording failure displayed as unavailable, never as evidence");
+  Check(get(root+"/runs",cap).status==200&&get(root+"/log/"+run,cap).status==200&&calls==2,"exact reference/run shared helper calls");
+  Check(get("/runs/api/"+foreign+"/runs",cap).status==404&&get(root+"/log/../../secret",cap).status==400&&calls==2,"unknown reference and traversal never reach helper");
+  Check(get(root+"/shot/"+foreign,cap).status==404,"foreign shot denied");
+  response=get(root+"/shot/"+id,cap);references.WaitForIdleForTesting();response=get(root+"/shot/"+id,cap);
+  Check(response.status==200&&Header(response,"Content-Type")=="image/png","marked image served by existing reference store");
+  Check(references.Delete(id)==DeleteResult::kDeleted&&get(root+"/runs",cap).status==410&&calls==2,"deletion blocks log access without touching original log");
+  server.Stop();
+}
+
 }  // namespace
 
 int main(int argc,char** argv) {
   try {
+    TestReferenceRuns();
+    if(argc==2&&std::string_view(argv[1])=="--runs-only"){std::cout<<checks<<" reference runs checks passed\n";return 0;}
     if(argc==2&&std::string_view(argv[1])=="--p4-component-only") {
       TestMultiShotDelivery();TestMultiShotViewer();TestSingleImageDelivery();
       std::cout<<checks<<" P4 protocol checks passed\n";return 0;
@@ -3493,7 +3554,7 @@ int main(int argc,char** argv) {
           "explicit legacy capability read returns compact ordered mark metadata");
     AwaitAsset(references,current_id,0);
     const auto legacy_default=Request(server.port(),ReferenceGet(server.port(),agent_root));
-    Check(legacy_default.status==200&&legacy_default.body.find("\"delivery_schema\":3,\"reference_schema\":1")!=std::string::npos&&
+    Check(legacy_default.status==200&&legacy_default.body.find("\"delivery_schema\":5,\"reference_schema\":1")!=std::string::npos&&
           legacy_default.body.find("full-annotated-v1")!=std::string::npos&&
           legacy_default.body.find(current.value.source.sha256)!=std::string::npos,
           "persisted schema1 uses schema3 default without migrating historical data");

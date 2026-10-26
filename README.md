@@ -6,6 +6,10 @@ Website: **[seethis.dev](https://seethis.dev)**
 
 SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more areas of your screen. It copies a local reference immediately, and prepares a marked image you can paste into an AI conversation or any app that accepts images.
 
+## Hackathon demo 0.1.6
+
+See the [Hackathon installation and source mapping guide](docs/HACKATHON.md) for the dedicated app and companion MCP/plugin 0.4.1. This branch is a Hackathon prerelease; the existing beta and Store links below describe their own releases.
+
 ## Demo
 
 https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba

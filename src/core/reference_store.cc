@@ -1441,6 +1441,7 @@ struct NotesSidecar {
   std::uint64_t revision=0;
   std::vector<std::string> notes;
   std::vector<bool> visible;
+  std::vector<NoteRevision> history;
 };
 bool ValidNote(std::string_view note) {
   if(note.size()>kMaxNoteBytes)return false;
@@ -1499,7 +1500,7 @@ NotesSidecar ReadNotes(const std::filesystem::path& directory,
   }
   const auto size=std::filesystem::file_size(path,ec);
   if(ec){result.status=MarkNotesStatus::kIOError;return result;}
-  if(size>1024*1024){result.status=MarkNotesStatus::kCorrupt;return result;}
+  if(size>8*1024*1024){result.status=MarkNotesStatus::kCorrupt;return result;}
   Bytes file;
   try {file=ReadFile(path);} catch(...) {
     result.status=MarkNotesStatus::kIOError;return result;
@@ -1513,7 +1514,7 @@ NotesSidecar ReadNotes(const std::filesystem::path& directory,
   if(!GetU32(data,offset,version)) {
     result.status=MarkNotesStatus::kCorrupt;return result;
   }
-  if(version!=1&&version!=2) {
+  if(version!=1&&version!=2&&version!=3) {
     result.status=MarkNotesStatus::kUnsupported;return result;
   }
   if(data.size()-offset<reference.id.size()+reference.source.sha256.size()||
@@ -1541,7 +1542,7 @@ NotesSidecar ReadNotes(const std::filesystem::path& directory,
       result.status=MarkNotesStatus::kCorrupt;return result;
     }
     offset+=note_size;
-    if(version==2) {
+    if(version>=2) {
       const auto mark_id=StableMarkId(reference.id,slot);
       if(data.size()-offset<mark_id.size()+1 ||
          data.substr(offset,mark_id.size())!=mark_id) {
@@ -1553,12 +1554,38 @@ NotesSidecar ReadNotes(const std::filesystem::path& directory,
       result.visible[slot]=flag==1;
     }
   }
+  if(version==3) {
+    std::uint32_t count_history=0;
+    if(!GetU32(data,offset,count_history)||count_history>512) {
+      result.status=MarkNotesStatus::kCorrupt;return result;
+    }
+    std::uint64_t last=0;
+    for(std::uint32_t i=0;i<count_history;++i) {
+      NoteRevision entry;std::uint64_t slot=0,at=0;
+      if(!GetU64(data,offset,entry.revision)||!GetU64(data,offset,slot)||
+         !GetU64(data,offset,at)||slot>=count||!at||at>INT64_MAX||
+         entry.revision<=last||entry.revision>result.revision) {
+        result.status=MarkNotesStatus::kCorrupt;return result;
+      }
+      entry.slot=slot;entry.edited_utc_us=at;
+      for(auto* text:{&entry.before,&entry.after}) {
+        std::uint32_t size=0;
+        if(!GetU32(data,offset,size)||size>kMaxNoteBytes||data.size()-offset<size) {
+          result.status=MarkNotesStatus::kCorrupt;return result;
+        }
+        *text=std::string(data.substr(offset,size));offset+=size;
+        if(!ValidNote(*text)){result.status=MarkNotesStatus::kCorrupt;return result;}
+      }
+      if(entry.before==entry.after){result.status=MarkNotesStatus::kCorrupt;return result;}
+      last=entry.revision;result.history.push_back(std::move(entry));
+    }
+  }
   if(offset!=data.size())result.status=MarkNotesStatus::kCorrupt;
   return result;
 }
 std::string EncodeNotes(const Reference& reference,const NotesSidecar& sidecar) {
   std::string bytes(kNotesMagic);
-  PutU32(bytes,2);bytes+=reference.id;bytes+=reference.source.sha256;
+  PutU32(bytes,3);bytes+=reference.id;bytes+=reference.source.sha256;
   PutU64(bytes,sidecar.revision);
   PutU32(bytes,static_cast<std::uint32_t>(sidecar.notes.size()));
   for(std::size_t slot=0;slot<sidecar.notes.size();++slot) {
@@ -1566,6 +1593,13 @@ std::string EncodeNotes(const Reference& reference,const NotesSidecar& sidecar) 
     PutU32(bytes,static_cast<std::uint32_t>(note.size()));bytes+=note;
     bytes+=StableMarkId(reference.id,slot);
     bytes.push_back(sidecar.visible[slot]?1:0);
+  }
+  PutU32(bytes,static_cast<std::uint32_t>(sidecar.history.size()));
+  for(const auto& event:sidecar.history) {
+    PutU64(bytes,event.revision);PutU64(bytes,event.slot);PutU64(bytes,event.edited_utc_us);
+    for(const auto* text:{&event.before,&event.after}) {
+      PutU32(bytes,static_cast<std::uint32_t>(text->size()));bytes+=*text;
+    }
   }
   return bytes;
 }
@@ -1611,7 +1645,7 @@ std::filesystem::path ShotPath(const std::filesystem::path& dir, std::string_vie
 }
 std::string EncodeCollection(const Reference& root, const ReferenceCollection& source) {
   Writer w;
-  std::string magic="seethis-collection-v1",id=root.id,binding=root.source.sha256;
+  std::string magic="seethis-collection-v2",id=root.id,binding=root.source.sha256;
   auto revision=source.revision,notes_revision=source.notes_revision;
   auto count=source.shots.size();w(magic,id,binding,revision,notes_revision,count);
   for(const auto& shot:source.shots) {
@@ -1623,6 +1657,9 @@ std::string EncodeCollection(const Reference& root, const ReferenceCollection& s
   }
   auto notes=source.notes;w(notes);
   for(bool flag:source.visible){std::uint64_t value=flag?1:0;w(value);}
+  auto history_count=source.note_history.size();w(history_count);
+  for(auto event:source.note_history)
+    w(event.revision,event.slot,event.edited_utc_us,event.before,event.after);
   return {w.bytes.begin(),w.bytes.end()};
 }
 ReferenceCollection ReadCollection(const std::filesystem::path& dir,const Reference& root) {
@@ -1634,13 +1671,13 @@ ReferenceCollection ReadCollection(const std::filesystem::path& dir,const Refere
       result.shots.push_back({root.id,0,std::make_shared<const Reference>(std::move(metadata))});
       const auto notes=ReadNotes(dir,root,EffectiveRegions(root).size());
       result.status=notes.status;result.notes_revision=notes.revision;
-      result.notes=notes.notes;result.visible=notes.visible;return result;
+      result.notes=notes.notes;result.visible=notes.visible;result.note_history=notes.history;return result;
     }
     if(std::filesystem::file_size(path)>8*1024*1024)throw std::runtime_error("manifest too large");
     const auto bytes=ReadFile(path);Reader r{bytes};
     std::string magic,id,binding;std::uint64_t count=0;
     r(magic,id,binding,result.revision,result.notes_revision,count);
-    if(magic!="seethis-collection-v1"||id!=root.id||binding!=root.source.sha256||
+    if((magic!="seethis-collection-v1"&&magic!="seethis-collection-v2")||id!=root.id||binding!=root.source.sha256||
        count<2||count>64||result.revision!=count||!result.notes_revision)
       throw std::runtime_error("invalid collection");
     std::size_t total=0;
@@ -1670,8 +1707,42 @@ ReferenceCollection ReadCollection(const std::filesystem::path& dir,const Refere
       std::uint64_t flag=0;r(flag);if(flag>1)throw std::runtime_error("invalid visibility");
       result.visible.push_back(flag==1);
     }
+    if(magic=="seethis-collection-v2") {
+      std::uint64_t count_history=0,last=0;r(count_history);
+      if(count_history>512)throw std::runtime_error("history too large");
+      for(std::uint64_t i=0;i<count_history;++i) {
+        NoteRevision event;r(event.revision,event.slot,event.edited_utc_us,event.before,event.after);
+        if(event.revision<=last||event.revision>result.notes_revision||event.slot>=total||
+           event.edited_utc_us<=0||!ValidNote(event.before)||!ValidNote(event.after)||event.before==event.after)
+          throw std::runtime_error("invalid note history");
+        last=event.revision;result.note_history.push_back(std::move(event));
+      }
+    }
     if(r.offset!=bytes.size())throw std::runtime_error("manifest trailing data");
   } catch(...) {result={};result.status=MarkNotesStatus::kCorrupt;}
+  return result;
+}
+std::filesystem::path DeliveryPath(const std::filesystem::path& dir,std::string_view id) {
+  return dir/(std::string(id)+".deliveries");
+}
+NoteDeliveryLog ReadDeliveries(const std::filesystem::path& dir,const Reference& root) {
+  NoteDeliveryLog result;
+  try {
+    const auto path=DeliveryPath(dir,root.id);
+    if(!std::filesystem::exists(path)){result.available=true;return result;}
+    if(std::filesystem::is_symlink(path)||std::filesystem::file_size(path)>8192)return result;
+    const auto bytes=ReadFile(path);Reader r{bytes};
+    std::string magic,id,binding;std::uint64_t count=0;r(magic,id,binding,count);
+    if(magic!="seethis-note-deliveries-v1"||id!=root.id||binding!=root.source.sha256||
+       count>ReferenceStore::kMaximumNoteDeliveries)return result;
+    for(std::uint64_t i=0;i<count;++i) {
+      NoteDelivery entry;r(entry.notes_revision,entry.delivered_utc_us);
+      if(entry.delivered_utc_us<=0)return {};
+      result.records.push_back(entry);
+    }
+    if(r.offset!=bytes.size())return {};
+    result.available=true;
+  } catch(...) {return {};}
   return result;
 }
 bool RemoveCollectionFiles(const std::filesystem::path& dir,std::string_view id,
@@ -1684,6 +1755,7 @@ bool RemoveCollectionFiles(const std::filesystem::path& dir,std::string_view id,
   const std::string prefix=std::string(id)+".shot-";
   for(const auto& item:std::filesystem::directory_iterator(dir))
     if(item.path().filename().string().starts_with(prefix))success=erase(item.path())&&success;
+  success=erase(DeliveryPath(dir,id))&&success;
   return erase(CollectionPath(dir,id))&&success;
 }
 std::optional<DisplayPoint> FirstPoint(const ReferenceRegion& region) {
@@ -2176,6 +2248,32 @@ ReferenceCollection ReferenceStore::Collection(std::string_view id) const {
   std::lock_guard io_lock(impl_->retention_io_mutex);
   return ReadCollection(directory_,*job->metadata);
 }
+NoteDeliveryLog ReferenceStore::NoteDeliveries(std::string_view id) const {
+  const auto job=LookupMetadata(id);
+  if(!job||job->state!=ReferenceJobState::kReady||!job->metadata)return {};
+  std::lock_guard io_lock(impl_->retention_io_mutex);
+  return ReadDeliveries(directory_,*job->metadata);
+}
+void ReferenceStore::RecordNoteDelivery(std::string_view id,std::uint64_t revision,
+                                       std::int64_t at) noexcept {
+  try {
+    if(at<=0||!SafeID(std::string(id)))return;
+    std::lock_guard io_lock(impl_->retention_io_mutex);
+    std::lock_guard lock(impl_->mutex);
+    const auto found=impl_->jobs.find(std::string(id));
+    if(found==impl_->jobs.end()||found->second.state!=ReferenceJobState::kReady||!found->second.metadata)return;
+    const auto& root=*found->second.metadata;
+    auto log=ReadDeliveries(directory_,root);
+    // Keep every prior observation. Never rotate, reject delivery or touch notes.
+    if(!log.available||log.records.size()>=kMaximumNoteDeliveries)return;
+    log.records.push_back({revision,at});
+    Writer w;std::string magic="seethis-note-deliveries-v1",root_id=root.id,binding=root.source.sha256;
+    auto count=log.records.size();w(magic,root_id,binding,count);
+    for(auto entry:log.records)w(entry.notes_revision,entry.delivered_utc_us);
+    (void)PersistSmall(DeliveryPath(directory_,id),std::string_view(
+      reinterpret_cast<const char*>(w.bytes.data()),w.bytes.size()));
+  } catch(...) { /* Recording failure never changes the already delivered response. */ }
+}
 void ReferenceStore::AppendReferenceAsync(std::string root,std::uint64_t expected,
     std::string operation,Reference metadata,CaptureResult capture,AppendCompletion completion) {
   AppendAsync(std::move(root),{},expected,std::move(operation),std::move(metadata),
@@ -2268,8 +2366,9 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
       result.status=AppendStatus::kUnavailable;return;
     }
     if(!active->load()){result.status=AppendStatus::kCancelled;return;}
-    const auto persisted=PersistNotes(CollectionPath(directory_,root_id),
-        EncodeCollection(*root_metadata,collection),hooks.fail_append_after_rename);
+    const auto encoded=EncodeCollection(*root_metadata,collection);
+    if(encoded.size()>8*1024*1024){result.status=AppendStatus::kInvalid;return;}
+    const auto persisted=PersistNotes(CollectionPath(directory_,root_id),encoded,hooks.fail_append_after_rename);
     result.revision=collection.revision;
     result.status=persisted==NotesWriteResult::kSaved?AppendStatus::kCommitted:
       persisted==NotesWriteResult::kCommitUncertain?AppendStatus::kCommitUncertain:AppendStatus::kIOError;
@@ -3272,7 +3371,7 @@ MarkNotesSnapshot ReferenceStore::MarkSnapshots(std::string_view id) const {
     for(std::size_t slot=0;slot<regions.size();++slot) {
       const auto anchor=FirstPoint(regions[slot]);if(!anchor)continue;
       result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
-          *anchor,{},"",true,0,std::string(id),slot});
+          *anchor,{},"",true,0,std::string(id),slot,0});
     }
     return result;
   }
@@ -3290,7 +3389,7 @@ MarkNotesSnapshot ReferenceStore::MarkSnapshots(std::string_view id) const {
       if(!anchor||!bounds){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
       result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
           *anchor,*bounds,collection.notes[slot],collection.visible[slot],collection.notes_revision,
-          shot.id,local});
+          shot.id,local,collection.NoteVersion(slot)});
     }
   }
   return result;
@@ -3320,11 +3419,16 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
     for(std::size_t index=0;index<collection.notes.size();++index)
       if(StableMarkId(id,index)==mark_id){slot=index;break;}
     if(slot==collection.notes.size())return {MarkNoteUpdateStatus::kInvalid,0};
-    collection.notes[slot]=std::move(note);
-    if(collection.notes_revision==std::numeric_limits<std::uint64_t>::max())return {MarkNoteUpdateStatus::kInvalid,collection.notes_revision};
-    ++collection.notes_revision;
-    const auto persisted=PersistNotes(CollectionPath(directory_,id),
-        EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    if(collection.notes[slot]!=note) {
+      const auto at=impl_->hooks.now?impl_->hooks.now():Now();
+      if(collection.note_history.size()>=512||at.utc_us<=0||collection.notes_revision==std::numeric_limits<std::uint64_t>::max())
+        return {MarkNoteUpdateStatus::kInvalid,collection.notes_revision};
+      collection.note_history.push_back({collection.notes_revision+1,slot,at.utc_us,collection.notes[slot],note});
+      collection.notes[slot]=std::move(note);++collection.notes_revision;
+    }
+    const auto encoded=EncodeCollection(*found->second.metadata,collection);
+    if(encoded.size()>8*1024*1024)return {MarkNoteUpdateStatus::kInvalid,expected_revision};
+    const auto persisted=PersistNotes(CollectionPath(directory_,id),encoded,impl_->hooks.fail_note_after_rename);
     return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
       persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
       MarkNoteUpdateStatus::kIOError,collection.notes_revision};
@@ -3348,8 +3452,15 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
     return {MarkNoteUpdateStatus::kRevisionConflict,sidecar.revision};
   if(sidecar.revision==std::numeric_limits<std::uint64_t>::max())
     return {MarkNoteUpdateStatus::kInvalid,sidecar.revision};
-  sidecar.notes[slot]=std::move(note);++sidecar.revision;
+  if(sidecar.notes[slot]!=note) {
+    const auto at=impl_->hooks.now?impl_->hooks.now():Now();
+    if(sidecar.history.size()>=512||at.utc_us<=0)return {MarkNoteUpdateStatus::kInvalid,sidecar.revision};
+    sidecar.history.push_back({sidecar.revision+1,slot,at.utc_us,sidecar.notes[slot],note});
+    sidecar.notes[slot]=std::move(note);++sidecar.revision;
+  }
+  if(sidecar.revision==0)return {MarkNoteUpdateStatus::kUpdated,0};
   const auto bytes=EncodeNotes(reference,sidecar);
+  if(bytes.size()>8*1024*1024)return {MarkNoteUpdateStatus::kInvalid,expected_revision};
   const auto persisted=PersistNotes(NotesPath(directory_,id),bytes,
                                      impl_->hooks.fail_note_after_rename);
   if(persisted==NotesWriteResult::kIOError)
@@ -3387,8 +3498,9 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
     collection.visible[slot]=visible;
     if(collection.notes_revision==std::numeric_limits<std::uint64_t>::max())return {MarkNoteUpdateStatus::kInvalid,collection.notes_revision};
     ++collection.notes_revision;
-    const auto persisted=PersistNotes(CollectionPath(directory_,id),
-        EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    const auto encoded=EncodeCollection(*found->second.metadata,collection);
+    if(encoded.size()>8*1024*1024)return {MarkNoteUpdateStatus::kInvalid,expected_revision};
+    const auto persisted=PersistNotes(CollectionPath(directory_,id),encoded,impl_->hooks.fail_note_after_rename);
     return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
       persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
       MarkNoteUpdateStatus::kIOError,collection.notes_revision};

@@ -224,12 +224,12 @@ static void CheckRetirementAndDrafts() {
     VisibilityFixture f;f.saveStatus=status;f.Open(f.a);f.Type(@"Retained A 世界");
     NSTimer* timer=f.editor.saveTimer;const auto generation=f.editor.presentationGeneration;
     Check(f.settings->SetGlobalVisibility(false),"global Hide persists");[f.visibility reconcile];
-    Check(!f.editor.presentationOpen && !timer.valid && f.writes.size()==1 && f.copies.empty(),
-          "global Hide retires without copy and attempts valid exact draft save once");
+    Check(!f.editor.presentationOpen && !timer.valid && f.writes.empty() && f.copies.empty(),
+          "global Hide retires without publishing or copying the draft");
     Check(f.settings->SetGlobalVisibility(true),"global Show persists");f.Window(f.a);[f.visibility reconcile];
     Check(!f.editor.presentationOpen,"Show and context return never auto-open failed draft");
-    f.Open(f.a);Check([f.editor.textView.string isEqualToString:@"Retained A 世界"] && !f.editor.retryButton.hidden,
-          "explicit valid owner reopen restores exact failed draft honestly");
+    f.Open(f.a);Check([f.editor.textView.string isEqualToString:@"Retained A 世界"] && f.editor.retryButton.hidden,
+          "explicit valid owner reopen restores the unsaved draft without inventing a save failure");
     const auto before=f.writes.size();[f.editor autosaveTimer:timer generation:generation];
     Check(f.writes.size()==before && f.copies.empty(),"retired timer cannot save or complete reopened same pair");
     f.Window(f.b);f.Open(f.b);Check(f.editor.referenceID==f.a && f.copies.empty(),"failed old save blocks even equal-ordinal reference switch");
@@ -630,7 +630,7 @@ static void CheckProductionInvalidationWiring(bool sameNative=false) {
             [coordinator badges].empty()&&panel.ignoresMouseEvents&&
             [coordinator hoveredReference].empty(),
             "warmed cache invalidation removes badge paint/hit/hover for a same-app window with no marks");
-      Check(editor.presentationOpen&&retiredTimer.valid&&
+      Check(editor.presentationOpen&&!retiredTimer&&
             ![coordinator handleNoteBadgeClick:stationary],
             "context loss preserves editor and stale badge click passes through");
       [coordinator testContext:context];
@@ -666,8 +666,8 @@ static void CheckProductionInvalidationWiring(bool sameNative=false) {
       [view.markVisibilityButton performClick:nil];
       [editor autosaveTimer:hideTimer generation:hideGeneration];
       Check(!hideTimer.valid && copiedReferences.size()==hideCopies && referenceCopies.size()==hideReferenceCopies &&
-            store.MarkSnapshots(a).marks[0].note=="Dirty fixed-row Hide draft 世界",
-            "relocated Hide saves dirty original owner, invalidates stale timer and never invokes either injected copy path");
+            store.MarkSnapshots(a).marks[0].note!="Dirty fixed-row Hide draft 世界",
+            "relocated Hide retains draft locally without publishing it or invoking either injected copy path");
       [coordinator testContext:windowB];[coordinator testContext:context];
       Check(![coordinator noteBadgeAtPoint:stationary]&&![coordinator hasPaint]&&
             panel.ignoresMouseEvents&&[coordinator hoveredReference].empty()&&!editor.presentationOpen,
@@ -935,11 +935,11 @@ int main(int argc,char** argv) {
     Check(editor.panel.isVisible,"another mark cannot hide the selected editor");
     [editor hideIfEditingReference:reference_id mark:snapshot.marks[0].id];
     Check(!editor.panel.isVisible,
-          "hiding the edited mark dismisses its editor after failed save");
+          "hiding the edited mark dismisses its editor without publishing the draft");
     [editor toggleReference:reference_id mark:snapshot.marks[0].id
                      number:1 screenPoint:NSMakePoint(300,300)];
     Check([editor.textView.string isEqualToString:@"Unsaved draft"]&&
-          !editor.retryButton.hidden,
+          editor.retryButton.hidden,
           "hidden editor retains its unsaved draft for restoration");
     [editor hide];
     CheckPersistentContext();CheckChromeTransitions();CheckRetirementAndDrafts();
