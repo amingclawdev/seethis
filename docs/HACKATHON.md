@@ -4,6 +4,8 @@ This branch provides Reference runs for SeeThis and the companion seethis-runs M
 
 ## Install
 
+**[Start here: app, plugin, hooks, connection and full demo testing](https://github.com/amingclawdev/seethis-agent-plugin#readme). [All installers and checksums](https://github.com/amingclawdev/seethis-agent-plugin/releases/tag/v0.4.1-hackathon.1).**
+
 Download the Hackathon DMG or ZIP and SHA256SUMS from the matching release. Verify the files you downloaded with `shasum -a 256`; compare against that release's SHA256SUMS. Open the DMG, drag SeeThis.app into Applications, then open that copy. Follow [installation and permissions](INSTALL.md) for Input Monitoring, Screen Recording and optional Chrome Automation; its older beta download names do not identify this Hackathon build.
 
 The Hackathon app and DMG are Developer ID signed, Apple notarized and stapled. Apple Silicon and macOS 14.2+ are required. The preparation did not install or launch them. First-install permission dialogs, Finder drag installation, another Mac and a full two-run recording remain unverified.

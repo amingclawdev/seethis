@@ -8,7 +8,7 @@ SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more 
 
 ## Hackathon demo 0.1.6
 
-See the [Hackathon installation and source mapping guide](docs/HACKATHON.md) for the dedicated app and companion MCP/plugin 0.4.1. This branch is a Hackathon prerelease; the existing beta and Store links below describe their own releases.
+Use the **[single installation and testing guide](https://github.com/amingclawdev/seethis-agent-plugin#readme)** for the dedicated app and companion MCP/plugin 0.4.1. **[Download the notarized app and plugin together](https://github.com/amingclawdev/seethis-agent-plugin/releases/tag/v0.4.1-hackathon.1)**. See [source mapping](docs/HACKATHON.md) for provenance. This branch is a Hackathon prerelease; the existing beta and Store links below describe their own releases.
 
 ## Demo
 
