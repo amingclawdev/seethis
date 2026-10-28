@@ -327,6 +327,188 @@ void Transactions() {
   Check(marks.phase()==ReferencePhase::kAborted,"capture timeout ignores late result");
   Check(store.Lookup(idA)->ready->record==bytes,"historical immutable after later transactions");
 }
+// Explicit simulated monotonic time; no live-duration or native-provider claim.
+void SeparatedCaptureDeadlines() {
+  TempDirectory temp;ReferenceStore store(temp.path);
+  const auto origin=Now();std::atomic<std::int64_t> elapsed{0};
+  const auto clock=[&] {const auto delta=elapsed.load();return Stamp{origin.utc_us+delta,origin.monotonic_us+delta};};
+  ReferenceStoreTestHooks hooks;hooks.now=clock;store.SetTestHooks(hooks);
+  MarkController marks(store,[](const auto&){return true;},clock);
+  Commit(store,marks,idA);
+  auto generation=Begin(marks,idB);elapsed+=30'000'001;marks.Expire(clock());
+  Check(!marks.Pending()&&marks.phase()==ReferencePhase::kAborted,"F3 genuine unreturned screenshot keeps30s service bound");
+  marks.Captured(generation,Capture());Check(!store.LookupMetadata(idB),"F3 late unaccepted screenshot cannot create a reference");
+
+  generation=Begin(marks,idC);elapsed+=29'000'000;marks.Release(generation,Path(),clock());
+  elapsed+=1'000'001;marks.Expire(clock());store.WaitForIdleForTesting();
+  const auto failed=store.LookupMetadata(idC);
+  Check(failed&&failed->state==ReferenceJobState::kFailed&&failed->code=="capture_timeout",
+      "F3 release cannot renew unfinished screenshot's original deadline");
+  marks.Captured(generation,Capture());store.WaitForIdleForTesting();
+  Check(store.LookupMetadata(idC)->state==ReferenceJobState::kFailed,"F3 late accepted screenshot cannot revive failed ownership");
+
+  auto chrome=ContextFixture();chrome.bundle_id="com.google.Chrome";
+  marks.SetViewportContinuity(1,true);Observe(marks,chrome);
+  generation=marks.Begin(idD);Check(marks.BindContext(generation,chrome),"F3 Chrome context binds");
+  marks.Captured(generation,Capture());elapsed+=40'000'000;marks.Expire(clock());
+  Check(marks.AllowsDrawing(),"F3 arrived screenshot has no overall30s drawing cap while page pending");
+  marks.Release(generation,Path(),clock());elapsed+=30'000'000;marks.Expire(clock());
+  Check(marks.Pending(),"F3 released page wait lives at exact release budget boundary");
+  elapsed+=1;marks.Expire(clock());
+  Check(!marks.Pending()&&marks.phase()==ReferencePhase::kAborted,"F3 released page no-return expires its own budget");
+  seethis::platform::ChromePageSample sample;sample.availability=PageAvailability::kReady;
+  sample.browser_pid=chrome.pid;sample.window_id=chrome.window_id;sample.window_bounds=chrome.window;
+  sample.process_start_identity_us=700;sample.opaque_tab_id="owned-tab";sample.url="https://example.test/f3";
+  const auto identity=seethis::platform::MakeChromePageIdentity(sample);
+  Check(identity&&!marks.BindPageIdentity(generation,*identity),"F3 late page cannot revive released timeout");
+  const auto next=Begin(marks,idE);marks.Captured(next,Capture());marks.Release(next,Path(),clock());store.WaitForIdleForTesting();
+  Check(marks.phase()==ReferencePhase::kCommitted&&!marks.BindPageIdentity(generation,*identity),
+      "F3 next valid generation recovers without accepting old page");
+
+  unsigned completions=0;marks.SetAppendCompletion([&](auto,std::uint64_t){++completions;});
+  const auto append=marks.BeginAppendReference(idA,1,idF);
+  Check(append&&marks.BindContext(append,ContextFixture()),"F3 unfinished Append starts");
+  elapsed+=29'000'000;marks.Release(append,Path(),clock());elapsed+=1'000'001;marks.Expire(clock());
+  marks.Captured(append,Capture());store.WaitForIdleForTesting();
+  Check(completions==1&&store.Collection(idA).shots.size()==1,"F3 unfinished accepted Append cancels once at screenshot service bound");
+
+  auto metadata=PendingReference(idF);metadata.operation_started=origin;const auto original=metadata.operation_started;
+  elapsed+=60'000'000;AppendResult result;
+  store.AppendReferenceAsync(idA,1,idF,metadata,Capture(),[&](auto r){result=r;});store.WaitForIdleForTesting();
+  Check(result.status==AppendStatus::kCommitted&&store.Collection(idA).shots.size()==2&&
+        metadata.operation_started.monotonic_us==original.monotonic_us,
+      "F3 Append admission budget is independent of immutable original gesture start");
+  hooks.stage=[&](std::string_view stage,std::string_view) {if(stage=="append_before_publish")elapsed+=30'000'001;};
+  store.SetTestHooks(hooks);unsigned terminal=0;
+  store.AppendReferenceAsync(idA,2,idB,metadata,Capture(),[&](auto r){result=r;++terminal;});store.WaitForIdleForTesting();
+  Check(terminal==1&&result.status==AppendStatus::kCancelled&&store.Collection(idA).shots.size()==2,
+      "F3 physical Append finishing after deadline cannot publish membership");
+  hooks.stage={};store.SetTestHooks(hooks);
+  store.AppendReferenceAsync(idA,2,idB,metadata,Capture(),[&](auto r){result=r;});store.WaitForIdleForTesting();
+  Check(result.status==AppendStatus::kCommitted&&store.Collection(idA).shots.size()==3,
+      "F3 fresh admission recovers after timed-out physical work drains");
+}
+
+void FailedActionCustodyLifecycle() {
+  TempDirectory temp;ReferenceStore store(temp.path);store.SetRetentionPolicy(3600,1000);
+  // Stage real attempt creation on one simulated clock: Appends age31s while
+  // ordinary pending captures age11s. No existing transaction is retimed.
+  const auto fixed=Now();std::atomic<std::int64_t> elapsed{0};ReferenceStoreTestHooks clock;
+  clock.now=[&]{const auto delta=elapsed.load();return Stamp{fixed.utc_us+delta,fixed.monotonic_us+delta};};store.SetTestHooks(clock);
+  int copies=0,appendEvents=0;
+  MarkController marks(store,[&](std::string_view)->std::optional<std::int64_t>{return ++copies;},
+      [](auto,std::int64_t){return true;},[](auto task){task();},clock.now);
+  Commit(store,marks);
+  const auto append=marks.BeginAppendReference(idA,1,idC);
+  Check(append&&marks.BindContext(append,ContextFixture()),"custody fixture starts actual unfinished append");
+  marks.Release(append,Path(10),{1'000'002,1002});
+  marks.SetAppendCompletion([&](auto,std::uint64_t){++appendEvents;});
+  for(unsigned index=0;index<5;++index) {
+    const auto g=Begin(marks,Identifier(9000+index));marks.Release(g,Path(),{1'000'002,1002});
+    CaptureResult failure;failure.error="capture_failed";marks.Captured(g,failure);store.WaitForIdleForTesting();
+  }
+  const auto another=marks.BeginAppendReference(idA,1,idD);
+  Check(another!=0,"over four retained failures do not consume active append capacity");
+  Check(marks.BindContext(another,ContextFixture()),"second actual append binds");
+  marks.Release(another,Path(20),{1'000'002,1002});
+  elapsed=20'000'000;
+  const auto pendingGeneration=Begin(marks,idB);marks.Release(pendingGeneration,Path(),{1'000'002,1002});
+  std::uint64_t lastGeneration=0;
+  for(unsigned index=0;index<=500;++index) {
+    lastGeneration=Begin(marks,Identifier(10'000+index));
+    marks.Release(lastGeneration,Path(),{1'000'002,1002});
+    CaptureResult failed;failed.error="capture_failed";marks.Captured(lastGeneration,failed);
+    store.WaitForIdleForTesting();
+  }
+  Observe(marks,ContextFixture());const auto before=copies;
+  Check(store.LookupMetadata(Identifier(10'000))->state==ReferenceJobState::kFailed&&
+        !marks.RecopyJob(Identifier(10'000))&&marks.RecopyJob(Identifier(10'500))&&copies==before+1,
+        "501 real failures evict oldest custody at insertion while newest status URL remains owned");
+  Check(marks.RecopyJob(idB)&&store.LookupMetadata(idB)->state==ReferenceJobState::kPending,
+        "terminal custody cap never evicts an unfinished ordinary capture");
+  const auto fourth=Begin(marks,idE);marks.Release(fourth,Path(30),{1'000'002,1002});
+  Check(marks.BeginAppendReference(idA,1,idF)==0,
+        "four actual unfinished entries including metadata-less appends still enforce busy admission");
+  marks.Abort("no active drawing");
+  elapsed=31'000'000;marks.Expire(clock.now());
+  Check(appendEvents==2&&store.Collection(idA).shots.size()==1,
+        "expiry cancels only two real appends and never completes failed custody");
+  marks.Captured(append,Capture());marks.Captured(another,Capture());
+  marks.Captured(lastGeneration,Capture());store.WaitForIdleForTesting();
+  Observe(marks,ContextFixture());const auto after=copies;
+  Check(marks.RecopyJob(Identifier(10'500))&&copies==after+1&&
+        store.LookupMetadata(Identifier(10'500))->state==ReferenceJobState::kFailed&&appendEvents==2&&
+        store.Collection(idA).shots.size()==1,
+        "abort expiry and duplicate late capture do not reactivate terminal failure or canceled appends");
+  Check(marks.DeleteJob(idB)==DeleteResult::kDeleted,"unfinished capture remains deletable after custody eviction");
+  marks.Captured(pendingGeneration,Capture());store.WaitForIdleForTesting();
+  Check(store.LookupMetadata(idB)->state==ReferenceJobState::kDeleted,
+        "late capture after custody-bound test deletion preserves tombstone");
+}
+
+void StatusURLActionBoundaries() {
+  {
+    TempDirectory temp;ReferenceStore store(temp.path);int copies=0;
+    MarkController marks(store,[&](std::string_view)->std::optional<std::int64_t>{return ++copies;},
+        [](auto,std::int64_t){return true;},[](auto task){task();});
+    const auto generation=Begin(marks);
+    marks.Release(generation,Path(),{1'000'002,1002});
+    CaptureResult failed;failed.error="capture_failed";marks.Captured(generation,failed);
+    store.WaitForIdleForTesting();const auto metadata=store.LookupMetadata(idA);
+    Check(metadata&&metadata->state==ReferenceJobState::kFailed&&copies==1&&marks.marks().empty()&&
+          marks.SavedProjection(*metadata->metadata)==SavedProjectionState::kTerminal,
+          "failed completion keeps one release publication and no ready projection");
+    Check(marks.RecopyJob(idA)&&copies==2&&!marks.CopyHistoryJob(idA),
+          "explicit same-source failed status URL recopy does not turn failure into ready history");
+    auto wrong=WindowFor(ContextFixture(),marks.window_observation().generation+1);
+    wrong.window_title="different source";marks.SetWindowObservation(wrong);
+    Check(!marks.RecopyJob(idA)&&marks.DeleteJob(idA)==DeleteResult::kNotFound&&copies==2,
+          "failed status actions reject another current title without mutation");
+    Observe(marks,ContextFixture());
+    Check(marks.RecopyJob(idA)&&copies==3,"fresh matching title restores owned failed status URL");
+    marks.SetViewportContinuity(1,false);
+    Check(!marks.RecopyJob(idA)&&copies==3,"failed status copy requires healthy current input");
+    marks.SetViewportContinuity(1,true);Observe(marks,ContextFixture());
+    marks.SetPresentationPermitted(false);
+    Check(!marks.RecopyJob(idA)&&copies==3,"failed status copy obeys global presentation suppression");
+    marks.SetPresentationPermitted(true);
+    Check(!marks.RecopyJob(idA)&&copies==3&&store.LookupMetadata(idA)->state==ReferenceJobState::kFailed,
+          "retired presentation does not manufacture new failed action custody");
+    Check(marks.DeleteHistoryJob(idA)==DeleteResult::kDeleted&&!marks.RecopyJob(idA)&&copies==3,
+          "deleted failed status cannot be recopied or resurrected");
+  }
+  {
+    TempDirectory temp;ReferenceStore store(temp.path);int copies=0;
+    MarkController marks(store,[&](std::string_view)->std::optional<std::int64_t>{return ++copies;},
+        [](auto,std::int64_t){return true;},[](auto task){task();});
+    marks.SetViewportContinuity(1,true);Observe(marks,ContextFixture());
+    Check(store.AcceptPending(PendingReference(idA),0,0).state==ReferenceJobState::kPending,
+          "unowned pending fixture contains otherwise valid source metadata");
+    Check(!marks.RecopyJob(idA)&&marks.DeleteJob(idA)==DeleteResult::kNotFound&&copies==0,
+          "matching source alone cannot manufacture a live accepted pending action");
+    store.Fail(idA,"capture_failed");store.WaitForIdleForTesting();
+    Check(!marks.RecopyJob(idA)&&marks.DeleteJob(idA)==DeleteResult::kNotFound&&copies==0,
+          "valid failed metadata without owned capture custody cannot acquire live actions");
+    auto invalid=PendingReference(idB);invalid.path.clear();
+    Check(store.AcceptPending(invalid,0,0).state==ReferenceJobState::kFailed,
+          "malformed pending metadata becomes an invalid failure");
+    Check(!marks.RecopyJob(idB)&&copies==0,"invalid failed metadata never acquires a status publication");
+  }
+  {
+    TempDirectory temp;ReferenceStore store(temp.path);int copies=0;
+    MarkController marks(store,[&](const auto&){++copies;return true;});Commit(store,marks);
+    const auto accepted=store.LookupMetadata(idA)->accepted_utc_us;
+    ReferenceStoreTestHooks clock;clock.now=[=]{return Stamp{accepted+1'000'001,Now().monotonic_us};};
+    store.SetTestHooks(clock);store.SetRetentionPolicy(1,100);
+    Check(store.LookupMetadata(idA)->state==ReferenceJobState::kExpired,
+          "ready status fixture reaches actual retention expiry");
+    Observe(marks,ContextFixture());
+    Check(!marks.RecopyJob(idA)&&marks.DeleteJob(idA)==DeleteResult::kNotFound&&copies==1&&marks.marks().empty(),
+          "expired reference rejects live copy/delete and remains nonprojectable");
+    store.WaitForIdleForTesting();
+  }
+}
+
 void PersistenceAndClipboard() {
   TempDirectory temp;ReferenceStore store(temp.path);bool clipboardWorks=false;Bytes initialRecord,initialText,initialPNG;
   MarkController marks(store,[&](const auto& r){initialRecord=r.record;initialText=r.clipboard_text;initialPNG=r.clipboard_png;return clipboardWorks;});
@@ -345,6 +527,7 @@ void PersistenceAndClipboard() {
   ReferenceStore restartedStore(temp.path);Bytes record,text,png;
   MarkController restarted(restartedStore,[&](const auto& r){record=r.record;text=r.clipboard_text;png=r.clipboard_png;return true;});
   restartedStore.WaitForIdleForTesting();
+  restarted.SetViewportContinuity(1,true);
   Observe(restarted,ContextFixture());
   Check(restarted.marks().size()==2 && restarted.RecopyJob(idA),"restart indexes and recopies reference");
   Check(record==original.record && text==original.clipboard_text && png==original.clipboard_png,"restart re-copy byte identical in every representation");
@@ -919,6 +1102,7 @@ void LegacyReadyMigration() {
              (job.context.pid<=0||job.path.empty());
     }),"legacy indexing never publishes ready marks with empty geometry");
     migrated.WaitForIdleForTesting();const auto ready=migrated.Jobs();
+    marks.SetViewportContinuity(1,true);
     Observe(marks,ContextFixture());
     Check(ready.size()==ids.size()&&std::all_of(ready.begin(),ready.end(),
       [](const auto& job) {return job.state==ReferenceJobState::kReady&&
@@ -939,6 +1123,7 @@ void LegacyReadyMigration() {
   {
     ReferenceStore restarted(root);
     MarkController marks(restarted,[](const auto&){return true;});
+    marks.SetViewportContinuity(1,true);
     Observe(marks,ContextFixture());
     const auto indexed=restarted.Jobs();
     Check(std::all_of(indexed.begin(),indexed.end(),[](const auto& job) {
@@ -1944,6 +2129,51 @@ void ChromeProductionAdapter() {
   Check(marks.page_observation().generation==21 && marks.page_observation().identity &&
             marks.page_observation().identity->opaque_tab_id=="fast",
         "production Chrome adapter generation handoff keeps the newest page");
+
+  struct BlockedProvider {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool released=false;
+    std::atomic<int> entered=0,active=0,maximum=0;
+    seethis::platform::ChromePageSample Acquire(seethis::platform::ChromePageSample sample) {
+      const auto count=++active;++entered;
+      auto previous=maximum.load();while(count>previous&&!maximum.compare_exchange_weak(previous,count)){}
+      std::unique_lock lock(mutex);ready.wait(lock,[&]{return released;});--active;return sample;
+    }
+    void Release(){ {std::lock_guard lock(mutex);released=true;}ready.notify_all(); }
+    ~BlockedProvider(){Release();}
+  };
+  auto blocked=std::make_shared<BlockedProvider>();
+  int completed=0,rejected=0;
+  for(int i=0;i<2;++i)seethis::platform::AcquireChromePageAsync(
+      [blocked,sample]{return blocked->Acquire(sample);},30+i,[&](PageObservation page){
+        ++completed;Check(page.availability==PageAvailability::kTimedOut&&!page.identity,
+            "sustained provider timeout publishes no late ready identity");});
+  pump(0.4);
+  Check(blocked->entered==2&&blocked->active==2&&completed==2&&
+      seethis::platform::ChromePhysicalWorkCountForTesting()==2,
+      "two logical timeouts retain both physically blocked provider admissions");
+  for(int i=0;i<1000;++i) {
+    bool inline_completion=false;
+    seethis::platform::AcquireChromePageAsync([blocked,sample]{return blocked->Acquire(sample);},40+i,
+        [&](PageObservation page){inline_completion=true;++rejected;
+          Check(page.availability==PageAvailability::kUnavailable&&!page.identity,
+              "full provider admission rejects unavailable without identity");});
+    Check(inline_completion&&blocked->entered==2&&blocked->maximum==2&&
+        seethis::platform::ChromePhysicalWorkCountForTesting()==2,
+        "repeated timed-out provider polling has no physical or pending queue growth");
+  }
+  blocked->Release();pump(0.1);
+  Check(completed==2&&rejected==1000&&blocked->active==0&&
+      seethis::platform::ChromePhysicalWorkCountForTesting()==0,
+      "actual native return drains retained admissions without late callbacks");
+  int recovered=0;
+  seethis::platform::AcquireChromePageAsync([sample]{return sample;},2000,[&](PageObservation page){
+    ++recovered;Check(page.availability==PageAvailability::kReady&&page.identity,
+        "fresh provider recovers after physical completion");});
+  pump(0.1);
+  Check(recovered==1&&seethis::platform::ChromePhysicalWorkCountForTesting()==0,
+      "provider recovery cancels timer and drains its physical record");
 }
 #endif
 
@@ -2487,6 +2717,7 @@ void ChromePageVisibility() {
   int copied = 0;
   MarkController marks(store, [&](const auto&) { ++copied; return true; });
   const auto id = std::string(32, '8');
+  marks.SetViewportContinuity(1,true);
   auto generation = marks.Begin(id);
   auto context = ContextFixture();
   context.pid = 42; context.window_pid = 42; context.window_id = 500;
@@ -4127,9 +4358,320 @@ void RejectedPrivateObservationCoordinates() {
       "fresh exact original return restores saved geometry after genuine private move/resize hide");
 }
 
+void ExplicitContextScopes() {
+  auto legacy=PendingReference(idA);
+  const auto oldBytes=Serialize(legacy);
+  const auto old=Deserialize(oldBytes);
+  Check(old&&old->context.scope.version==0&&
+      old->context.scope.kind==CaptureScopeKind::kLegacy&&Serialize(*old)==oldBytes,
+      "absent scope remains byte-identical legacy rather than application fallback");
+  auto application=legacy;
+  application.context.scope={1,CaptureScopeKind::kApplication,
+      application.context.displays.front().id,700,true};
+  const auto restored=Deserialize(Serialize(application));
+  Check(restored&&restored->context.scope.version==1&&
+      restored->context.scope.kind==CaptureScopeKind::kApplication&&
+      restored->context.scope.display_id==application.context.scope.display_id&&
+      restored->context.scope.process_start_identity_us==700,
+      "explicit application scope survives actual production serialization");
+  application.context.window_id=0;application.context.window_pid=0;application.context.window={};
+  application.context.window_title.clear();application.context.selection_method="frontmost-application/selected-display";
+  auto current=WindowFor(legacy.context,1);
+  current.application_available=true;current.application_start_identity_us=700;
+  Check(ReferenceVisible(application.context,{},current,{}),
+      "application scope has no forged window ID and is visible in its current application instance");
+  current.window_id+=10;current.bounds.x+=20;
+  Check(ReferenceVisible(application.context,{},current,{}),
+      "application scope remains fixed-screen across windows of the same application instance");
+  ++current.application_start_identity_us;
+  Check(!ReferenceVisible(application.context,{},current,{}),
+      "application process replacement cannot revive application scope");
+  auto chrome=legacy.context;chrome.bundle_id="com.google.Chrome";chrome.window_title.clear();
+  auto observed=WindowFor(chrome,2);
+  Check(!ReferenceVisible(chrome,{},observed,{}),
+      "legacy Chrome missing page identity never silently becomes window scope");
+  chrome.native_window={1,700,"scope-test",1};
+  observed=WindowFor(chrome,2);
+  chrome.scope={1,CaptureScopeKind::kWindow,chrome.displays.front().id,700,true};
+  Check(ReferenceVisible(chrome,{},observed,{}),
+      "new explicit Chrome window scope permits basic capture without page authorization");
+  auto titled=legacy.context;titled.native_window={1,700,"scope-test",1};titled.title={1,TitleAvailability::kReady};
+  titled.scope={1,CaptureScopeKind::kWindow,1,700,true,true};auto fresh=WindowFor(titled,3);
+  Check(ReferenceVisible(titled,{},fresh,{}),"new window with reliable captured title is visible");
+  fresh.window_title="another source";
+  Check(!ReferenceVisible(titled,{},fresh,{}),"reliable normal-window title remains an exact constraint");
+  titled.window_title.clear();titled.title={1,TitleAvailability::kUnavailable};titled.scope.title_required=false;
+  fresh=WindowFor(titled,4);
+  Check(ReferenceVisible(titled,{},fresh,{}),"new explicit window with genuinely absent title remains usable without invented title evidence");
+  titled.scope={};Check(!ReferenceVisible(titled,{},fresh,{}),"missing title does not broaden a legacy record");
+  std::cout<<checks<<" explicit context scope persistence and visibility checks passed\n";
+}
+
+void TypedProcessIdentityVisibility() {
+  auto reference=PendingReference(idA);auto& launch=reference.context;
+  launch.native_window={1,1000000,"typed-test",1};launch.title={1,TitleAvailability::kReady};
+  launch.scope={1,CaptureScopeKind::kWindow,1,1000000,true,true};
+  const auto old=Serialize(reference);Check(Deserialize(old)&&Serialize(*Deserialize(old))==old,"existing tail6/v1 canonical bytes stay unchanged");
+  auto kernel=launch;kernel.native_window.version=2;kernel.scope.version=2;kernel.scope.process_source=ProcessStartSource::kKernelBSDStart;
+  auto current=WindowFor(launch,1);current.application_available=true;current.application_start_identity_us=1000000;
+  current.kernel_application_start_identity_us=1000000;current.kernel_native_window=kernel.native_window;
+  Check(ReferenceVisible(launch,{},current,{})&&ReferenceVisible(kernel,{},current,{}),"two typed sources can coexist even when their numbers happen to coincide");
+  current.native_window={1,0,{},0};current.application_start_identity_us=0;
+  Check(!ReferenceVisible(launch,{},current,{})&&ReferenceVisible(kernel,{},current,{}),"old launchDate absence cannot borrow equal kernel value");
+  current.native_window=launch.native_window;current.native_window.process_start_identity_us=2000000;current.application_start_identity_us=2000000;
+  Check(ReferenceVisible(kernel,{},current,{}),"later differing launchDate cannot rebind a kernel-shot identity");
+  current.kernel_native_window={2,0,{},0};current.kernel_application_start_identity_us=0;
+  Check(!ReferenceVisible(kernel,{},current,{}),"kernel source absence hides only its records without borrowing launchDate");
+  current.kernel_native_window=kernel.native_window;current.kernel_application_start_identity_us=1000000;
+  Check(ReferenceVisible(kernel,{},current,{}),"fresh same kernel identity restores the original mark");
+  current.kernel_native_window.process_start_identity_us++;
+  Check(!ReferenceVisible(kernel,{},current,{}),"same PID replacement kernel start never matches old shot");
+  auto typed=reference;typed.context=kernel;const auto bytes=Serialize(typed);const auto decoded=Deserialize(bytes);
+  Check(decoded&&decoded->context.scope==kernel.scope&&Serialize(*decoded)==bytes,"kernel v2 source is explicit in canonical tail and survives roundtrip");
+  auto shortBytes=bytes;shortBytes.pop_back();Check(!Deserialize(shortBytes),"missing source field cannot downgrade to old launchDate");
+  typed.context.scope.process_source=static_cast<ProcessStartSource>(99);
+  const auto unknown=Deserialize(Serialize(typed));Check(!unknown||!ValidCaptureScope(unknown->context),"unknown v2 source fails closed rather than becoming legacy");
+  auto chrome=kernel;chrome.bundle_id="com.google.Chrome";chrome.scope.kind=CaptureScopeKind::kPage;
+  Check(!ValidCaptureScope(chrome),"kernel source cannot masquerade as Chrome launchDate-based page identity");
+  std::cout<<checks<<" typed process source isolation and canonical checks passed\n";
+}
+
+void ExplicitScopeStoreLifecycle(bool kernel=false) {
+  TempDirectory temp;const auto directory=temp.path/"scoped";
+  const std::int64_t start=kernel?1000000:700;
+  for(const auto kind:kernel?std::vector<CaptureScopeKind>{CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}:std::vector<CaptureScopeKind>{CaptureScopeKind::kPage,CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}) {
+    const auto offset=static_cast<unsigned>(kind)*10;const auto root=Identifier(6100+offset);
+    auto context=ContextFixture();context.native_window={kernel?2u:1u,start,"scope-test",1};
+    context.scope={kernel?2u:1u,kind,1,start,true,kind==CaptureScopeKind::kWindow};
+    if(kernel)context.scope.process_source=ProcessStartSource::kKernelBSDStart;
+    if(kind==CaptureScopeKind::kWindow)context.title={1,TitleAvailability::kReady};
+    if(kind==CaptureScopeKind::kPage)context.bundle_id="com.google.Chrome";
+    if(kind==CaptureScopeKind::kApplication) {
+      context.window_pid=0;context.window_id=0;context.window={};context.window_title.clear();
+      context.selection_method="frontmost-application/selected-display";context.native_window={};
+    }
+    const auto observe=[&](MarkController& marks) {
+      auto window=WindowFor(context,marks.window_observation().generation+1);
+      window.pid=context.pid;window.application_available=true;window.application_start_identity_us=kernel?0:start;
+      if(kernel){window.kernel_native_window=context.native_window;window.native_window={1,0,{},0};window.kernel_application_start_identity_us=start;}
+      marks.SetWindowObservation(window);marks.SetDisplayObservation(context.displays);
+      if(kind==CaptureScopeKind::kPage) {
+        seethis::platform::ChromePageSample sample;sample.availability=PageAvailability::kReady;
+        sample.browser_pid=context.pid;sample.window_id=context.window_id;sample.window_bounds=context.window;
+        sample.process_start_identity_us=700;sample.opaque_tab_id="scope-owned-tab";sample.url="https://example.test/scope";
+        marks.SetPageObservation({PageAvailability::kReady,marks.page_observation().generation+1,Now(),
+            seethis::platform::MakeChromePageIdentity(sample)});
+      }
+    };
+    {
+      ReferenceStore store(directory);MarkController marks(store,[](const auto&){return true;});
+      marks.SetViewportContinuity(1,true);observe(marks);
+      for(unsigned round=0;round<2;++round) {
+        const auto id=Identifier(6100+offset+round);const auto generation=marks.Begin(id);
+        Check(marks.BindContext(generation,context),"explicit scope production controller admission");
+        marks.Captured(generation,Capture());
+        marks.Release(generation,std::vector<std::vector<DisplayPoint>>{Path(),Path(10)},Stamp{1'000'002,1002});
+        store.WaitForIdleForTesting();
+        Check(store.LookupMetadata(id)->state==ReferenceJobState::kReady,
+            "page/window/app consecutive multi-stroke capture reaches Ready without page wait for basic scopes");
+        Check(store.Collection(id).shots.front().metadata->context.scope==context.scope,
+            "scope remains frozen in finalized production metadata");
+      }
+      Check(store.UpdateMarkNote(root,StableMarkId(root,0),"scope note",0).status==MarkNoteUpdateStatus::kUpdated,
+          "scoped mark note persists through production note writer");
+      auto appended=context;appended.scope={kernel?2u:1u,CaptureScopeKind::kWindow,1,start,true};
+      if(kernel)appended.scope.process_source=ProcessStartSource::kKernelBSDStart;
+      appended.window_pid=appended.pid;appended.window_id=500;appended.window={0,0,100,100};
+      appended.window_title="Original window";appended.native_window={kernel?2u:1u,start,"scope-test",1};
+      appended.selection_method="frontmost-pid/topmost-normal-containing-initial-point";
+      auto window=WindowFor(appended,marks.window_observation().generation+1);
+      window.application_available=true;window.application_start_identity_us=kernel?0:start;
+      if(kernel){window.kernel_native_window=appended.native_window;window.native_window={1,0,{},0};window.kernel_application_start_identity_us=start;}
+      marks.SetWindowObservation(window);
+      const auto generation=marks.BeginAppendReference(root,1,Identifier(6102+offset));
+      Check(generation&&marks.BindContext(generation,appended),"Append binds its independent frozen scope");
+      marks.Captured(generation,Capture());marks.Release(generation,Path(),Stamp{1'000'002,1002});store.WaitForIdleForTesting();
+      const auto collection=store.Collection(root);const auto notes=store.MarkSnapshots(root);
+      Check(collection.shots.size()==2&&collection.shots.front().metadata->context.scope.kind==kind&&
+          collection.shots.back().metadata->context.scope.kind==CaptureScopeKind::kWindow&&
+          notes.marks.size()==3&&notes.marks[0].note=="scope note"&&notes.marks[2].number==3,
+          "mixed-scope Append preserves each shot, original note and global numbering");
+      if(kind==CaptureScopeKind::kApplication) {
+        observe(marks);Check(!marks.marks().empty(),"application index selects current instance/display with no window ID");
+        auto other=window;other.pid+=1;other.generation=marks.window_observation().generation+1;marks.SetWindowObservation(other);
+        Check(marks.marks().empty(),"application switch hides ink and its shared source eligibility");
+        observe(marks);Check(!marks.marks().empty(),"fresh A after B restores application marks");
+        marks.SetPresentationPermitted(false);Check(marks.marks().empty(),"global hide gates application projection");
+        marks.SetPresentationPermitted(true);Check(!marks.marks().empty(),"global show restores application projection");
+        marks.SetDisplayObservation({});Check(marks.marks().empty(),"missing display never falls back application projection");
+        marks.SetDisplayObservation(context.displays);
+        const auto target=marks.BeginOwnUIPresentationSource();
+        Check(target&&target->context.scope.kind==CaptureScopeKind::kApplication,"own Inspector source preserves explicit app identity without a native window");
+        marks.SetOwnInputFocus(true);
+        auto owned=WindowFor(context,marks.window_observation().generation+10);
+        owned.pid=context.pid;owned.application_available=true;owned.application_start_identity_us=kernel?0:start;
+        if(kernel)owned.kernel_application_start_identity_us=start;
+        owned.availability=WindowAvailability::kUnavailable;
+        Check(marks.PublishOwnUIPresentationObservation(*target,owned,{}),"own UI fresh application observation uses original process instance/display scope");
+        Check(!marks.marks().empty(),"app ink and shared note eligibility survive legitimate own Inspector ownership");
+        marks.SetOwnInputFocus(false);marks.EndOwnUIPresentationSource();observe(marks);
+      }
+    }
+    {
+      ReferenceStore reopened(directory);reopened.WaitForIdleForTesting();
+      const auto collection=reopened.Collection(root);const auto notes=reopened.MarkSnapshots(root);
+      Check(collection.status==MarkNotesStatus::kReady&&collection.shots.size()==2&&
+          collection.shots.front().metadata->context.scope==context.scope&&notes.marks[0].note=="scope note",
+          "Ready v10 cold restart preserves per-shot scope and note");
+      Check(reopened.Delete(root)==DeleteResult::kDeleted&&reopened.Collection(root).status==MarkNotesStatus::kDeleted,
+          "whole-reference deletion removes mixed-scope collection");
+    }
+  }
+  std::cout<<checks<<" explicit scope store/controller lifecycle checks passed\n";
+}
+
+void ColdCorruptPresentationWithdrawal() {
+  for(const auto schema:{1u,2u}) {
+    TempDirectory temp;
+    {
+      ReferenceStore store(temp.path);
+      auto reference=PendingReference(idA);reference.schema=schema;
+      if(schema==2) {
+        reference.capture_display_id=1;reference.path.clear();reference.regions={{Path(),{},{},{}}};
+        reference.capture_api="ScreenCaptureKit.SCScreenshotManager.selected-display";
+        reference.provenance="historical;context-before-overlay;single-selected-display;pixels-at-async-completion;multi-region;no-semantic-object-id";
+      }
+      Check(store.AcceptPending(reference,0,0).state==ReferenceJobState::kPending,"cold corruption fixture accepted");
+      store.FinalizeAsync(idA,Capture());store.WaitForIdleForTesting();
+      Check(store.LookupMetadata(idA)->state==ReferenceJobState::kReady,"cold corruption fixture persisted ready");
+    }
+    ReferenceStore store(temp.path);store.WaitForIdleForTesting();
+    Check(!store.Jobs().front().ready,"cold reopened fixture has no hydrated original payload");
+    MarkController marks(store,[](const auto&){return true;});marks.SetViewportContinuity(1,true);Observe(marks,ContextFixture());
+    Check(marks.marks().size()==1&&marks.LiveMarkSnapshots(idA).marks.size()==1&&
+        marks.HitIdentity(Path().front(),2,ContextFixture().displays)==idA,"cold valid metadata initially supplies ink number and hit");
+    {std::ofstream corrupt(temp.path/(idA+".stref"));corrupt<<"corrupt original fixture";}
+    {std::ofstream corrupt(temp.path/(idA+".source.png"));corrupt<<"corrupt original fixture";}
+    const auto discovered=store.Lookup(idA);
+    Check(discovered&&discovered->state==ReferenceJobState::kFailed&&discovered->code=="corrupt",
+        "cold hydration explicitly discovers original corruption");
+    const auto absent=[&] {
+      return !store.ReadPresentation(idA)&&marks.marks().empty()&&marks.jobs().empty()&&
+          marks.presentation_jobs().empty()&&marks.LiveMarkSnapshots(idA).marks.empty()&&
+          !marks.HitIdentity(Path().front(),2,ContextFixture().displays)&&!marks.HitJob(Path().front(),2,ContextFixture().displays);
+    };
+    Check(absent(),"discovered corrupt original withdraws ink number and every ready/failed fallback hit immediately");
+    auto other=ContextFixture();other.window_id+=1;other.window_title="B";Observe(marks,other);Observe(marks,ContextFixture());
+    Check(absent(),"A to B to A cannot resurrect discovered corrupt ink numbers or hits");
+    const auto history=marks.inspector_jobs();
+    Check(history.size()==1&&history.front().state==ReferenceJobState::kFailed&&history.front().code=="corrupt",
+        "corrupt durable reference status remains available to Inspector history");
+    const auto pending=store.AcceptPending(PendingReference(idB),0,0);
+    Check(pending.state==ReferenceJobState::kPending&&store.ReadPresentation(idB)->notes.status==MarkNotesStatus::kPending,
+        "corruption withdrawal preserves legitimate pending note publication");
+    store.Fail(idB,"capture_failed");store.WaitForIdleForTesting();
+    Check(store.ReadPresentation(idB)&&store.ReadPresentation(idB)->job.state==ReferenceJobState::kFailed&&
+        marks.jobs().size()==1,"legitimate capture failure keeps existing presentation fallback while corrupt reference stays withdrawn");
+  }
+  std::cout<<"Cold original corruption publication withdrawal checks passed for schema1 and2\n";
+}
+
+void ActivePresentationPublication() {
+  TempDirectory temp;ReferenceStore store(temp.path);MarkController marks(store,[](const auto&){return true;});
+  const auto pending=store.AcceptPending(PendingReference(Identifier(999)),0,0);
+  const auto pendingPresentation=store.ReadPresentation(Identifier(999));
+  Check(pending.state==ReferenceJobState::kPending&&pendingPresentation&&pendingPresentation->notes.status==MarkNotesStatus::kPending&&
+      pendingPresentation->notes.marks.size()==1,"pending note publication preserves stable owner metadata before image completion");
+  store.Fail(Identifier(999),"fixture-complete");store.WaitForIdleForTesting();
+  Commit(store,marks);
+  const auto original=store.ReadPresentation(idA);
+  Check(original&&original->notes.status==MarkNotesStatus::kReady&&original->notes.marks.size()==1,
+      "presentation publishes validated ready membership and precomputed number metadata");
+  const auto revision=store.ReadPresentation()->revision;
+  (void)store.Collection(idA);(void)store.MarkSnapshots(idA);
+  Check(store.ReadPresentation()->revision==revision,"unchanged durable read does not rebuild current source publication");
+  Check(store.UpdateMarkNote(idA,StableMarkId(idA,0),"cached note",0).status==MarkNoteUpdateStatus::kUpdated,
+      "presentation note fixture saves through real durable API");
+  Check(store.ReadPresentation(idA)->notes.marks.front().note=="cached note"&&original->notes.marks.front().note.empty(),
+      "note publication changes atomically while older snapshot stays immutable");
+  Check(store.UpdateMarkVisibility(idA,StableMarkId(idA,0),false,1).status==MarkNoteUpdateStatus::kUpdated&&
+      !store.ReadPresentation(idA)->notes.marks.front().visible,"visibility edit immediately updates published metadata");
+  ReferenceStoreTestHooks uncertain;uncertain.fail_note_after_rename=true;store.SetTestHooks(uncertain);
+  const auto uncertainResult=store.UpdateMarkNote(idA,StableMarkId(idA,0),"cached note",2);
+  Check(uncertainResult.status==MarkNoteUpdateStatus::kCommitUncertain&&store.ReadPresentation(idA)->notes.revision==3&&
+      store.ReadPresentation(idA)->notes.marks.front().note=="cached note","uncertain note rename republishes validated readback atomically");
+  store.SetTestHooks({});
+  auto other=ContextFixture();other.window_id+=10;other.window_title="other current source";
+  for(unsigned index=0;index<15;++index) {
+    char identity[33];std::snprintf(identity,sizeof(identity),"%032x",index+100);
+    auto metadata=PendingReference(identity);metadata.context=other;
+    AppendResult result;store.AppendReferenceAsync(idA,index+1,identity,metadata,Capture(),[&](auto value){result=value;});
+    store.WaitForIdleForTesting();Check(result.status==AppendStatus::kCommitted,"mixed-source synthetic append commits");
+  }
+  Observe(marks,ContextFixture());
+  Check(marks.marks().size()==1&&marks.LiveShots(idA).size()==1&&marks.LiveMarkSnapshots(idA).marks.size()==1,
+      "current source A excludes every unrelated shot within a shared appended root");
+  auto unavailable=WindowObservation{WindowAvailability::kUnavailable,marks.window_observation().generation+1,Now()};
+  marks.SetWindowObservation(unavailable);Check(marks.marks().empty(),"unavailable current observation hides cached ink");
+  auto rejected=WindowFor(other,unavailable.generation);marks.SetWindowObservation(rejected);
+  Check(marks.marks().empty(),"same-generation fresh payload cannot replace an admitted unavailable observation");
+  Observe(marks,other);Check(marks.marks().size()==15&&marks.LiveMarkSnapshots(idA).marks.size()==15,
+      "higher-generation source B restores all and only its fifteen appended shots");
+  Observe(marks,ContextFixture());Check(marks.marks().size()==1&&marks.LiveMarkSnapshots(idA).marks.front().note=="cached note",
+      "A to B to A restores immutable coordinates and edited note");
+  std::mutex mutex;std::condition_variable condition;bool entered=false,release=false;
+  ReferenceStoreTestHooks hooks;hooks.stage=[&](std::string_view stage,std::string_view) {
+    if(stage!="append_before_publish")return;
+    std::unique_lock lock(mutex);entered=true;condition.notify_all();condition.wait(lock,[&]{return release;});
+  };store.SetTestHooks(hooks);
+  auto metadata=PendingReference(idF);AppendResult result;
+  store.AppendReferenceAsync(idA,16,idF,metadata,Capture(),[&](auto value){result=value;});
+  {std::unique_lock lock(mutex);Check(condition.wait_for(lock,std::chrono::seconds(5),[&]{return entered;}),"controlled append owns persistence lock");}
+  const auto began=std::chrono::steady_clock::now();
+  // A watchdog releases the worker even if this regression reintroduces IO.
+  std::thread watchdog([&]{std::unique_lock lock(mutex);condition.wait_for(lock,std::chrono::milliseconds(200),[&]{return release;});release=true;condition.notify_all();});
+  for(int sample=0;sample<20;++sample) {
+    marks.Expire(Now());Check(marks.marks().size()==1&&marks.HitIdentity(Path().front(),2,ContextFixture().displays)==idA,
+        "pointer and deadline processing consume previous valid publication during held append persistence");
+  }
+  const auto elapsed=std::chrono::steady_clock::now()-began;
+  {std::lock_guard lock(mutex);release=true;}condition.notify_all();watchdog.join();store.WaitForIdleForTesting();store.SetTestHooks({});
+  Check(elapsed<std::chrono::milliseconds(100),"current-source event processing never waits for collection persistence lock");
+  Check(result.status==AppendStatus::kCommitted&&marks.marks().size()==2,"completed append publishes new current shot atomically");
+  {std::ofstream corrupt(temp.path/(idA+".collection"));corrupt<<"malicious invalid manifest";}
+  Check(store.Collection(idA).status==MarkNotesStatus::kCorrupt&&store.ReadPresentation(idA)->notes.status==MarkNotesStatus::kCorrupt&&marks.marks().empty(),
+      "explicit validation failure withdraws all cached ink and number metadata");
+  Check(store.Delete(idA)==DeleteResult::kDeleted&&!store.ReadPresentation(idA)&&marks.marks().empty(),
+      "delete withdraws publication and prevents cached mark resurrection");
+  Observe(marks,other);Observe(marks,ContextFixture());Check(marks.marks().empty(),"deleted publication stays absent across source return");
+  Commit(store,marks,idB);const auto accepted=store.LookupMetadata(idB)->accepted_utc_us;
+  ReferenceStoreTestHooks expired;expired.now=[=]{return Stamp{accepted+8LL*24*60*60*1'000'000,Now().monotonic_us};};store.SetTestHooks(expired);
+  Check(!store.ReadPresentation(idB)&&marks.marks().empty(),"cached metadata obeys retention deadline before a pruning sweep");
+  store.SetTestHooks({});
+  std::cout<<"Active presentation publication/current-shot/held-IO regression checks passed\n";
+}
+
 }
 int main(int argc,char** argv) {
   try {
+    if(argc==2&&std::string_view(argv[1])=="--finder-instance-only") {TypedProcessIdentityVisibility();ExplicitScopeStoreLifecycle(true);CapturedSourceContext();SourceContextLegacySidecars();TitleScopedVisibility();NativeWindowLifetimes();return 0;}
+    if(argc==2&&std::string_view(argv[1])=="--context-scope-component-only") {
+      ExplicitContextScopes();ExplicitScopeStoreLifecycle();return 0;
+    }
+    ColdCorruptPresentationWithdrawal();
+    if(argc==2&&std::string_view(argv[1])=="--cold-corrupt-presentation-component-only")return 0;
+    ActivePresentationPublication();
+    if(argc==2&&std::string_view(argv[1])=="--active-presentation-component-only")return 0;
+    StatusURLActionBoundaries();FailedActionCustodyLifecycle();
+    if(argc==2&&std::string_view(argv[1])=="--f3-deadline-component-only") {Transactions();SeparatedCaptureDeadlines();std::cout<<checks<<" F3 deadline checks passed\n";return 0;}
+    if(argc==2&&std::string_view(argv[1])=="--status-action-component-only") {
+      std::cout<<checks<<" status action checks passed\n";return 0;
+    }
+#ifdef __APPLE__
+    if(argc==2&&std::string_view(argv[1])=="--chrome-provider-component-only") {
+      ChromeProductionAdapter();std::cout<<checks<<" Chrome production adapter checks passed\n";return 0;
+    }
+#endif
     if(argc==2&&std::string_view(argv[1])=="--own-source-component-only"){OwnUIPresentationContinuity();return 0;}
     RejectedPrivateObservationCoordinates();
     if(argc==2&&std::string_view(argv[1])=="--rejected-private-component-only")return 0;

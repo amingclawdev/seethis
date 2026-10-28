@@ -474,7 +474,7 @@ bool NativeIdentityMatches(const NativeWindowIdentity& required,
   // Preserve the original weaker fresh-tuple branch for genuine old records.
   if(required.version==0)return required.process_start_identity_us==0 &&
       required.observation_session.empty() && required.incarnation==0;
-  if(required.version!=1 || current.version!=1 ||
+  if((required.version!=1&&required.version!=2) || current.version!=required.version ||
      required.process_start_identity_us<=0 || current.process_start_identity_us<=0 ||
      required.process_start_identity_us!=current.process_start_identity_us ||
      required.observation_session.empty() || current.observation_session.empty() ||
@@ -484,16 +484,90 @@ bool NativeIdentityMatches(const NativeWindowIdentity& required,
       required.incarnation==current.incarnation;
 }
 }
+bool ValidCaptureScope(const Context& c) {
+  const auto& scope=c.scope;
+  if(!scope.policy_present)return scope.version==0 && scope.kind==CaptureScopeKind::kLegacy &&
+      scope.display_id==0 && scope.process_start_identity_us==0 && !scope.title_required &&
+      scope.process_source==ProcessStartSource::kUnspecified && c.native_window.version!=2;
+  const bool kernel=scope.version==2&&scope.process_source==ProcessStartSource::kKernelBSDStart;
+  if((!kernel&&(scope.version!=1||scope.process_source!=ProcessStartSource::kUnspecified)) ||
+     (kernel&&scope.kind==CaptureScopeKind::kPage) || scope.process_start_identity_us<=0 ||
+     scope.process_start_identity_us>c.observed.utc_us || c.pid<=0 || c.bundle_id.empty() ||
+     std::none_of(c.displays.begin(),c.displays.end(),[&](const auto& d){return d.id==scope.display_id;}))return false;
+  if(scope.kind==CaptureScopeKind::kApplication)
+    return !scope.title_required && c.window_id==0 && c.window_pid==0 && c.window_title.empty() &&
+        c.selection_method=="frontmost-application/selected-display";
+  return (!scope.title_required || (scope.kind==CaptureScopeKind::kWindow && c.bundle_id!="com.google.Chrome" &&
+      c.title.version==1 && c.title.availability==TitleAvailability::kReady && ValidSourceContextText(c.window_title,1024))) &&
+      (scope.kind==CaptureScopeKind::kPage || scope.kind==CaptureScopeKind::kWindow) &&
+      c.window_id>0 && c.window_pid==c.pid && c.native_window.version==(kernel?2:1) &&
+      !c.native_window.observation_session.empty() && c.native_window.incarnation>0 &&
+      c.native_window.process_start_identity_us==scope.process_start_identity_us;
+}
+std::string WindowSourceKey(std::int64_t pid,std::uint64_t window) {
+  return std::to_string(pid)+":"+std::to_string(window);
+}
+std::string ApplicationSourceKey(std::int64_t pid,std::int64_t start,DisplayId display,ProcessStartSource source) {
+  return std::to_string(static_cast<unsigned>(source))+":"+std::to_string(pid)+":"+std::to_string(start)+":"+std::to_string(display);
+}
+ProcessStartSource CaptureProcessSource(const Context& context) {
+  if(context.scope.version==2)return context.scope.process_source;
+  if(context.scope.version==1||context.native_window.version==1)return ProcessStartSource::kLaunchDate;
+  return ProcessStartSource::kUnspecified;
+}
+const char* ProcessStartSourceName(ProcessStartSource source) {
+  switch(source) {
+    case ProcessStartSource::kLaunchDate:return "launch-services-date-v1";
+    case ProcessStartSource::kKernelBSDStart:return "kernel-bsd-start-v1";
+    default:return "legacy-unspecified";
+  }
+}
+const NativeWindowIdentity& WindowIdentityForContext(const Context& context,const WindowObservation& observation) {
+  return CaptureProcessSource(context)==ProcessStartSource::kKernelBSDStart?
+      observation.kernel_native_window:observation.native_window;
+}
+std::int64_t ApplicationIdentityForContext(const Context& context,const WindowObservation& observation) {
+  return CaptureProcessSource(context)==ProcessStartSource::kKernelBSDStart?
+      observation.kernel_application_start_identity_us:observation.application_start_identity_us;
+}
+const char* CaptureScopeKindName(CaptureScopeKind kind) {
+  switch(kind) {
+    case CaptureScopeKind::kLegacy:return "legacy";
+    case CaptureScopeKind::kPage:return "page";
+    case CaptureScopeKind::kWindow:return "window";
+    case CaptureScopeKind::kApplication:return "application";
+  }
+  return "unsupported";
+}
+const char* CaptureScopeName(const Context& c) {
+  if(!ValidCaptureScope(c))return "Unavailable scope";
+  switch(c.scope.kind) {
+    case CaptureScopeKind::kPage:return "Follows this page";
+    case CaptureScopeKind::kWindow:return "Follows this window";
+    case CaptureScopeKind::kApplication:return "Follows this app (fixed screen positions across its windows)";
+    default:return "Legacy source";
+  }
+}
 bool WindowObservationMatchesContext(const Context& required,
                                      const WindowObservation& current) {
   const auto now=Now();
   const auto age=now.monotonic_us-current.observed.monotonic_us;
-  return NativeIdentityMatches(required.native_window,current.native_window) &&
+  if(!ValidCaptureScope(required))return false;
+  if(required.scope.kind==CaptureScopeKind::kApplication) {
+    const auto stamp=current.application_observed.monotonic_us?current.application_observed:current.observed;
+    const auto app_age=now.monotonic_us-stamp.monotonic_us;
+    return current.application_available && current.generation>0 &&
+        stamp.monotonic_us>0 && app_age>=0 && app_age<=2'000'000 &&
+        current.pid==required.pid && current.bundle_id==required.bundle_id &&
+        ApplicationIdentityForContext(required,current)==required.scope.process_start_identity_us;
+  }
+  const auto& native=WindowIdentityForContext(required,current);
+  return NativeIdentityMatches(required.native_window,native) &&
       (required.native_window.version==0 ||
        (required.pid==required.window_pid && required.window_pid>0 &&
         required.window_id>0 && !required.bundle_id.empty() && ValidRect(required.window) &&
         required.native_window.process_start_identity_us<=required.observed.utc_us &&
-        current.native_window.process_start_identity_us<=current.observed.utc_us)) &&
+        native.process_start_identity_us<=current.observed.utc_us)) &&
       current.availability==WindowAvailability::kReady &&
       current.generation>0 && current.observed.monotonic_us>0 &&
       age>=0 && age<=2'000'000 && current.pid==required.window_pid &&
@@ -513,6 +587,13 @@ bool CaptureContextProvenanceSupported(const Context& c) {
        !Same(d.logical_to_pixels,{d.scale,-d.scale,d.pixels.x-d.logical.x*d.scale,
            d.pixels.y+(d.logical.y+d.logical.height)*d.scale}))return false;
   }
+  if(!ValidCaptureScope(c))return false;
+  if(c.scope.kind==CaptureScopeKind::kApplication)
+    return c.self_pid>0 && c.pid!=c.self_pid && !c.app_name.empty() &&
+        ValidStamp(c.observed) && !c.displays.empty() &&
+        Finite(c.quartz_to_appkit_top) && c.quartz_to_appkit_top>0 &&
+        c.exclusion_method=="exact-window-allowlist;self-pid-rejected;child-windows-off" &&
+        !c.excluded_window_ids.empty();
   return c.pid>0 && c.window_pid==c.pid && c.self_pid>0 && c.self_pid!=c.pid &&
       c.window_id>0 && c.window_layer==0 && ValidRect(c.window) &&
       Finite(c.quartz_to_appkit_top) && c.quartz_to_appkit_top>0 &&
@@ -529,6 +610,12 @@ bool LegacyCaptureTitleSupported(const Context& c) {
 }
 }
 const char* TitleScopeCapabilityName(const Context& c) {
+  if(c.scope.policy_present) {
+    if(!ValidCaptureScope(c))return "Unavailable capture scope; overlays hidden";
+    if(c.scope.kind==CaptureScopeKind::kApplication)return CaptureScopeName(c);
+    if(c.scope.kind==CaptureScopeKind::kWindow&&!c.scope.title_required)
+      return "Follows this window; no title constraint was available when captured";
+  }
   if(c.bundle_id=="com.google.Chrome")return "Chrome page identity; title not applicable";
   if(c.title.version==0) {
     if(c.title.policy_present || c.title.availability!=TitleAvailability::kUnavailable || !LegacyCaptureTitleSupported(c))
@@ -563,6 +650,10 @@ bool ReferenceVisible(const Context& context,
                       const WindowObservation& window_observation,
                       const PageObservation& page_observation) {
   if(!WindowObservationMatchesContext(context,window_observation))return false;
+  if(context.scope.kind==CaptureScopeKind::kApplication)return !page_identity;
+  if(context.scope.kind==CaptureScopeKind::kWindow)
+    return !page_identity && (!context.scope.title_required || TitleContextVisible(context,window_observation));
+  if(context.scope.kind==CaptureScopeKind::kPage && !page_identity)return false;
   if(!page_identity)return context.bundle_id!="com.google.Chrome" &&
       TitleContextVisible(context,window_observation);
   return PageIdentityMatchesContext(*page_identity,context) &&
@@ -741,17 +832,18 @@ void ProjectText(std::string_view value,std::size_t limit,
 }
 SourceContextProjection ProjectSourceContext(const Reference& reference) {
   SourceContextProjection result;const auto& context=reference.context;
+  result.scope=context.scope;result.scope_label=CaptureScopeName(context);result.process_source=CaptureProcessSource(context);
   ProjectText(context.app_name,256,result.app_name,result.app_name_availability);
   ProjectText(context.bundle_id,512,result.bundle_id,result.bundle_id_availability);
   ProjectText(context.window_title,1024,result.window_title,result.window_title_availability);
   const bool chrome=context.bundle_id=="com.google.Chrome";
-  if(chrome&&context.window_title.empty())
+  if((chrome||context.scope.kind==CaptureScopeKind::kApplication)&&context.window_title.empty())
     result.window_title_availability=SourceFieldAvailability::kNotApplicable;
   if(context.window_id>0)result.window_id=context.window_id;
   if(ValidStamp(context.observed))result.context_observed_utc_us=context.observed.utc_us;
   if(ValidStamp(reference.image_completed))
     result.image_completed_utc_us=reference.image_completed.utc_us;
-  if(!chrome)result.page_url_availability=SourceFieldAvailability::kNotApplicable;
+  if(!chrome||(context.scope.policy_present&&context.scope.kind!=CaptureScopeKind::kPage))result.page_url_availability=SourceFieldAvailability::kNotApplicable;
   else if(reference.captured_page) {
     const auto& metadata=*reference.captured_page;
     if(CapturedPageMatches(metadata,reference.page_identity,reference.context)) {
@@ -802,6 +894,11 @@ Bytes Serialize(const Reference& reference) {
     const std::uint64_t title_tail=5;w(title_tail);
     w(copy.context.title.version,copy.context.title.availability);
   }
+  if(copy.context.scope.policy_present) {
+    const std::uint64_t scope_tail=6;const auto& scope=copy.context.scope;
+    w(scope_tail,scope.version,scope.kind,scope.display_id,scope.process_start_identity_us,scope.title_required);
+    if(scope.version==2)w(scope.process_source);
+  }
   return w.bytes;
 }
 std::optional<Reference> Deserialize(const Bytes& bytes) {
@@ -833,7 +930,7 @@ std::optional<Reference> Deserialize(const Bytes& bytes) {
       auto& identity=v.context.native_window;
       r(identity.version,identity.process_start_identity_us,
         identity.observation_session,identity.incarnation);
-      if(identity.version!=1 || identity.observation_session.size()>128)return {};
+      if((identity.version!=1&&identity.version!=2) || identity.observation_session.size()>128)return {};
       next_version=0;
       if(r.offset<bytes.size())r(next_version);
     }
@@ -843,6 +940,13 @@ std::optional<Reference> Deserialize(const Bytes& bytes) {
       r(v.context.title.version,v.context.title.availability);
       v.context.title.policy_present=true;
       next_version=0;
+      if(r.offset<bytes.size())r(next_version);
+    }
+    if(next_version==6) {
+      auto& scope=v.context.scope;
+      r(scope.version,scope.kind,scope.display_id,scope.process_start_identity_us,scope.title_required);
+      if(scope.version==2)r(scope.process_source);
+      scope.policy_present=true;next_version=0;
     }
     if(next_version!=0)return {};
     if(r.offset!=bytes.size() || Serialize(v)!=bytes)return {};
@@ -911,12 +1015,9 @@ bool Validate(const Reference& r,std::string* error) {
       return fail("invalid page identity");
   }
   const auto& c=r.context;
-  if(c.pid<=0 || c.self_pid<=0 || c.pid==c.self_pid || c.window_pid!=c.pid || c.window_id==0 || c.window_layer!=0 ||
-     !Finite(c.quartz_to_appkit_top) || c.quartz_to_appkit_top<=0 ||
-     c.app_name.empty() || (c.bundle_id.empty() && c.executable.empty()) || !ValidRect(c.window) ||
-     c.selection_method!="frontmost-pid/topmost-normal-containing-initial-point" ||
-     c.exclusion_method!="exact-window-allowlist;self-pid-rejected;child-windows-off" || c.excluded_window_ids.empty() ||
-     std::find(c.excluded_window_ids.begin(),c.excluded_window_ids.end(),c.window_id)!=c.excluded_window_ids.end())return fail("invalid context/provenance");
+  if(!CaptureContextProvenanceSupported(c) ||
+     ((c.scope.kind==CaptureScopeKind::kPage)!=bool(r.page_identity) && c.scope.policy_present))
+    return fail("invalid context/provenance or scope");
   std::set<std::string> uuids;std::set<DisplayId> ids;
   for(const auto& d:c.displays) {
     if(d.uuid.empty() || !uuids.insert(d.uuid).second || !ids.insert(d.id).second || d.id==0 ||
@@ -1065,6 +1166,9 @@ struct ReferenceStore::Impl {
     AnnotatedRepresentation representation;
     std::shared_ptr<const Reference> metadata;
   };
+  std::shared_ptr<const ReferencePresentationState> presentation{
+      std::make_shared<const ReferencePresentationState>()};
+  std::shared_ptr<const std::function<Stamp()>> presentation_now;
   mutable std::mutex mutex;
   std::condition_variable work_ready;
   std::condition_variable idle;
@@ -1149,7 +1253,7 @@ std::string ReadyStateText(const ReferenceJobSnapshot& source) {
   if(job.context.bundle_id=="com.google.Chrome")job.context.window_title.clear();
   if(metadata.context.bundle_id=="com.google.Chrome")
     metadata.context.window_title.clear();
-  const std::uint64_t version=(metadata.context.title.policy_present || job.context.title.policy_present ||
+  const std::uint64_t version=(metadata.context.scope.version==2||job.context.scope.version==2)?11:(metadata.context.scope.policy_present || job.context.scope.policy_present)?10:(metadata.context.title.policy_present || job.context.title.policy_present ||
       metadata.context.title.version || job.context.title.version ||
       metadata.context.title.availability!=TitleAvailability::kUnavailable ||
       job.context.title.availability!=TitleAvailability::kUnavailable)?9:
@@ -1189,13 +1293,18 @@ std::string ReadyStateText(const ReferenceJobSnapshot& source) {
   }
   if(version>=9)for(auto* context:{&job.context,&metadata.context})
     writer(context->title.version,context->title.availability);
+  if(version>=10)for(auto* context:{&job.context,&metadata.context}) {
+    const auto& scope=context->scope;
+    writer(scope.version,scope.kind,scope.display_id,scope.process_start_identity_us,scope.title_required);
+    if(version>=11)writer(scope.process_source);
+  }
   return {writer.bytes.begin(),writer.bytes.end()};
 }
 // Compare every positional capture field, not just the native extension. The
 // original bytes stay on disk; a disagreement only retires live presentation.
 bool SameCaptureContext(Context a,Context b) {
   Writer first,second;first(a);second(b);
-  return first.bytes==second.bytes &&
+  return first.bytes==second.bytes && a.scope==b.scope &&
       a.native_window.version==b.native_window.version &&
       a.native_window.process_start_identity_us==b.native_window.process_start_identity_us &&
       a.native_window.observation_session==b.native_window.observation_session &&
@@ -1241,7 +1350,10 @@ bool ValidReadyMetadata(const Reference& value,std::string_view id) {
               std::all_of(region.subpaths.begin(), region.subpaths.end(),
                           [](const auto& path) { return path.size() >= 2; });
           }));
-  const bool valid = (value.schema==1||value.schema==2)&&subpaths_ok&&value.id==id&&value.mark_id==id&&SafeID(value.id)&&
+  const bool valid = ValidCaptureScope(value.context)&&
+      (!value.context.scope.policy_present||CaptureProvenanceSupported(value))&&
+      (!value.context.scope.policy_present || ((value.context.scope.kind==CaptureScopeKind::kPage)==bool(value.page_identity)))&&
+      (value.schema==1||value.schema==2)&&subpaths_ok&&value.id==id&&value.mark_id==id&&SafeID(value.id)&&
       (!value.page_identity||(ValidPageIdentity(*value.page_identity)&&
        PageIdentityMatchesContext(*value.page_identity,value.context)))&&
       value.context.pid>0&&!EffectiveRegions(value).empty()&&ValidStamp(value.requested)&&
@@ -1277,7 +1389,7 @@ bool ReadReadyState(const std::filesystem::path& path,
     if(std::filesystem::file_size(path)>4*1024*1024)return false;
     const auto bytes=ReadFile(path);Reader reader{bytes};std::uint64_t version=0;
     Reference metadata;reader(version);
-    if(version!=2&&version!=3&&version!=4&&version!=5&&version!=6&&version!=7&&version!=8&&version!=9)return false;
+    if(version!=2&&version!=3&&version!=4&&version!=5&&version!=6&&version!=7&&version!=8&&version!=9&&version!=10&&version!=11)return false;
     reader(job->accepted_utc_us,job->terminal_utc_us,
            job->key_down_monotonic_ms,job->key_up_monotonic_ms,
            job->circle_completed,job->crop_margin,job->context,job->path);
@@ -1327,19 +1439,25 @@ bool ReadReadyState(const std::filesystem::path& path,
         if(identity.observation_session.size()>128)return false;
       }
     }
-    if(!ValidReadyMetadata(metadata,job->id)||(version<9 && reader.offset!=bytes.size())||
-       job->accepted_utc_us<=0||job->terminal_utc_us<=0)return false;
     if(version>=9)for(auto* context:{&job->context,&metadata.context}) {
       reader(context->title.version,context->title.availability);
       context->title.policy_present=true;
     }
-    if(reader.offset!=bytes.size())return false;
+    if(version>=10)for(auto* context:{&job->context,&metadata.context}) {
+      auto& scope=context->scope;
+      reader(scope.version,scope.kind,scope.display_id,scope.process_start_identity_us,scope.title_required);
+      if(version>=11)reader(scope.process_source);
+      scope.policy_present=true;
+    }
+    if(!ValidReadyMetadata(metadata,job->id)||reader.offset!=bytes.size()||
+       job->accepted_utc_us<=0||job->terminal_utc_us<=0)return false;
     const bool native_policy_supported=version!=8 ||
         (job->context.native_window.version==1 && metadata.context.native_window.version==1);
     const bool capture_consistent=native_policy_supported && SameCaptureContext(job->context,metadata.context) &&
         job->circle_completed.utc_us==metadata.circle_completed.utc_us &&
         job->circle_completed.monotonic_us==metadata.circle_completed.monotonic_us &&
         job->crop_margin==metadata.crop_margin;
+    if(version>=10 && (!capture_consistent || !ValidCaptureScope(metadata.context)))return false;
     if(!capture_consistent || (metadata.context.bundle_id!="com.google.Chrome" &&
         !CaptureProvenanceSupported(metadata))) {
       for(auto* context:{&job->context,&metadata.context})
@@ -2045,7 +2163,8 @@ std::optional<StoredReference> FinalizeReference(Reference reference,
   if(allow_empty&&EffectiveRegions(reference).empty()) {
     const auto display=std::find_if(reference.context.displays.begin(),reference.context.displays.end(),
         [&](const auto& value){return value.id==reference.capture_display_id;});
-    if(reference.context.pid<=0||reference.context.pid!=reference.context.window_pid||
+    if(!ValidCaptureScope(reference.context)||reference.context.pid<=0||
+       (reference.context.scope.kind!=CaptureScopeKind::kApplication&&reference.context.pid!=reference.context.window_pid)||
        display==reference.context.displays.end()||display->pixels.width!=pixels.width||
        display->pixels.height!=pixels.height||!ValidPixels(pixels)||!ValidRect(display->logical)) {
       if(error)*error="empty_shot_display_unavailable";return {};
@@ -2164,6 +2283,104 @@ std::optional<StoredReference> FinalizeReference(Reference reference,
 }
 }  // namespace
 
+namespace {
+MarkNotesSnapshot PresentationNotes(std::string_view id,const ReferenceCollection& collection) {
+  MarkNotesSnapshot result;result.status=collection.status;
+  if(collection.status!=MarkNotesStatus::kReady)return result;
+  result.status=MarkNotesStatus::kReady;result.revision=collection.notes_revision;
+  for(const auto& shot:collection.shots) {
+    const auto& reference=*shot.metadata;const auto regions=EffectiveRegions(reference);
+    const auto placements=PlaceNumbers(reference,regions);
+    if(!placements){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
+    for(std::size_t local=0;local<regions.size();++local) {
+      const auto slot=shot.first_mark_slot+local;
+      const auto anchor=FirstPoint(regions[local]);
+      const auto bounds=NumberedMarkBounds(reference,local,regions,*placements);
+      if(!anchor||!bounds){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
+      result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
+          *anchor,*bounds,collection.notes[slot],collection.visible[slot],collection.notes_revision,
+          shot.id,local});
+    }
+  }
+  return result;
+}
+}
+void ReferenceStore::PublishPresentationLocked(const ReferenceJobSnapshot& job,ReferenceCollection collection) {
+  const auto previous=std::atomic_load(&impl_->presentation);
+  if(const auto found=previous->by_id.find(job.id);found!=previous->by_id.end()) {
+    const auto& old=*found->second;
+    const bool sameCollection=old.collection.status==collection.status&&
+        (collection.status!=MarkNotesStatus::kReady||
+         (job.metadata&&EncodeCollection(*job.metadata,old.collection)==EncodeCollection(*job.metadata,collection)));
+    if(old.job.state==job.state&&old.job.code==job.code&&old.job.metadata==job.metadata&&
+       old.retained_until_utc_us==job.accepted_utc_us+impl_->retention_ttl_us&&sameCollection)return;
+  }
+  auto entry=std::make_shared<ReferencePresentation>();
+  entry->job=job;entry->job.ready.reset();
+  entry->collection=std::move(collection);
+  entry->notes=PresentationNotes(job.id,entry->collection);
+  if(job.state==ReferenceJobState::kPending&&job.metadata) {
+    entry->notes.status=MarkNotesStatus::kPending;
+    const auto regions=EffectiveRegions(*job.metadata);
+    for(std::size_t slot=0;slot<regions.size();++slot)if(const auto anchor=FirstPoint(regions[slot]))
+      entry->notes.marks.push_back({StableMarkId(job.id,slot),slot,static_cast<std::uint32_t>(slot+1),
+          *anchor,{},"",true,0,job.id,slot});
+  }
+  for(std::size_t index=0;index<entry->collection.shots.size();++index) {
+    const auto& shot=entry->collection.shots[index];
+    if(!shot.metadata)continue;
+    entry->source_membership.emplace(std::to_string(shot.first_mark_slot)+":"+shot.metadata->source.sha256,index);
+    auto& notes=entry->shot_notes[shot.id];notes.status=entry->notes.status;notes.revision=entry->notes.revision;
+  }
+  for(const auto& mark:entry->notes.marks)entry->shot_notes[mark.shot_id].marks.push_back(mark);
+  entry->retained_until_utc_us=job.accepted_utc_us+impl_->retention_ttl_us;
+  auto state=std::make_shared<ReferencePresentationState>(*std::atomic_load(&impl_->presentation));
+  ++state->revision;
+  std::erase_if(state->jobs,[&](const auto& old){return old->job.id==job.id;});
+  state->by_id.erase(job.id);
+  // Discovered corrupt payloads retain their historical failure status, but
+  // must not re-enter the Pending/Failed live-stroke presentation fallback.
+  if(job.state!=ReferenceJobState::kDeleted&&job.state!=ReferenceJobState::kExpired&&
+     !(job.state==ReferenceJobState::kFailed&&job.code=="corrupt")) {
+    state->jobs.push_back(entry);state->by_id.emplace(job.id,entry);
+    std::sort(state->jobs.begin(),state->jobs.end(),[](const auto& a,const auto& b) {
+      return a->job.accepted_utc_us==b->job.accepted_utc_us?a->job.id<b->job.id:
+          a->job.accepted_utc_us<b->job.accepted_utc_us;
+    });
+  }
+  state->has_chrome_context=false;state->by_window.clear();state->by_application.clear();
+  for(const auto& value:state->jobs) {
+    std::set<std::string> windows,applications;
+    const auto index=[&](const Context& context) {
+      if(!ValidCaptureScope(context))return;
+      if(context.scope.kind==CaptureScopeKind::kApplication)
+        applications.insert(ApplicationSourceKey(context.pid,context.scope.process_start_identity_us,context.scope.display_id,CaptureProcessSource(context)));
+      else if(context.window_id)windows.insert(WindowSourceKey(context.window_pid,context.window_id));
+    };
+    index(value->job.context);
+    for(const auto& shot:value->collection.shots)if(shot.metadata)index(shot.metadata->context);
+    for(const auto& key:windows)state->by_window[key].push_back(value);
+    for(const auto& key:applications)state->by_application[key].push_back(value);
+    if(value->job.context.bundle_id=="com.google.Chrome")state->has_chrome_context=true;
+    for(const auto& shot:value->collection.shots)
+      if(shot.metadata&&shot.metadata->context.bundle_id=="com.google.Chrome")state->has_chrome_context=true;
+  }
+  std::atomic_store(&impl_->presentation,std::shared_ptr<const ReferencePresentationState>(std::move(state)));
+}
+std::shared_ptr<const ReferencePresentationState> ReferenceStore::ReadPresentation() const {
+  return std::atomic_load(&impl_->presentation);
+}
+std::shared_ptr<const ReferencePresentation> ReferenceStore::ReadPresentation(std::string_view id) const {
+  const auto state=ReadPresentation();const auto found=state->by_id.find(std::string(id));
+  if(found==state->by_id.end())return {};
+  const auto& entry=found->second;
+  // Retention remains a live deadline even between maintenance passes.
+  const auto clock=std::atomic_load(&impl_->presentation_now);
+  const auto now=clock?(*clock)():Now();
+  if(entry->job.accepted_utc_us<=0||now.utc_us>entry->retained_until_utc_us)return {};
+  return entry;
+}
+
 ReferenceCollection ReferenceStore::Collection(std::string_view id) const {
   const auto job=LookupMetadata(id);
   ReferenceCollection result;
@@ -2174,16 +2391,24 @@ ReferenceCollection ReferenceStore::Collection(std::string_view id) const {
     return result;
   }
   std::lock_guard io_lock(impl_->retention_io_mutex);
-  return ReadCollection(directory_,*job->metadata);
+  result=ReadCollection(directory_,*job->metadata);
+  {std::lock_guard lock(impl_->mutex);
+    const auto current=impl_->jobs.find(job->id);
+    if(current!=impl_->jobs.end()&&current->second.state==ReferenceJobState::kReady&&
+       current->second.metadata==job->metadata)
+      const_cast<ReferenceStore*>(this)->PublishPresentationLocked(current->second,result);
+  }
+  return result;
 }
 void ReferenceStore::AppendReferenceAsync(std::string root,std::uint64_t expected,
-    std::string operation,Reference metadata,CaptureResult capture,AppendCompletion completion) {
+    std::string operation,Reference metadata,CaptureResult capture,AppendCompletion completion,
+    std::int64_t deadline_monotonic_us) {
   AppendAsync(std::move(root),{},expected,std::move(operation),std::move(metadata),
-      std::move(capture),std::move(completion));
+      std::move(capture),std::move(completion),deadline_monotonic_us);
 }
 void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_id,
     std::uint64_t expected,std::string operation,Reference metadata,CaptureResult capture,
-    AppendCompletion completion) {
+    AppendCompletion completion,std::int64_t deadline_monotonic_us) {
   const auto report=[&](AppendStatus status) {
     if(completion)completion({status,root_id,operation,0});
   };
@@ -2192,6 +2417,13 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
     report(AppendStatus::kInvalid);return;
   }
   Prune();
+  std::function<Stamp()> clock;
+  {std::lock_guard guard(impl_->mutex);clock=impl_->hooks.now;}
+  const auto admitted=clock?clock():Now();
+  // operation_started is immutable gesture evidence, not a service deadline.
+  const auto deadline=deadline_monotonic_us>0?
+      std::min(deadline_monotonic_us,admitted.monotonic_us+kJobTimeoutUs):
+      admitted.monotonic_us+kJobTimeoutUs;
   std::unique_lock lock(impl_->mutex);
   if(impl_->stopping||impl_->unfinished>=kMaximumUnfinishedJobs||
      impl_->reserved+kPerJobReservation>kMaximumReservedBytes) {
@@ -2200,9 +2432,8 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
   if(impl_->append_operations.contains(operation)){lock.unlock();report(AppendStatus::kBusy);return;}
   auto active=std::make_shared<std::atomic_bool>(true);impl_->append_operations[operation]=active;
   ++impl_->unfinished;impl_->reserved+=kPerJobReservation;
-  const auto began=metadata.operation_started.monotonic_us>0?metadata.operation_started:Now();
   impl_->work.push_back([this,root_id,selected_mark_id,expected,operation,
-      metadata=std::move(metadata),capture=std::move(capture),completion=std::move(completion),began,active]() mutable {
+      metadata=std::move(metadata),capture=std::move(capture),completion=std::move(completion),deadline,active]() mutable {
     AppendResult result{AppendStatus::kInvalid,root_id,operation,0};
     const auto release=std::shared_ptr<void>(nullptr,[&](void*) {
       {std::lock_guard guard(impl_->mutex);--impl_->unfinished;impl_->reserved-=kPerJobReservation;impl_->append_operations.erase(operation);}
@@ -2231,6 +2462,7 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
     }
     const auto root_metadata=job->second.metadata;
     auto collection=ReadCollection(directory_,*root_metadata);
+    PublishPresentationLocked(job->second,collection);
     if(collection.status!=MarkNotesStatus::kReady){result.status=AppendStatus::kInvalid;return;}
     for(const auto& shot:collection.shots)if(shot.id==operation) {
       const int directory=open(directory_.c_str(),O_RDONLY|O_DIRECTORY);
@@ -2244,7 +2476,7 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
       if(StableMarkId(root_id,slot)==selected_mark_id)owner=true;
     const auto count=EffectiveRegions(stored->value).size();
     if(!owner||collection.shots.size()>=64||collection.notes.size()+count>1024||
-       now.monotonic_us-began.monotonic_us>kJobTimeoutUs) {
+       now.monotonic_us>deadline) {
       result.status=AppendStatus::kInvalid;return;
     }
     guard.unlock();
@@ -2267,9 +2499,11 @@ void ReferenceStore::AppendAsync(std::string root_id,std::string selected_mark_i
        std::filesystem::exists(directory_/(root_id+".deleted"))) {
       result.status=AppendStatus::kUnavailable;return;
     }
-    if(!active->load()){result.status=AppendStatus::kCancelled;return;}
+    const auto publish_now=hooks.now?hooks.now():Now();
+    if(!active->load()||publish_now.monotonic_us>deadline){result.status=AppendStatus::kCancelled;return;}
     const auto persisted=PersistNotes(CollectionPath(directory_,root_id),
         EncodeCollection(*root_metadata,collection),hooks.fail_append_after_rename);
+    PublishPresentationLocked(current_job->second,ReadCollection(directory_,*root_metadata));
     result.revision=collection.revision;
     result.status=persisted==NotesWriteResult::kSaved?AppendStatus::kCommitted:
       persisted==NotesWriteResult::kCommitUncertain?AppendStatus::kCommitUncertain:AppendStatus::kIOError;
@@ -2418,6 +2652,9 @@ ReferenceStore::ReferenceStore(std::filesystem::path directory)
     (void)PersistSmall(directory_/(id+".deleted"),TerminalStateText(
         job.code,job.accepted_utc_us,job.terminal_utc_us));
   }
+  for(const auto& [id,job]:impl_->jobs)
+    PublishPresentationLocked(job,job.state==ReferenceJobState::kReady&&job.metadata?
+        ReadCollection(directory_,*job.metadata):ReferenceCollection{});
   for(int index=0;index<2;++index)impl_->workers.emplace_back([this] {
     for(;;) {std::function<void()> task;{
       std::unique_lock lock(impl_->mutex);impl_->work_ready.wait(lock,[&]{return impl_->stopping||!impl_->work.empty();});
@@ -2529,7 +2766,10 @@ void ReferenceStore::SetRetentionPolicy(std::int64_t ttl_seconds,
   {std::lock_guard lock(impl_->mutex);
     impl_->retention_ttl_us=std::clamp<std::int64_t>(ttl_seconds,1,
         365LL*24*60*60)*1'000'000;
-    impl_->maximum_visible=std::max<std::size_t>(1,maximum_visible);}
+    impl_->maximum_visible=std::max<std::size_t>(1,maximum_visible);
+    const auto previous=std::atomic_load(&impl_->presentation);
+    for(const auto& entry:previous->jobs)PublishPresentationLocked(entry->job,entry->collection);
+  }
   Prune();
 }
 
@@ -2610,6 +2850,8 @@ void ReferenceStore::MigrateLegacyReady(std::string id) {
         found->second.code=valid?"migration_failed":"corrupt";
         found->second.terminal_utc_us=terminal.utc_us;
       }
+      PublishPresentationLocked(found->second,found->second.state==ReferenceJobState::kReady?
+          ReadCollection(directory_,*found->second.metadata):ReferenceCollection{});
     }
   }
   if(deleted)(void)CleanupDeletedFiles(id);
@@ -2649,6 +2891,7 @@ void ReferenceStore::Prune() {
       job.state=ReferenceJobState::kExpired;job.code="expired_reference";
       job.ready.reset();job.expired_utc_us=now.utc_us;
       impl_->ready_access.erase(job.id);cleanup.push_back(job.id);changed=true;
+      PublishPresentationLocked(job,{});
       if(impl_->derived_crop&&impl_->derived_crop->id==job.id&&
          impl_->derived_crop->state!=ReadyAssetState::kPending)
         impl_->derived_crop.reset();
@@ -2753,8 +2996,11 @@ ReferenceJobSnapshot ReferenceStore::AcceptPending(
       (reference.page_identity &&
        (!ValidPageIdentity(*reference.page_identity)||
         !PageIdentityMatchesContext(*reference.page_identity,reference.context)))||
+      !ValidCaptureScope(reference.context)||
+      (reference.context.scope.policy_present &&
+       ((reference.context.scope.kind==CaptureScopeKind::kPage)!=bool(reference.page_identity)))||
       (reference.context.bundle_id=="com.google.Chrome" &&
-       !reference.page_identity);
+       !reference.page_identity && !reference.context.scope.policy_present);
   {
     std::lock_guard lock(impl_->mutex);
     if(auto found=impl_->jobs.find(job.id);found!=impl_->jobs.end())return found->second;
@@ -2770,6 +3016,7 @@ ReferenceJobSnapshot ReferenceStore::AcceptPending(
       impl_->reservations[job.id]=kPerJobReservation;
     }
     impl_->jobs.emplace(job.id,job);
+    PublishPresentationLocked(job,{});
   }
   if(job.state==ReferenceJobState::kPending) {
     {std::lock_guard lock(impl_->mutex);impl_->work.push_back([this,id=job.id,metadata=job.metadata,accepted=job.accepted_utc_us] {
@@ -2914,6 +3161,7 @@ void ReferenceStore::FinalizeAsync(std::string id,CaptureResult capture,
         found->second.metadata=std::move(prepared.metadata);
         impl_->ready_access[id]=++impl_->access_clock;
         impl_->completions.erase(id);
+        PublishPresentationLocked(found->second,ReadCollection(directory_,*found->second.metadata));
         result=found->second;}}
       if(deleted_during_assets) {
         (void)CleanupDeletedFiles(id);return;
@@ -2954,6 +3202,7 @@ void ReferenceStore::Fail(std::string_view id,std::string code,
     } else {
       impl_->completions.erase(found->first);
     }
+    PublishPresentationLocked(found->second,{});
     result=found->second;changed=true;
     impl_->work.push_back([this,job_id=found->first,reason=found->second.code,
                            accepted=found->second.accepted_utc_us,
@@ -3012,6 +3261,7 @@ DeleteResult ReferenceStore::Delete(std::string_view id) {
       found->second.code="deleted_reference";
       found->second.terminal_utc_us=terminal.utc_us;
       found->second.ready.reset();found->second.metadata.reset();
+      PublishPresentationLocked(found->second,{});
       EraseAnnotatedCacheForId(*impl_,found->first);
       found->second.context={};found->second.path.clear();found->second.regions.clear();
       impl_->ready_access.erase(found->first);
@@ -3278,22 +3528,7 @@ MarkNotesSnapshot ReferenceStore::MarkSnapshots(std::string_view id) const {
   }
   const auto collection=Collection(id);
   if(collection.status!=MarkNotesStatus::kReady) {result.status=collection.status;return result;}
-  result.status=MarkNotesStatus::kReady;result.revision=collection.notes_revision;
-  for(const auto& shot:collection.shots) {
-    const auto& reference=*shot.metadata;const auto regions=EffectiveRegions(reference);
-    const auto placements=PlaceNumbers(reference,regions);
-    if(!placements){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
-    for(std::size_t local=0;local<regions.size();++local) {
-      const auto slot=shot.first_mark_slot+local;
-      const auto anchor=FirstPoint(regions[local]);
-      const auto bounds=NumberedMarkBounds(reference,local,regions,*placements);
-      if(!anchor||!bounds){result.status=MarkNotesStatus::kCorrupt;result.marks.clear();return result;}
-      result.marks.push_back({StableMarkId(id,slot),slot,static_cast<std::uint32_t>(slot+1),
-          *anchor,*bounds,collection.notes[slot],collection.visible[slot],collection.notes_revision,
-          shot.id,local});
-    }
-  }
-  return result;
+  return PresentationNotes(id,collection);
 }
 
 MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
@@ -3313,6 +3548,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
     return {MarkNoteUpdateStatus::kInvalid,0};
   if(std::filesystem::exists(CollectionPath(directory_,id))) {
     auto collection=ReadCollection(directory_,*found->second.metadata);
+    PublishPresentationLocked(found->second,collection);
     if(collection.status!=MarkNotesStatus::kReady)return {MarkNoteUpdateStatus::kCorrupt,0};
     if(collection.notes_revision!=expected_revision)
       return {MarkNoteUpdateStatus::kRevisionConflict,collection.notes_revision};
@@ -3325,6 +3561,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
     ++collection.notes_revision;
     const auto persisted=PersistNotes(CollectionPath(directory_,id),
         EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    PublishPresentationLocked(found->second,ReadCollection(directory_,*found->second.metadata));
     return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
       persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
       MarkNoteUpdateStatus::kIOError,collection.notes_revision};
@@ -3338,6 +3575,8 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
     if(StableMarkId(id,index)==mark_id){slot=index;break;}
   if(slot==regions.size())return {MarkNoteUpdateStatus::kInvalid,0};
   auto sidecar=ReadNotes(directory_,reference,regions.size());
+  if(sidecar.status!=MarkNotesStatus::kReady)
+    PublishPresentationLocked(found->second,ReadCollection(directory_,reference));
   if(sidecar.status==MarkNotesStatus::kCorrupt)
     return {MarkNoteUpdateStatus::kCorrupt,0};
   if(sidecar.status==MarkNotesStatus::kUnsupported)
@@ -3352,6 +3591,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkNote(
   const auto bytes=EncodeNotes(reference,sidecar);
   const auto persisted=PersistNotes(NotesPath(directory_,id),bytes,
                                      impl_->hooks.fail_note_after_rename);
+  PublishPresentationLocked(found->second,ReadCollection(directory_,*found->second.metadata));
   if(persisted==NotesWriteResult::kIOError)
     return {MarkNoteUpdateStatus::kIOError,expected_revision};
   if(persisted==NotesWriteResult::kCommitUncertain)
@@ -3377,6 +3617,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
     return {MarkNoteUpdateStatus::kInvalid,0};
   if(std::filesystem::exists(CollectionPath(directory_,id))) {
     auto collection=ReadCollection(directory_,*found->second.metadata);
+    PublishPresentationLocked(found->second,collection);
     if(collection.status!=MarkNotesStatus::kReady)return {MarkNoteUpdateStatus::kCorrupt,0};
     if(collection.notes_revision!=expected_revision)
       return {MarkNoteUpdateStatus::kRevisionConflict,collection.notes_revision};
@@ -3389,6 +3630,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
     ++collection.notes_revision;
     const auto persisted=PersistNotes(CollectionPath(directory_,id),
         EncodeCollection(*found->second.metadata,collection),impl_->hooks.fail_note_after_rename);
+    PublishPresentationLocked(found->second,ReadCollection(directory_,*found->second.metadata));
     return {persisted==NotesWriteResult::kSaved?MarkNoteUpdateStatus::kUpdated:
       persisted==NotesWriteResult::kCommitUncertain?MarkNoteUpdateStatus::kCommitUncertain:
       MarkNoteUpdateStatus::kIOError,collection.notes_revision};
@@ -3402,6 +3644,8 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
     if(StableMarkId(id,index)==mark_id){slot=index;break;}
   if(slot==regions.size())return {MarkNoteUpdateStatus::kInvalid,0};
   auto sidecar=ReadNotes(directory_,reference,regions.size());
+  if(sidecar.status!=MarkNotesStatus::kReady)
+    PublishPresentationLocked(found->second,ReadCollection(directory_,reference));
   if(sidecar.status==MarkNotesStatus::kCorrupt)
     return {MarkNoteUpdateStatus::kCorrupt,0};
   if(sidecar.status==MarkNotesStatus::kUnsupported)
@@ -3417,6 +3661,7 @@ MarkNoteUpdateResult ReferenceStore::UpdateMarkVisibility(
   const auto persisted=PersistNotes(NotesPath(directory_,id),
       EncodeNotes(reference,sidecar),found->second.state==ReferenceJobState::kReady&&
       impl_->hooks.fail_note_after_rename);
+  PublishPresentationLocked(found->second,ReadCollection(directory_,*found->second.metadata));
   if(persisted==NotesWriteResult::kIOError)
     return {MarkNoteUpdateStatus::kIOError,expected_revision};
   if(persisted==NotesWriteResult::kCommitUncertain)
@@ -3664,6 +3909,7 @@ std::optional<ReferenceJobSnapshot> ReferenceStore::Lookup(std::string_view id) 
       if(found->second.state!=ReferenceJobState::kReady)return found->second;
       found->second.state=ReferenceJobState::kFailed;found->second.code="corrupt";
       found->second.terminal_utc_us=terminal;found->second.ready.reset();
+      const_cast<ReferenceStore*>(this)->PublishPresentationLocked(found->second,{});
       impl_->ready_access.erase(found->first);result=found->second;
     }
   }
@@ -3688,7 +3934,10 @@ std::vector<ReferenceJobSnapshot> ReferenceStore::MetadataJobs() const {
 }
 
 void ReferenceStore::SetTestHooks(ReferenceStoreTestHooks hooks) {
-  std::lock_guard lock(impl_->mutex);impl_->hooks=std::move(hooks);
+  std::lock_guard lock(impl_->mutex);
+  std::atomic_store(&impl_->presentation_now,hooks.now?
+      std::make_shared<const std::function<Stamp()>>(hooks.now):std::shared_ptr<const std::function<Stamp()>>{});
+  impl_->hooks=std::move(hooks);
 }
 
 void ReferenceStore::WaitForIdleForTesting() {

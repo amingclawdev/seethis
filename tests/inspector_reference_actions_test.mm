@@ -596,9 +596,10 @@ static void TestStrokeSelectionCaptureFlow() {
 // Executes the exact transition dispatcher, synchronous observation/scheduling,
 // and completion ownership boundary used by STOverlayCoordinator. No NSApp or
 // production input adapter is invoked: release/press here is component evidence.
-static void TestR1RefreshOrchestration() {
+static void TestR1RefreshOrchestration(bool explicitScopes=false,bool kernel=false) {
   using namespace seethis::core;
   struct Fixture {
+    Stamp policyNow=Now(); // Simulated elapsed time, never a live-duration claim.
     ReferenceStore store;
     MarkController marks;
     InteractionController gesture;
@@ -609,24 +610,46 @@ static void TestR1RefreshOrchestration() {
     std::int64_t clock=1000;
     unsigned begins=0,schedules=0,finishes=0,ids=0;
     bool succeeded=false,selectionPending=true;
+    bool deferCapture=false,failCapture=false;
     std::string root;
     Context context;
     std::function<void()> observation;
-    explicit Fixture(const char* directory):store(directory),marks(store,[](const auto&){return true;}) {
+    explicit Fixture(const char* directory,CaptureScopeKind scope=CaptureScopeKind::kLegacy,bool kernel=false):store(directory),marks(store,[](const auto&){return true;},[this]{return policyNow;}) {
+      ReferenceStoreTestHooks hooks;hooks.now=[this]{return policyNow;};store.SetTestHooks(hooks);
       context.pid=context.window_pid=42;context.self_pid=99;context.window_id=7;
       context.app_name="Fixture";context.bundle_id="test.fixture";context.executable="/fixture";
       context.window_title="Fixture window";context.window={0,0,100,100};context.quartz_to_appkit_top=100;
-      context.observed=Now();context.selection_method="frontmost-pid/topmost-normal-containing-initial-point";
+      context.observed=policyNow;context.selection_method="frontmost-pid/topmost-normal-containing-initial-point";
       context.excluded_window_ids={8};context.exclusion_method="exact-window-allowlist;self-pid-rejected;child-windows-off";
       context.displays.push_back({"display-a",1,{0,0,100,100},{0,0,100,100},1,{1,-1,0,100}});
+      if(scope!=CaptureScopeKind::kLegacy) {
+        context.native_window={kernel?2u:1u,kernel?1000000:700,"scope-native-orchestration",1};
+        context.scope={kernel?2u:1u,scope,1,kernel?1000000:700,true,scope==CaptureScopeKind::kWindow};
+        if(kernel)context.scope.process_source=ProcessStartSource::kKernelBSDStart;
+        context.title={1,TitleAvailability::kReady};
+        if(scope==CaptureScopeKind::kPage){context.bundle_id="com.google.Chrome";context.window_title.clear();}
+        if(scope==CaptureScopeKind::kApplication) {
+          context.window_id=0;context.window_pid=0;context.window={};context.window_title.clear();context.native_window={};
+          context.selection_method="frontmost-application/selected-display";
+        }
+      }
       WindowObservation window;window.availability=WindowAvailability::kReady;window.generation=1;
       window.observed=Now();window.pid=42;window.bundle_id=context.bundle_id;window.window_id=7;
       window.bounds=context.window;window.window_title=context.window_title;window.title={1,TitleAvailability::kReady};
-      marks.SetWindowObservation(window);marks.SetViewportContinuity(1,true);
+      window.native_window=context.native_window;window.application_available=true;window.application_start_identity_us=kernel?0:700;
+      if(kernel){window.kernel_native_window=context.native_window;window.native_window={1,0,{},0};window.kernel_application_start_identity_us=1000000;}
+      window.browser_content=scope==CaptureScopeKind::kPage;
+      if(scope==CaptureScopeKind::kApplication)window.availability=WindowAvailability::kUnavailable;
+      marks.SetWindowObservation(window);marks.SetDisplayObservation(context.displays);marks.SetViewportContinuity(1,true);
+      if(scope==CaptureScopeKind::kPage) {
+        PageIdentity page;page.browser_pid=42;page.window_id=7;page.window_bounds=context.window;
+        page.process_start_identity_us=700;page.opaque_tab_id="orchestration-tab";page.navigation_digest=std::string(64,'a');
+        marks.SetPageObservation({PageAvailability::kReady,1,Now(),page});
+      }
     }
     static DisplayPoint Point(double x,double y) {return {1,CoordinateUnit::kLogicalPoints,{x,y},1};}
-    static CaptureResult Pixels() {
-      CaptureResult result;result.requested=Now();result.completed=Now();
+    CaptureResult Pixels() {
+      CaptureResult result;result.requested=policyNow;result.completed=policyNow;
       result.pixels={100,100,Bytes(40000,255)};return result;
     }
     void Abort() {
@@ -641,18 +664,26 @@ static void TestR1RefreshOrchestration() {
         const auto start=STBeginModeCapture(marks,store,mode,operation,8,snapshot.key_down_monotonic_ms);
         generation=start.generation;ownedGeneration=generation;root=start.rootID;
         succeeded=false;selectionPending=true;
-        Check(generation&&marks.BindContext(generation,context),"R1 production Begin callback binds context");
+        const auto frozenContext=context.scope.policy_present?seethis::platform::FreezeCaptureScope(context,
+            snapshot.session_origin,marks.window_observation(),marks.page_observation(),true):std::optional<Context>(context);
+        Check(generation&&frozenContext&&marks.BindContext(generation,*frozenContext),"R1 production Begin callback freezes and binds context");
         gesture.SetSelectedDisplayGeometry({1,{0,0},{100,100},1});
         const auto frozen=generation;
         STObserveAndScheduleCapture(gesture,marks,generation,frozen,[&] {
           if(observation){const auto observe=observation;observe();}
         },[&] {
           ++schedules;
-          if(STCompleteCaptureAttempt(marks,generation,frozen,Pixels(),succeeded,selectionPending))Abort();
+          if(deferCapture)return;
+          auto pixels=Pixels();if(failCapture)pixels.error="owned capture failure";
+          if(STCompleteCaptureAttempt(marks,generation,frozen,std::move(pixels),succeeded,selectionPending))Abort();
         });
       },[&](const auto& snapshot) {
-        ++finishes;marks.Release(generation,snapshot.subpaths,Now(),snapshot.key_up_monotonic_ms);
+        ++finishes;marks.Release(generation,snapshot.subpaths,policyNow,snapshot.key_up_monotonic_ms);
       },[&](const auto&) {marks.Abort("component idle transition");});
+      STReconcileCaptureDeadline(gesture,marks,policyNow,[&]{Abort();});
+    }
+    void Advance(std::int64_t milliseconds) {
+      clock+=milliseconds;policyNow.monotonic_us+=milliseconds*1000;policyNow.utc_us+=milliseconds*1000;
     }
     bool Press() {
       // Constructed physical sequence; the real input adapter is unchanged.
@@ -680,11 +711,12 @@ static void TestR1RefreshOrchestration() {
       store.WaitForIdleForTesting();return finished;
     }
   };
+  for(const auto scope:explicitScopes?(kernel?std::vector<CaptureScopeKind>{CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}:std::vector<CaptureScopeKind>{CaptureScopeKind::kPage,CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}):std::vector<CaptureScopeKind>{CaptureScopeKind::kLegacy})
   for(const bool append:{false,true}) {
     char pattern[]="/tmp/seethis-p4-r1-refresh-XXXXXX";
     const char* directory=mkdtemp(pattern);Check(directory,"R1 owned directory");
     {
-      Fixture f(directory);
+      Fixture f(directory,scope,kernel);
       if(append) {
         Check(f.Press(),"R1 seed starts through production orchestration");f.TwoStrokes();f.Release();
         Check(f.mode.Enable(f.root,true),"R1 ON binds seed without arming");
@@ -734,7 +766,62 @@ static void TestR1RefreshOrchestration() {
     }
     std::filesystem::remove_all(directory);
   }
-  std::cout<<"R1 production-shared refresh OFF/ON two-round/two-stroke/abort/generation checks passed\n";
+  if(explicitScopes){std::cout<<"Frozen page/window/application production orchestration two-round multi-stroke Append OFF/ON checks passed\n";return;}
+  for(const bool append:{false,true}) {
+    char pattern[]="/tmp/seethis-f3-active-XXXXXX";
+    const char* directory=mkdtemp(pattern);Check(directory,"F3 owned directory");
+    {
+      Fixture f(directory);
+      if(append) {Check(f.Press(),"F3 seed starts");f.TwoStrokes();f.Release();Check(f.mode.Enable(f.root,true),"F3 append seed bound");}
+      for(unsigned round=0;round<2;++round) {
+        Check(f.Press(),"F3 fresh long round starts");f.TwoStrokes();
+        const auto original=f.policyNow;
+        f.Advance(30'000);f.Refresh();
+        Check(f.marks.AllowsDrawing(),"F3 arrived screenshot survives exact30s service boundary");
+        f.Advance(1);f.Refresh();
+        Check(f.gesture.Snapshot().captures_pointer()&&f.marks.AllowsDrawing(),
+            "F3 production refresh preserves active drawing after screenshot arrived beyond30s");
+        for(unsigned renewal=0;renewal<2;++renewal) {
+          f.Advance(180'000);
+          Check(f.gesture.PointerDown(Fixture::Point(60,70),++f.clock)&&
+                f.gesture.PointerUp(Fixture::Point(70,70),++f.clock),"F3 timed click renews active idle deadline");
+          Check(!f.gesture.Watchdog(f.clock,true),"F3 active clicks beyond cumulative5min do not expire");
+          f.Refresh();Check(f.marks.AllowsDrawing(),"F3 long active interaction keeps arrived capture");
+        }
+        Check(f.Release(),"F3 long round releases normally");
+        Check(f.marks.phase()==ReferencePhase::kCommitted,"F3 long round saves through real store");
+        const auto collection=f.store.Collection(f.root);
+        const auto& saved=*collection.shots.back().metadata;
+        Check(saved.requested.monotonic_us==original.monotonic_us&&
+              saved.circle_completed.monotonic_us==f.policyNow.monotonic_us&&
+              saved.circle_completed.monotonic_us-saved.requested.monotonic_us>300'000'000&&
+              seethis::core::EffectiveRegions(saved).size()==4,
+            "F3 original capture/release evidence and four strokes survive long OFF/ON save");
+      }
+      const auto retained=f.store.MetadataJobs().size();
+      Check(f.Press(),"F3 idle fixture starts");f.TwoStrokes();
+      f.Advance(300'000);Check(!f.gesture.Watchdog(f.clock,true),"F3 exact idle boundary remains live");
+      f.Advance(1);Check(f.gesture.Watchdog(f.clock,true),"F3 true idle expiry cancels interaction");f.Refresh();
+      Check(!f.marks.Pending()&&!f.marks.AllowsDrawing()&&!f.Press(),"F3 cancellation does not fabricate physical release");
+      f.Release();Check(f.Press(),"F3 actual release rearms next gesture after idle expiry");f.TwoStrokes();f.Release();
+      Check(f.marks.phase()==ReferencePhase::kCommitted&&f.store.MetadataJobs().size()==retained+(append?0:1),
+          "F3 idle cancel leaves saved references and a new round succeeds");
+
+      f.deferCapture=true;Check(f.Press(),"F3 missing-screenshot service starts");f.TwoStrokes();
+      const auto timedOutGeneration=f.generation;f.Advance(30'001);f.Refresh();
+      Check(!f.gesture.Snapshot().captures_pointer()&&!f.marks.Pending()&&!f.Press(),
+          "F3 genuine screenshot no-return expires despite activity and keeps hold boundary");
+      f.Release();f.deferCapture=false;Check(f.Press(),"F3 released next gesture recovers after screenshot timeout");
+      Check(!STCompleteCaptureAttempt(f.marks,f.generation,timedOutGeneration,f.Pixels(),f.succeeded,f.selectionPending)&&
+            f.marks.AllowsDrawing(),"F3 late timed-out screenshot cannot revive or replace new round");
+      f.TwoStrokes();f.Release();
+      f.failCapture=true;Check(!f.Press(),"F3 actual completion seam fails capture honestly");
+      Check(!f.Press(),"F3 capture failure does not clear actual hold");f.Release();f.failCapture=false;
+      Check(f.Press(),"F3 fresh gesture recovers after capture failure");f.TwoStrokes();f.Release();
+    }
+    std::filesystem::remove_all(directory);
+  }
+  std::cout<<"R1/F3 production-shared refresh OFF/ON two-round/two-stroke/abort/generation checks passed\n";
 }
 
 // Actual prefix ingress action order + production capture/render composition.
@@ -1251,6 +1338,11 @@ static void TestRecoverableGeometryHistory(bool nativeReplacement) {
 }
 
 int main(int argc,char** argv) {
+  if(argc==2&&std::string_view(argv[1])=="--finder-instance-only") {TestR1RefreshOrchestration(true,true);return 0;}
+  if(argc==2&&std::string_view(argv[1])=="--context-fallback-only") {
+    TestR1RefreshOrchestration(true);TestCapturedReferenceLabels();TestPersistedCapturedLabel();return 0;
+  }
+  if(argc==2&&std::string_view(argv[1])=="--f3-deadline-component-only") {TestR1RefreshOrchestration();return 0;}
   TestRecoverableGeometryHistory(false);TestRecoverableGeometryHistory(true);
   if(argc==2&&std::string_view(argv[1])=="--recoverable-history-component-only")return 0;
   TestPendingSourceScroll();

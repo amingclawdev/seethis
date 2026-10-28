@@ -1,23 +1,21 @@
-# Google Chrome page marks
+# Google Chrome context
 
-This path supports normal windows in the standalone **Google Chrome** app (`com.google.Chrome`). Browsers embedded in other apps are outside this Chrome path. Set up Input Monitoring and Screen Recording first.
+SeeThis supports standalone **Google Chrome**. Input Monitoring and Screen Recording are required. Chrome **Automation is optional**: without reliable authorized page information, a new shot can follow a reliable window or the running app on the selected display. Inspector shows the frozen scope beside the shot.
 
-## Automation and recovery
+## Optional page association
 
-1. Open a safe page in standalone Chrome and give Chrome a real foreground activation.
-2. When Chrome Automation is missing, press the configured physical capture shortcut (default **Option+A**). This explicit action requests consent asynchronously. The app’s main UI remains available while macOS decides whether to show a dialog.
-3. If macOS asks whether **SeeThis may control Google Chrome**, click **Allow**. Input Monitoring and Screen Recording are separate permissions; a screen/audio or bypass-window-picker notice is not the Chrome control dialog.
-4. Release the original capture key and modifiers completely, then use a **fresh capture gesture** on the safe page. Grant completion does not resume the interrupted hold or automatically create a reference. Repeats while the same key is held do not make additional requests.
-5. **Connect Chrome** remains an explicit recovery action in the menu and in Inspector when recovery is needed. **Retry Chrome** refreshes permission/page readiness without requesting consent. If access was denied, use **Automation Settings…** to open **System Settings > Privacy & Security > Automation > SeeThis > Google Chrome**, change the switch yourself, then retry. macOS policy may require this recovery instead of repeating a dialog.
+Activate Chrome and choose **Connect Chrome** in the menu or Inspector. If macOS asks whether SeeThis may control Google Chrome, decide in the system dialog. This explicit authorization action interrupts a capture hold: release its keys completely and begin a fresh gesture. Grant completion never replays the old gesture.
 
-Starting in the background, passive page observation, opening Inspector and using non-Chrome or already-authorized Chrome do not request Automation. Chrome targets are checked against their current process identity, so stale queued requests are abandoned after target replacement. Neither a browser extension nor Chrome’s “Allow JavaScript from Apple Events” setting is required.
+**Retry Chrome** refreshes status without prompting. If access was denied, use **Automation Settings…** to change the Chrome switch yourself, then retry. Starting SeeThis, opening Inspector and passive observation do not request Automation. Page reads are not attempted without an available authorization grant. No browser extension or “Allow JavaScript from Apple Events” setting is required.
 
-Denied/unavailable access, ambiguous page identity and a timeout are not success. That capture should not save a reference or copy a URL. Keep the correct standalone Chrome window in the foreground, check **Location:** for the authorized app copy, release the shortcut and retry. If the problem persists, quit duplicate copies, manually reopen the exact app and record the precise status.
+## What follows a page, window or app
 
-## Page isolation
+A new shot uses reliable context already available when capture starts. It does not wait for a higher precision result. A shot that starts as window or app scope keeps that scope even if page information arrives later; a later new capture may use page scope.
 
-Create a mark in a safe tab A. When you switch to tab B, A's live marks should hide. Return to A and wait for a fresh page observation; undeleted marks should reappear. Different tabs have different identities even when their URLs match. Navigating to another page hides the original marks; returning to the original context restores them. Switching apps/windows also respects the original context.
+- **Follows this page:** marks hide on other tabs/pages and return after a fresh matching observation.
+- **Follows this window:** marks can remain across pages in that window.
+- **Follows this app:** marks can appear across windows of the same running app on the captured display.
 
-Quitting and reopening Chrome changes its process identity, so old marks are not guaranteed to appear automatically in the new process. Valid historical references can still be copied or previewed in Inspector. The selected history item and explicit copy actions are evaluated separately from live marks' availability on the current page.
+A failed or unavailable observation hides affected marks while retaining their data. It does not authorize showing stale page marks on another page. Fresh healthy contexts are judged independently. Old saved references retain their original binding rather than automatically expanding to app scope.
 
-The complete tab/reload/back/window, first-permission, reopening and multi-system matrix has not been fully retested. Implementation and automated tests cover page isolation rules; those checks do not establish that the entire physical matrix passed. Use safe test content in feedback, and do not publish real tab URLs, titles or reference read-access capability URLs.
+Chrome process replacement and closed windows can make historical live marks ineligible. Valid images and notes remain available in Inspector until deletion or expiration. Use safe content to check the scope and page return before sharing. Do not publish actual tab URLs, titles or local read-access links in bug reports.

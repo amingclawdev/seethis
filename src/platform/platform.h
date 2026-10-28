@@ -1126,7 +1126,64 @@ struct ChromePageSample {
   std::string opaque_tab_id;
   // Provider input: identity uses its digest; bounded display metadata is separate.
   std::string url;
+  // A fresh provider/native association, never a browser session ID used as a
+  // CGWindowID. Titles used to establish it remain private to the native call.
+  std::optional<core::WindowObservation> content_window;
 };
+// One current-application metadata sample. The sources are never interchangeable.
+struct ProcessIdentitySample {
+  std::int64_t launch_start_identity_us=0,kernel_start_identity_us=0;
+  bool coherent=false;
+};
+struct KernelProcessIdentityRecord {
+  int returned_bytes=0;
+  std::int64_t pid=0;
+  std::uint64_t seconds=0,microseconds=0;
+};
+#if defined(SEETHIS_CHROME_CONSENT_TESTING)
+ProcessIdentitySample ReadProcessIdentityForTesting(const void* before,const void* after,
+    std::function<KernelProcessIdentityRecord(std::int64_t)> read,core::Stamp observed);
+#endif
+// Select once from evidence already available before drawing. No native work,
+// permission request, waiting, or later callback may refine this shot's scope.
+inline std::optional<core::Context> FreezeCaptureScope(core::Context context,
+    core::DisplayPoint initial,const core::WindowObservation& source,
+    const core::PageObservation& page,bool automation_granted) {
+  if(!core::ValidCaptureScope(context)||!context.scope.policy_present ||
+     context.scope.display_id!=initial.display_id)return {};
+  if(context.bundle_id!="com.google.Chrome")return context;
+  const auto display=std::find_if(context.displays.begin(),context.displays.end(),
+      [&](const auto& d){return d.id==initial.display_id;});
+  if(display==context.displays.end()||!initial.IsValid()||initial.unit!=core::CoordinateUnit::kLogicalPoints||
+     initial.backing_scale!=display->scale||initial.position.x<0||initial.position.y<0||
+     initial.position.x>display->logical.width||initial.position.y>display->logical.height)return {};
+  const auto x=display->logical.x+initial.position.x,y=display->logical.y+initial.position.y;
+  if(automation_granted && context.scope.version==1 && context.window_id!=0 && source.browser_content && core::WindowObservationMatchesContext(context,source) && source.pid==context.pid && source.bundle_id==context.bundle_id &&
+     source.native_window.process_start_identity_us==context.scope.process_start_identity_us &&
+     x>=source.bounds.x && y>=source.bounds.y &&
+     x<=source.bounds.x+source.bounds.width && y<=source.bounds.y+source.bounds.height) {
+    auto browser=context;browser.window_id=source.window_id;browser.window_pid=source.pid;
+    browser.window=source.bounds;browser.window_title.clear();browser.native_window=source.native_window;
+    browser.selection_method="frontmost-pid/topmost-normal-containing-initial-point";
+    browser.scope.kind=core::CaptureScopeKind::kWindow;
+    if(core::WindowObservationMatchesContext(browser,source)) {
+      if(automation_granted && page.identity && core::PageIdentityVisible(page.identity,page) &&
+         core::PageIdentityMatchesContext(*page.identity,browser))browser.scope.kind=core::CaptureScopeKind::kPage;
+      return browser;
+    }
+  }
+  // A point-selected native window is usable as window scope only when the
+  // current foreground tuple independently agrees. A different CG candidate
+  // may be auxiliary UI, but there is no parent evidence here to assume it.
+  if(context.window_id!=0&&core::WindowObservationMatchesContext(context,source)) {
+    context.scope.kind=core::CaptureScopeKind::kWindow;return context;
+  }
+  context.window_id=0;context.window_pid=0;context.window={};context.window_title.clear();
+  context.native_window={};context.title={1,core::TitleAvailability::kUnavailable};
+  context.selection_method="frontmost-application/selected-display";
+  context.scope.kind=core::CaptureScopeKind::kApplication;context.scope.title_required=false;
+  return core::ValidCaptureScope(context)?std::optional<core::Context>(context):std::nullopt;
+}
 inline std::optional<std::int64_t> ChromeProcessStartIdentity(
     double launch_unix_seconds) {
   if (!std::isfinite(launch_unix_seconds) || launch_unix_seconds<=0)
@@ -1197,8 +1254,34 @@ inline std::optional<ChromeWindowCandidate> CorrelateChromeWindow(
   }
   return match;
 }
+// One process-wide admission gate covers permission, consent and provider work.
+// A lease belongs to the physical operation, never its timeout/publication latch.
+class ChromePhysicalWorkGate {
+ public:
+  static constexpr unsigned kCapacity = 2;
+  [[nodiscard]] bool TryEnter() {
+    auto count = admitted_.load();
+    while (count < kCapacity) {
+      if (admitted_.compare_exchange_weak(count, count + 1)) return true;
+    }
+    return false;
+  }
+  void Leave() { admitted_.fetch_sub(1); }
+  [[nodiscard]] unsigned admitted() const { return admitted_.load(); }
+ private:
+  std::atomic<unsigned> admitted_{0};
+};
+#if defined(SEETHIS_CAPTURE_TESTING) || defined(SEETHIS_CHROME_CONSENT_TESTING)
+unsigned ChromePhysicalWorkCountForTesting();
+#endif
+
 using ChromePageAcquire = std::function<ChromePageSample()>;
 using ChromePageCompletion = std::function<void(core::PageObservation)>;
+struct ChromeContentObservation {
+  core::WindowObservation window;
+  core::PageObservation page;
+};
+using ChromeContentCompletion = std::function<void(ChromeContentObservation)>;
 
 // Coordinator-lifetime identity for one asynchronous provider request.  The
 // epoch invalidates every outstanding callback when observation stops or the
@@ -1239,11 +1322,19 @@ class ChromeObservationLifecycle {
   ChromeObservationRequest active_;
 };
 
-// Implemented by the macOS adapter with bounded background dispatch. The
-// callback is delivered on the main thread with separate bounded URL metadata.
+// Main-thread entry. Shared physical capacity is two, with no waiting queue.
+// Timeout delivers once but retains physical admission until native work exits.
+// Busy rejection delivers unavailable inline on main. Off-main entry is invalid
+// and returns without native work or a callback; it never enqueues main retries.
 void AcquireChromePageAsync(ChromePageAcquire acquire,
                             std::uint64_t generation,
                             ChromePageCompletion completion);
+// Same admission/timeout contract; publishes a matched window/page envelope.
+void AcquireChromeContentAsync(ChromePageAcquire acquire,
+                               std::uint64_t generation,
+                               ChromeContentCompletion completion);
+// Main-thread cached result plus asynchronous refresh; never native IPC here.
+// Off-main use fails closed with false.
 bool ChromeAutomationPreflight(std::int64_t browser_pid);
 // Connection readiness is separate from a mark's frozen foreground identity.
 // These adapters never publish a URL or a PageIdentity from a background probe.
@@ -1292,7 +1383,8 @@ struct ChromeConnectionSnapshot {
     const ChromeConnectionSnapshot& state, std::int64_t foreground_chrome_pid) {
   return state.target.valid() && foreground_chrome_pid==state.target.pid &&
       (state.permission.consent==ChromeConsent::kDenied ||
-       state.permission.consent==ChromeConsent::kNotRequested);
+       state.permission.consent==ChromeConsent::kNotRequested ||
+       (state.consent_pending && state.permission.consent!=ChromeConsent::kGranted));
 }
 struct ChromeConnectionAdapters {
   std::function<ChromeRunningTarget()> discover;
@@ -1418,6 +1510,7 @@ class ChromeConnectionController {
     }
   }
   void SettingsOpened(bool opened) { snapshot_.settings_open_failed = !opened; }
+  [[nodiscard]] bool stopped() const { return stopped_; }
   [[nodiscard]] const ChromeConnectionSnapshot& snapshot() const { return snapshot_; }
  private:
   ChromeConnectionSnapshot snapshot_;
@@ -1488,12 +1581,17 @@ class ChromeConnectionController {
   return "Automation access alone does not identify a page. Choose Retry Chrome to check the provider; make Chrome frontmost to create a mark.";
 }
 // Main-thread connection state shared by the menu and Inspector. Refresh is
-// prompt-free; explicit Connect and eligible physical capture intents may ask.
+// prompt-free and asynchronous; its current snapshot may be unavailable while
+// the off-main check runs. Explicit Connect/eligible physical intents may ask.
 ChromeConnectionSnapshot RefreshChromeConnection();
 ChromeConnectionSnapshot ChromeConnectionStatus();
+// The active input adapter interrupts any owned gesture on explicit Connect.
+// Registration has no native work and cannot start/replay input.
+void SetChromeConsentInterruptionHandler(const void* owner,std::function<void()> interrupt);
+void ClearChromeConsentInterruptionHandler(const void* owner);
 void ConnectChromeExplicit();
-// Called only by an eligible physical capture press before drawing starts.
-// A returned target means interrupt this hold; invalid/nonmatching targets never ask.
+// Legacy target discovery for explicit authorization actions. Basic capture
+// does not call it or request optional Automation permission.
 std::optional<ChromeRunningTarget> GetChromeCaptureConsentTarget();
 void ConnectChromeForCaptureExplicit(ChromeRunningTarget foreground_target);
 void StartChromeConnection();
@@ -1504,6 +1602,8 @@ struct ChromeConnectionTestAdapters {
   ChromeConnectionAdapters connection;
   std::function<ChromeProviderState(ChromeRunningTarget)> provider;
   std::function<ChromeRunningTarget()> foreground_chrome;
+  std::function<bool(core::WindowObservation&)> confirm_content;
+  std::function<ChromePageSample(const core::WindowObservation&)> acquire_content;
 };
 void SetChromeConnectionTestAdapters(ChromeConnectionTestAdapters adapters);
 #endif
@@ -1515,12 +1615,18 @@ void PublishChromeObservation(std::int64_t pid, bool active,
 ChromePageSample AcquireCurrentChromePage(const core::Context& captured);
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
 core::WindowObservation ObserveForegroundWindow(std::uint64_t generation);
+// Exact native revalidation for a source whose current point destination and
+// fresh page evidence the caller has already proved. Never selects a window.
+core::WindowObservation ObserveChromeContentSource(const core::Context& source,
+                                                  std::uint64_t generation);
 // Presentation-only exact original-source observation. Caller proves positive
 // own Inspector/note ownership at request and completion; never a capture API.
 core::WindowObservation ObserveOwnUIPresentationSource(
     const core::Context& source,std::uint64_t generation);
 ChromePageSample AcquireOwnUIPresentationChromePage(const core::Context& source);
 ChromePageSample AcquireCurrentChromePage(
+    const core::WindowObservation& foreground);
+ChromePageSample AcquireCurrentChromeContent(
     const core::WindowObservation& foreground);
 #endif
 

@@ -74,6 +74,12 @@ void CheckNativeCompactMenu() {
             source.find("- (void)menuWillOpen:(NSMenu*)menu {") !=
                 std::string_view::npos,
         "CRD-06: opening the menu refreshes compact state");
+  const auto menu_open = Between(source, "- (void)menuWillOpen:(NSMenu*)menu {",
+                                  "- (void)");
+  Check(menu_open.find("_chromeLastCheckMs=0;") <
+            menu_open.find("[self refreshPermissionMenu];") &&
+            menu_open.find("[self refreshPermissionMenu];") != std::string_view::npos,
+        "CRD-06: opening the menu forces a current compact snapshot without waiting for polling");
   const auto ready_item = Between(menu, "_startupStateItem=[[NSMenuItem alloc]",
                                   "[menu addItem:_startupStateItem];");
   Check(ready_item.find("action:@selector(showPermissionEntry:)") !=
@@ -135,13 +141,55 @@ void CheckNativeCompactMenu() {
                 std::string_view::npos &&
             compact_refresh.find("_chromeStateItem.title=") !=
                 std::string_view::npos &&
-            compact_refresh.find("ChromeAutomationPreflight(") !=
-                std::string_view::npos,
+            compact_refresh.find("RefreshChromeConnection()") !=
+                std::string_view::npos &&
+            compact_refresh.find("RefreshChromeConnection()") <
+                compact_refresh.find("_chromeStateItem.title="),
         "CRD-06/07: both compact items update before Show details exist");
+  // A prompt-free asynchronous refresh returns the current snapshot. Initial
+  // unknown/pending permission is conservative; a still-fresh cached grant can
+  // remain usable while another check runs. Grant alone never means page Ready.
+  const auto granted = Between(compact_refresh,
+      "} else if(connection.target.valid() &&", "} else {");
+  const auto ready = Between(granted, "if(connection.observation_active &&",
+      "_chromeCompactStatus=seethis::platform::ChromeCompactStatus::kReady;");
+  const auto ungranted = Between(compact_refresh, "} else {", "_chromeStateItem.title=");
+  Check(granted.find("connection.permission.consent==") != std::string_view::npos &&
+            granted.find("ChromeConsent::kGranted)") != std::string_view::npos &&
+            granted.find("ChromeCompactStatus::kAutomationAllowedPageUnchecked") != std::string_view::npos &&
+            ungranted.find("ChromeCompactStatus::kAutomationUnavailable") != std::string_view::npos,
+        "CRD-06/07: unchecked or ungranted pending snapshots stay Not ready; a current grant is only page-unchecked");
+  Check(!ready.empty() &&
+            ready.find("connection.provider==seethis::platform::ChromeProviderState::kReady &&") != std::string_view::npos &&
+            ready.find("connection.page==seethis::core::PageAvailability::kReady") != std::string_view::npos,
+        "MUI-02: compact Chrome Ready additionally requires active observation, ready provider and current page");
+
+  // This target is source-wiring coverage, not an AppKit runtime fixture. The
+  // Chrome async executable exercises the real API with blocked fake backends.
+  const auto context = Read(source_path.parent_path() / "context_mac.mm");
+  const auto connection_refresh = Between(context,
+      "ChromeConnectionSnapshot RefreshChromeConnection() {",
+      "ChromeConnectionSnapshot ChromeConnectionStatus()");
+  const auto passive = Between(context,
+      "void BeginPermissionRefresh(bool check_provider=false) {",
+      "ChromeProviderState ProbeChromeProvider(ChromeRunningTarget target) {");
+  const auto worker = Between(passive, "RunChromeWork(", "},[request,result");
+  Check(connection_refresh.find("RefreshCachedConnection();") != std::string_view::npos &&
+            connection_refresh.find("BeginPermissionRefresh();") != std::string_view::npos &&
+            connection_refresh.find("return connection.snapshot();") != std::string_view::npos &&
+            connection_refresh.find("CheckChromeAutomation(") == std::string_view::npos &&
+            !worker.empty() && worker.find("adapters.permission(request->target.pid,false)") != std::string_view::npos &&
+            worker.find("adapters.permission(request->target.pid,true)") == std::string_view::npos &&
+            worker.find("if(check_provider &&") != std::string_view::npos,
+        "CRD-05/07: actual compact refresh schedules prompt-free permission work with provider checking disabled by default");
   Check(refresh.find("CGRequestListenEventAccess") == std::string_view::npos &&
             refresh.find("RequestChromeAutomationPermission") ==
                 std::string_view::npos &&
-            refresh.find("RetryInputMonitoring(") == std::string_view::npos,
+            refresh.find("RetryInputMonitoring(") == std::string_view::npos &&
+            refresh.find("ConnectChromeExplicit(") == std::string_view::npos &&
+            refresh.find("RetryChromeExplicit(") == std::string_view::npos &&
+            refresh.find("AcquireChromePageAsync(") == std::string_view::npos &&
+            compact_refresh.find("ChromeAutomationPreflight(") == std::string_view::npos,
         "CRD-05/07: reading compact status does not prompt or retry");
   const auto details = refresh.substr(compact_refresh.size());
   for (const auto heading : {"BASE PERMISSIONS", "KEYBOARD AND SHORTCUTS",

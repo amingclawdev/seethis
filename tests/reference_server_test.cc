@@ -131,17 +131,19 @@ StoredReference MakeReference(ReferenceStore& store, const std::string& id,
   const int width = extra_mark_count?1920:realistically_large ? 2048 : 100;
   const int height = extra_mark_count?1080:realistically_large ? 2400 : 100;
   const auto context=context_override?*context_override:ContextFixture(observed,width,height);
-  Check(marks.BindContext(generation,context),"fixture context binds");
-  if(context.bundle_id=="com.google.Chrome") {
-    PageIdentity page;
-    page.bundle_id=context.bundle_id;page.browser_pid=context.window_pid;
+  std::optional<PageIdentity> frozenPage;
+  if(context.bundle_id=="com.google.Chrome"&&(!context.scope.policy_present||context.scope.kind==CaptureScopeKind::kPage)) {
+    PageIdentity page;page.bundle_id=context.bundle_id;page.browser_pid=context.window_pid;
     page.window_id=context.window_id;page.window_bounds=context.window;
     page.process_start_identity_us=700;page.opaque_tab_id="fixture-tab";
     page.navigation_digest=seethis::platform::ChromeNavigationDigest(
         captured_page&&captured_page->url?*captured_page->url:"https://example.test/legacy");
-    Check(marks.BindPageIdentity(generation,page,captured_page),
-        "display metadata does not change fixture capture eligibility");
+    frozenPage=page;
+    if(context.scope.policy_present)marks.SetPageObservation({PageAvailability::kReady,1,Now(),page,captured_page});
   }
+  Check(marks.BindContext(generation,context),"fixture context binds");
+  if(frozenPage&&!context.scope.policy_present)
+    Check(marks.BindPageIdentity(generation,*frozenPage,captured_page),"display metadata does not change fixture capture eligibility");
   CaptureResult capture;
   capture.requested = {observed.utc_us + 10, observed.monotonic_us + 10};
   capture.completed = {observed.utc_us + 20, observed.monotonic_us + 20};
@@ -1299,6 +1301,7 @@ void TestUrlOnlyControllerCompletion() {
   const auto observed = Now();
   const auto ready_context = ContextFixture(observed);
   Observe(marks, ready_context);
+  marks.SetViewportContinuity(1,true);
   auto generation = marks.Begin(ready_id);
   Check(marks.BindContext(generation, ready_context),
         "URL-only ready fixture binds context");
@@ -1474,6 +1477,7 @@ void TestChromeTransactionIdentityFreeze() {
   context.window_title = "redacted capture title";
   Observe(marks, context);
 
+  marks.SetViewportContinuity(1,true);
   const auto generation = marks.Begin(id);
   Check(marks.BindContext(generation, context),
         "Chrome transaction binds its original window");
@@ -1558,15 +1562,52 @@ std::string CompactSourceObject(const std::string& body) {
   const auto field=body.find("\"source_context\":{");
   Check(field!=std::string::npos,"authenticated compact response has source_context");
   const auto start=body.find('{',field);
-  bool quoted=false,escaped=false;
+  bool quoted=false,escaped=false;unsigned depth=1;
   for(std::size_t i=start+1;i<body.size();++i) {
     const char c=body[i];
     if(escaped){escaped=false;continue;}
     if(quoted&&c=='\\'){escaped=true;continue;}
     if(c=='"'){quoted=!quoted;continue;}
-    if(!quoted&&c=='}')return body.substr(start,i-start+1);
+    if(!quoted&&c=='{')++depth;
+    if(!quoted&&c=='}'&&--depth==0)return body.substr(start,i-start+1);
   }
   throw std::runtime_error("source_context is not a complete JSON object");
+}
+
+void TestExplicitScopeDelivery(bool kernel=false) {
+  TempDirectory temp;SettingsStore settings(temp.path/"settings.json");ReferenceStore store(temp.path/"references");
+  auto readiness=std::make_shared<seethis::platform::PermissionReadinessState>();
+  seethis::service::ReferenceServer server(store,settings,temp.path/"web",readiness);
+  std::string error;Check(server.Start(&error),"scope endpoint starts with owned ephemeral server");
+  unsigned counter=0;
+  for(const auto kind:kernel?std::vector<CaptureScopeKind>{CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}:std::vector<CaptureScopeKind>{CaptureScopeKind::kPage,CaptureScopeKind::kWindow,CaptureScopeKind::kApplication}) {
+    auto context=ContextFixture(Now());context.native_window={kernel?2u:1u,kernel?1000000:700,"delivery-scope",1};
+    context.scope={kernel?2u:1u,kind,1,kernel?1000000:700,true,kind==CaptureScopeKind::kWindow};
+    if(kernel)context.scope.process_source=ProcessStartSource::kKernelBSDStart;context.title={1,TitleAvailability::kReady};
+    if(kind==CaptureScopeKind::kPage)context.bundle_id="com.google.Chrome";
+    if(kind==CaptureScopeKind::kApplication) {
+      context.window_id=0;context.window_pid=0;context.window={};context.window_title.clear();context.native_window={};
+      context.selection_method="frontmost-application/selected-display";
+    }
+    const std::string id(32,static_cast<char>('a'+counter++));
+    const auto stored=MakeReference(store,id,0,false,true,0,false,0,&context);
+    AwaitAsset(store,id,0);
+    const auto root="/r/"+id+settings.ReferenceCapability(id);
+    const auto response=Request(server.port(),ReferenceGet(server.port(),root));
+    Check(response.status==200&&response.body.find("\"scope\":{\"version\":"+std::to_string(context.scope.version)+",\"kind\":\""+
+          std::string(CaptureScopeKindName(kind))+"\"")!=std::string::npos&&
+        response.body.find(CaptureScopeName(context))!=std::string::npos&&
+        response.body.find(ProcessStartSourceName(CaptureProcessSource(context)))!=std::string::npos,
+        "actual default JSON carries immutable shot scope and user-facing label");
+    const auto details=Request(server.port(),ReferenceGet(server.port(),root+"/metadata"));
+    Check(details.status==200&&CompactSourceObject(response.body)==CompactSourceObject(details.body),
+        "default and explicit metadata source projections agree on frozen scope");
+    const auto projection=ProjectSourceContext(stored.value);
+    Check(projection.scope==context.scope&&projection.scope_label==CaptureScopeName(context),"source projection comes from frozen shot policy");
+    if(kind==CaptureScopeKind::kApplication)Check(!projection.window_id&&projection.window_title_availability==SourceFieldAvailability::kNotApplicable,
+        "application scope never invents a native window in metadata");
+  }
+  server.Stop();std::cout<<checks<<" explicit scope HTTP/source projection checks passed\n";
 }
 
 void TestCompactSourceContext() {
@@ -2321,6 +2362,8 @@ void TestSettingsAssets() {
 
 int main(int argc,char** argv) {
   try {
+    if(argc==2&&std::string_view(argv[1])=="--finder-instance-only") {TestExplicitScopeDelivery(true);return 0;}
+    if(argc==2&&std::string_view(argv[1])=="--context-fallback-only") {TestExplicitScopeDelivery();return 0;}
     if(argc==2&&std::string_view(argv[1])=="--p4-component-only") {
       TestMultiShotDelivery();TestMultiShotViewer();TestSingleImageDelivery();
       std::cout<<checks<<" P4 protocol checks passed\n";return 0;
@@ -2492,6 +2535,7 @@ int main(int argc,char** argv) {
           return true;
         },
         [](std::function<void()> task) { task(); });
+    historical_copy.SetViewportContinuity(1,true);
     Observe(historical_copy, current.value.context);
     struct HistoricalRecopyAttempt {
       bool copied = false;

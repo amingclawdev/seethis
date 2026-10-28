@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
 
 #include "core/interaction.h"
 
@@ -62,6 +63,20 @@ struct TitleEvidence {
   // Retains even a malformed zero-version policy tail without legacy downgrade.
   bool policy_present = false;
 };
+enum class ProcessStartSource : std::uint64_t { kUnspecified, kLaunchDate, kKernelBSDStart };
+enum class CaptureScopeKind { kLegacy, kPage, kWindow, kApplication };
+struct CaptureScopePolicy {
+  std::uint64_t version = 0;
+  CaptureScopeKind kind = CaptureScopeKind::kLegacy;
+  DisplayId display_id = 0;
+  std::int64_t process_start_identity_us = 0;
+  bool policy_present = false;
+  // Frozen at capture: normal readable titles remain exact constraints; a new
+  // window capture with genuinely missing title evidence does not invent one.
+  bool title_required = false;
+  ProcessStartSource process_source = ProcessStartSource::kUnspecified;
+  bool operator==(const CaptureScopePolicy&) const = default;
+};
 struct Context {
   std::int64_t pid = 0, window_pid = 0, self_pid = 0;
   std::uint64_t window_id = 0;
@@ -76,7 +91,16 @@ struct Context {
   std::string exclusion_method;
   NativeWindowIdentity native_window;
   TitleEvidence title;
+  CaptureScopePolicy scope;
 };
+bool ValidCaptureScope(const Context& context);
+const char* CaptureScopeName(const Context& context);
+const char* CaptureScopeKindName(CaptureScopeKind kind);
+std::string WindowSourceKey(std::int64_t pid,std::uint64_t window);
+std::string ApplicationSourceKey(std::int64_t pid,std::int64_t start,DisplayId display,
+    ProcessStartSource source=ProcessStartSource::kLaunchDate);
+ProcessStartSource CaptureProcessSource(const Context& context);
+const char* ProcessStartSourceName(ProcessStartSource source);
 // Page identity is separate from the frozen app/window context. The
 // navigation digest is domain-separated; display URL metadata is stored separately.
 struct PageIdentity {
@@ -124,7 +148,17 @@ struct WindowObservation {
   NativeWindowIdentity native_window;
   std::string window_title;
   TitleEvidence title{1, TitleAvailability::kUnavailable};
+  bool browser_content = false;
+  bool application_available = false;
+  std::int64_t application_start_identity_us = 0;
+  Stamp application_observed;
+  // Separate namespaces from one current-process sample, never fallback values
+  // substituted into the historical launchDate fields above.
+  NativeWindowIdentity kernel_native_window;
+  std::int64_t kernel_application_start_identity_us = 0;
 };
+const NativeWindowIdentity& WindowIdentityForContext(const Context& context,const WindowObservation& observation);
+std::int64_t ApplicationIdentityForContext(const Context& context,const WindowObservation& observation);
 struct Pixels {
   std::uint32_t width = 0, height = 0;
   Bytes rgba;
@@ -272,6 +306,9 @@ struct ReferenceJobSnapshot {
   std::optional<CapturedPageMetadata> captured_page;
 };
 struct SourceContextProjection {
+  CaptureScopePolicy scope;
+  std::string scope_label;
+  ProcessStartSource process_source=ProcessStartSource::kUnspecified;
   std::optional<std::string> app_name, bundle_id, window_title, page_url;
   SourceFieldAvailability app_name_availability = SourceFieldAvailability::kLegacyUnavailable;
   SourceFieldAvailability bundle_id_availability = SourceFieldAvailability::kLegacyUnavailable;
@@ -348,6 +385,24 @@ struct ReferenceCollection {
   std::vector<bool> visible;
   [[nodiscard]] bool multi() const { return shots.size() > 1; }
 };
+// Immutable presentation metadata only. Publication never carries image bytes or
+// grants source visibility; consumers must evaluate fresh observation evidence.
+struct ReferencePresentation {
+  ReferenceJobSnapshot job;
+  ReferenceCollection collection;
+  MarkNotesSnapshot notes;
+  std::unordered_map<std::string,std::size_t> source_membership;
+  std::unordered_map<std::string,MarkNotesSnapshot> shot_notes;
+  std::int64_t retained_until_utc_us = 0;
+};
+struct ReferencePresentationState {
+  std::uint64_t revision = 0;
+  bool has_chrome_context = false;
+  std::vector<std::shared_ptr<const ReferencePresentation>> jobs;
+  std::unordered_map<std::string,std::shared_ptr<const ReferencePresentation>> by_id;
+  // Publication-time indexes; source refresh never scans unrelated history.
+  std::unordered_map<std::string,std::vector<std::shared_ptr<const ReferencePresentation>>> by_window, by_application;
+};
 enum class AppendStatus { kCommitted, kIdempotent, kStale, kUnavailable, kCancelled,
   kInvalid, kBusy, kIOError, kCommitUncertain };
 struct AppendResult {
@@ -410,13 +465,19 @@ class ReferenceStore {
   [[nodiscard]] std::vector<ReferenceJobSnapshot> Jobs() const;
   [[nodiscard]] std::vector<ReferenceJobSnapshot> MetadataJobs() const;
   [[nodiscard]] ReferenceCollection Collection(std::string_view id) const;
+  // Immutable publication: no store mutex, pruning, disk reads, hashing or layout.
+  [[nodiscard]] std::shared_ptr<const ReferencePresentationState> ReadPresentation() const;
+  [[nodiscard]] std::shared_ptr<const ReferencePresentation> ReadPresentation(std::string_view id) const;
   using AppendCompletion = std::function<void(AppendResult)>;
+  // Optional caller deadline can shorten the admission-based service budget;
+  // capture_metadata.operation_started always remains original provenance.
   void AppendAsync(std::string root_id, std::string selected_mark_id,
       std::uint64_t expected_content_revision, std::string operation_shot_id,
-      Reference capture_metadata, CaptureResult capture, AppendCompletion completion);
+      Reference capture_metadata, CaptureResult capture, AppendCompletion completion,
+      std::int64_t deadline_monotonic_us = 0);
   void AppendReferenceAsync(std::string root_id,std::uint64_t expected_content_revision,
       std::string operation_shot_id,Reference capture_metadata,CaptureResult capture,
-      AppendCompletion completion);
+      AppendCompletion completion, std::int64_t deadline_monotonic_us = 0);
   void CancelAppend(std::string_view operation_shot_id);
   [[nodiscard]] ReadyAssetResult RequestShotAnnotated(std::string_view root_id,
       std::string_view shot_id, bool numbers = true);
@@ -430,6 +491,7 @@ class ReferenceStore {
                                      AnnotatedRepresentation representation =
                                          AnnotatedRepresentation::kNumbered);
   void Prune();
+  void PublishPresentationLocked(const ReferenceJobSnapshot& job, ReferenceCollection collection);
   void ScheduleLegacyMigrations();
   void MigrateLegacyReady(std::string id);
   bool CleanupDeletedFiles(std::string_view id);
@@ -463,9 +525,11 @@ class MarkController {
       std::shared_ptr<const StoredReference>,
       std::int64_t expected_change_count)>;
   using Dispatcher = std::function<void(std::function<void()>)>;
-  MarkController(ReferenceStore& store, Clipboard clipboard);
+  // Injectable elapsed-time source; capture provenance is never retimed by expiry.
+  using Clock = std::function<Stamp()>;
+  MarkController(ReferenceStore& store, Clipboard clipboard, Clock clock = {});
   MarkController(ReferenceStore& store, PendingClipboard pending_clipboard,
-                 ReadyClipboard ready_clipboard, Dispatcher dispatcher);
+                 ReadyClipboard ready_clipboard, Dispatcher dispatcher, Clock clock = {});
   ~MarkController();
   std::uint64_t Begin(std::string id, double crop_margin = 8.0,
                       std::int64_t key_down_monotonic_ms = 0);
@@ -534,6 +598,8 @@ class MarkController {
   CopyResult copy_result() const { return copy_result_; }
   const std::string& last_copy_id() const { return last_copy_id_; }
   [[nodiscard]] std::vector<ReferenceMark> marks() const;
+  [[nodiscard]] std::vector<ReferenceJobSnapshot> presentation_jobs() const;
+  [[nodiscard]] MarkNotesSnapshot LiveMarkSnapshots(std::string_view root) const;
   [[nodiscard]] std::vector<ReferenceJobSnapshot> jobs() const;
   [[nodiscard]] std::vector<ReferenceJobSnapshot> inspector_jobs() const;
   [[nodiscard]] bool NeedsChromePageObservation() const;
@@ -556,6 +622,12 @@ class MarkController {
   DeleteResult DeleteHistoryJob(std::string_view id);
  private:
   struct Transaction;
+  void PrepareCurrentPresentation() const;
+  mutable std::shared_ptr<const ReferencePresentationState> presentation_state_;
+  mutable std::vector<std::shared_ptr<const ReferencePresentation>> presentation_candidates_;
+  mutable std::unordered_map<std::string,std::vector<ReferenceShot>> presentation_shots_;
+  mutable std::uint64_t presentation_window_generation_=0,presentation_own_window_generation_=0;
+  mutable std::uint64_t presentation_own_generation_=0;
   bool Current(std::uint64_t generation) const;
   void CheckPendingWindowContinuity(const WindowObservation& observation);
   void CheckPendingPageContinuity(const PageObservation& observation);
@@ -572,6 +644,7 @@ class MarkController {
   PendingClipboard pending_clipboard_;
   ReadyClipboard ready_clipboard_;
   Dispatcher dispatcher_;
+  Clock clock_;
   std::shared_ptr<int> lifetime_ = std::make_shared<int>(0);
   std::uint64_t generation_ = 0;
   std::uint64_t copy_generation_ = 0;

@@ -123,6 +123,7 @@ void TestContinuousDeleteAgainstDistinctMarks() {
   std::filesystem::remove_all(root);
   seethis::core::ReferenceStore store(root);
   seethis::core::MarkController marks(store, [](const auto&) { return true; });
+  marks.SetViewportContinuity(1,true);
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
   marks.SetWindowObservation(WindowFor(DeleteContext(),1));
 #endif
@@ -456,6 +457,34 @@ void TestNativeDragIdleTimeout() {
         "original untimed production relation reproduces premature expiry");
 }
 #endif
+
+void TestLongHoldConsecutiveDrawingRounds() {
+  using namespace seethis::core;
+  InteractionController controller;
+  const auto point=[](double x,double y){return LogicalPoint(1,x,y);};
+  for(int round=0;round<2;++round) {
+    const std::int64_t start=1'000+round*100'000;
+    Check(controller.ShortcutKeyDown(start,point(20,20))==StartResult::kStarted,
+        "same controller starts consecutive held drawing rounds");
+    controller.SetSelectedDisplayGeometry({1,{0,0},{100,80},1});
+    for(int stroke=0;stroke<2;++stroke) {
+      const auto began=start+1'000+stroke*22'000;const double y=20+stroke*20;
+      Check(controller.PointerDown(point(20,y),began),"long hold accepts each stroke down edge");
+      for(int sample=1;sample<=80;++sample) {
+        const auto time=began+sample*250;
+        Check(controller.PointerMoved(point(20+sample*0.5,y),time),"long hold retains every distinct timed stroke sample");
+        if(stroke==1&&sample==50)
+          Check(!controller.Watchdog(time+1,true)&&controller.Snapshot().state==InteractionState::kDrawing,
+              "hold beyond35 seconds preserves live second stroke under deterministic watchdog");
+      }
+      Check(controller.PointerUp(point(60,y),began+20'001),"long hold accepts each stroke up edge");
+      Check(controller.Snapshot().regions.size()==static_cast<std::size_t>(stroke+1)&&
+          controller.Snapshot().regions.back().size()==81,"long hold drops no samples or completed strokes");
+    }
+    Check(controller.ShortcutKeyUp(start+45'000)&&controller.Snapshot().state==InteractionState::kFinished&&
+        controller.Snapshot().regions.size()==2,"physical shortcut release completes one45 second round exactly once");
+  }
+}
 
 void TestMarkIdleTimeout() {
   using namespace seethis::core;
@@ -1482,6 +1511,7 @@ void TestPendingReferenceActions() {
         return true;
       },
       [](std::function<void()> task){task();});
+  marks.SetViewportContinuity(1,true);
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
   marks.SetWindowObservation(WindowFor(DeleteContext(),1));
 #endif
@@ -1572,6 +1602,92 @@ void TestPendingReferenceActions() {
   std::filesystem::remove_all(root);
 }
 
+void TestPendingLiveActionBoundaries() {
+  using namespace seethis::core;
+  const auto root=std::filesystem::path("/tmp")/
+      ("seethis-pending-boundaries-"+std::to_string(getpid()));
+  std::filesystem::remove_all(root);
+  for(int fault=0;fault<30;++fault) {
+    ReferenceStore store(root/std::to_string(fault));
+    std::size_t copies=0;
+    MarkController marks(store,[&](std::string_view)->std::optional<std::int64_t> {
+      return static_cast<std::int64_t>(++copies);
+    },[](auto,std::int64_t){return true;},[](auto task){task();});
+    auto context=DeleteContext();context.native_window={1,1234,"pending-session",1};
+    const bool chrome=fault>=21&&fault<=27;
+    if(chrome)context.bundle_id="com.google.Chrome";
+    if(fault==28)context.title={2,TitleAvailability::kReady};
+    auto page=ChromePageFor(context,"pending-tab",'a');page.process_start_identity_us=1234;
+    if(fault!=0&&fault!=29)marks.SetViewportContinuity(10,true);
+    marks.SetWindowObservation(WindowFor(context,1));
+    if(chrome)marks.SetPageObservation({PageAvailability::kReady,1,Now(),page});
+    const std::string id(32,'a');const auto generation=marks.Begin(id);
+    Check(marks.BindContext(generation,context),"pending boundary source binds");
+    if(chrome)Check(marks.BindPageIdentity(generation,page),"pending boundary page binds");
+    marks.Release(generation,DeletePath(0),{1'000'003,1'003});
+    Check(store.LookupMetadata(id)->state==ReferenceJobState::kPending&&copies==1,
+          "pending boundary has exactly the original release publication");
+    auto window=WindowFor(context,2);auto changedPage=page;
+    switch(fault) {
+      case 0: break; // The production default remains unhealthy.
+      case 1: marks.SetViewportContinuity(10,false);break;
+      case 2: marks.SetViewportContinuity(11,true);break;
+      case 3: marks.SetPresentationPermitted(false);break;
+      case 4: Check(marks.BeginPresentationPrefix(),"pending prefix begins with fresh context");break;
+      case 5: {auto displays=context.displays;displays[0].uuid="different";marks.SetDisplayObservation(displays);break;}
+      case 6: marks.SetDisplayObservation({});break;
+      case 7: window.pid++;break;
+      case 8: window.bundle_id="other.app";break;
+      case 9: window.window_id++;break;
+      case 10: window.bounds.x++;break;
+      case 11: window.window_title="other title";break;
+      case 12: window.window_title.clear();window.title.availability=TitleAvailability::kUnavailable;break;
+      case 13: window.observed.monotonic_us-=2'000'001;break;
+      case 14: window.observed.monotonic_us+=2'000'000;break;
+      case 15: window.native_window.process_start_identity_us++;break;
+      case 16: window.native_window.incarnation++;break;
+      case 17: window.native_window.observation_session.clear();break;
+      case 18: window.native_window.version=2;break;
+      case 19: window.availability=WindowAvailability::kUnavailable;break;
+      case 20: marks.SetViewportContinuity(10,false);marks.SetViewportContinuity(11,true);break;
+      case 21: changedPage.opaque_tab_id="other-tab";break;
+      case 22: changedPage.navigation_digest=std::string(64,'b');break;
+      case 23: changedPage.process_start_identity_us++;break;
+      case 24: changedPage.browser_pid++;break;
+      case 25: changedPage.window_bounds.x++;break;
+      case 26: marks.SetPageObservation({PageAvailability::kUnavailable,2,Now(),{}});break;
+      case 27: {auto stale=Now();stale.monotonic_us-=2'000'001;
+        marks.SetPageObservation({PageAvailability::kReady,2,stale,page});break;}
+      case 28: break; // Captured title policy cannot be manufactured by current evidence.
+      case 29: marks.SetViewportContinuity(10,true);break; // Late health cannot repair capture input custody.
+    }
+    if(fault>=7&&fault<=19)marks.SetWindowObservation(window);
+    if(fault>=21&&fault<=25)marks.SetPageObservation({PageAvailability::kReady,2,Now(),changedPage});
+    Check(!marks.RecopyJob(id)&&marks.DeleteJob(id)==DeleteResult::kNotFound&&
+          copies==1&&store.LookupMetadata(id)->state==ReferenceJobState::kPending,
+          "unsafe pending context rejects copy/delete without publication or tombstone, fault="+std::to_string(fault));
+    Check(marks.marks().empty()&&
+          marks.SavedProjection(*store.LookupMetadata(id)->metadata)==SavedProjectionState::kTerminal,
+          "pending status action never grants ready saved projection");
+    if(fault==11||fault==12) {
+      marks.SetWindowObservation(WindowFor(context,3));
+      Check(marks.RecopyJob(id)&&copies==2,
+            "fresh original title restores explicit pending recopy despite capture continuity loss");
+      Check(marks.DeleteJob(id)==DeleteResult::kDeleted,"fresh pending source permits logical deletion");
+      marks.Captured(generation,DeleteCapture());store.WaitForIdleForTesting();
+      Check(store.LookupMetadata(id)->state==ReferenceJobState::kDeleted&&copies==2&&
+            !marks.RecopyJob(id)&&marks.inspector_jobs().empty(),
+            "deleted pending reference rejects recopy and late capture without publication or resurrection");
+    }
+    if(fault==15||fault==16) {
+      marks.SetWindowObservation(WindowFor(context,3));
+      Check(!marks.RecopyJob(id)&&marks.DeleteJob(id)==DeleteResult::kNotFound&&copies==1,
+            "fresh old tuple cannot undo positively observed native replacement for pending action");
+    }
+  }
+  std::filesystem::remove_all(root);
+}
+
 void TestInspectorHistoryCopyAcrossApps() {
   using seethis::core::CopyResult;
   using seethis::core::ReferenceJobState;
@@ -1602,6 +1718,7 @@ void TestInspectorHistoryCopyAcrossApps() {
         return true;
       },
       [](std::function<void()> task){task();});
+  marks.SetViewportContinuity(1,true);
   const auto save=[&](const std::string& id,double shift) {
     const auto generation=marks.Begin(id);
     Check(marks.BindContext(generation,DeleteContext()),
@@ -2183,21 +2300,16 @@ void TestChromeCaptureIdentityFreeze() {
   std::ifstream input(overlay_source);
   const std::string source{std::istreambuf_iterator<char>(input),
                            std::istreambuf_iterator<char>()};
-  const auto ready_branch=source.find(
-      "if(published.availability==seethis::core::PageAvailability::kReady");
-  const auto terminal_branch=source.find("} else if(published.availability!=",
-                                         ready_branch);
-  const auto ready_body=ready_branch==std::string::npos ||
-                                terminal_branch==std::string::npos
-                            ? std::string()
-                            : source.substr(ready_branch,
-                                            terminal_branch-ready_branch);
-  Check(input.is_open() &&
-            ready_body.find("BindPageIdentity(capture_generation")!=
-                std::string::npos &&
-            ready_body.find("AwaitingPageIdentity")==std::string::npos &&
-            ready_body.find("abortPending")==std::string::npos,
-        "the native callback binds ready identity immediately and ignores later replacements");
+  const auto freeze=source.find("FreezeCaptureScope(*context,snapshot.session_origin");
+  const auto bind=source.find("_marks->BindContext(_generation,*context)",freeze);
+  const auto refresh=source.find("- (void)refreshChromePage {");
+  const auto callback_end=source.find("\n#else",refresh);
+  const auto callback_body=refresh==std::string::npos||callback_end==std::string::npos?
+      std::string():source.substr(refresh,callback_end-refresh);
+  Check(input.is_open()&&freeze!=std::string::npos&&bind!=std::string::npos&&freeze<bind&&
+        callback_body.find("BindPageIdentity(")==std::string::npos&&
+        callback_body.find("_capturePageIdentity")!=std::string::npos,
+        "native capture freezes scope before binding and asynchronous callbacks cannot replace its identity");
   std::filesystem::remove_all(root);
 }
 
@@ -2504,6 +2616,7 @@ void TestReferenceDropdownSelectionAfterRealDeletion() {
   const auto directory=std::filesystem::path(std::getenv("TMPDIR")?
       std::getenv("TMPDIR"):"/tmp")/("seethis-dropdown-"+std::to_string(getpid()));
   std::filesystem::remove_all(directory);
+  {
   ReferenceStore store(directory);
   MarkController marks(store,[](const auto&){return true;});
   std::int64_t clock=1'000'000;
@@ -2608,6 +2721,7 @@ void TestReferenceDropdownSelectionAfterRealDeletion() {
   state=ReduceInspectorLifecycle(state,InspectorLifecycleEvent::kReferenceSelection,tied_b);
   Check(apply(tied_b)==DeleteResult::kDeleted && state.selected_id.empty(),
         "continuous deletion ends at genuinely empty selection");
+  }
   std::filesystem::remove_all(directory);
 }
 
@@ -2620,6 +2734,7 @@ static void TestNativeWindowABA() {
   {
     ReferenceStore store(directory);int copies=0;
     MarkController marks(store,[&](const StoredReference&){++copies;return true;});
+    marks.SetViewportContinuity(1,true);
     auto a=DeleteContext();a.native_window={1,1234,"test-session",1};
     auto b=a;b.window_id+=1;b.native_window.incarnation=2;
     a.window_title=b.window_title="duplicate";
@@ -2653,6 +2768,7 @@ static void TestTitleWindowABA() {
   for(int legacy=0;legacy<2;++legacy) {
     ReferenceStore store(directory/std::to_string(legacy));int copies=0;
     MarkController marks(store,[&](const StoredReference&){++copies;return true;});
+    marks.SetViewportContinuity(1,true);
     auto a=DeleteContext();a.native_window={1,1234,"title-session",1};
     a.window_title="Synthetic session A";a.title=legacy?TitleEvidence{}:TitleEvidence{1,TitleAvailability::kReady};
     const std::string id(32,'a');marks.SetWindowObservation(WindowFor(a,1));
@@ -2694,6 +2810,7 @@ int main() {
   TestCaptureReleaseOrders();
   TestWatchdog();
   TestMarkIdleTimeout();
+  TestLongHoldConsecutiveDrawingRounds();
 #if defined(__APPLE__)
   TestNativeDragIdleTimeout();
 #endif
@@ -2706,6 +2823,7 @@ int main() {
   TestAnnotatedClipboardOnNamedPasteboard();
 #endif
   TestPendingReferenceActions();
+  TestPendingLiveActionBoundaries();
   TestInspectorHistoryCopyAcrossApps();
   TestInspectorHistoryDelete();
   TestInspectorSelectionPolicy();

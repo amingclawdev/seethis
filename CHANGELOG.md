@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.5 — 2026-10-28
+
+- Add per-shot frozen page/window/app scope, explained in Inspector. Chrome Automation is optional for basic capture; explicit authorization still requires a fresh gesture.
+- Support reliable running-app identity when Launch Services has no launch date, preserving old stored bindings and indexed context lookup.
+- Add Append screenshots with separate shot images, continuous numbering and persistent per-mark notes.
+- Keep strokes, numbers, notes and hit testing under one visibility rule, recover from temporary observation failures, and delete whole references deliberately.
+- Bound asynchronous Chrome work and late results; separate drawing idle time from screenshot/save deadlines.
+- Retain local reference delivery, image sharing and separate ordinary/Store distribution paths.
+
+The user accepted the remaining manual checks, reporting one transient flicker followed by stable behavior. Independent source/offline verification passed; final GitHub package signing/notarization checks are separately recorded in its release manifest and are pending during source preparation. See [release notes](docs/RELEASE.md) for limits.
+
 ## v0.1.1-beta.1 — 2026-10-02
 
 - Request missing Chrome Automation from the configured physical capture shortcut while Chrome is foreground; keep consent work off the main UI thread and coalesce repeated holds.

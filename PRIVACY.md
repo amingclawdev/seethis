@@ -5,8 +5,8 @@ SeeThis processes screen references locally. This version has no cloud sync, tel
 ## Capture and permissions
 
 - **Input Monitoring** observes global shortcuts, mouse input and interruptions; the native listener does not record unrelated keystroke content. **Screen Recording** captures the selected display. These permissions are checked separately.
-- A reference stores the entire selected display as a static image, plus regions/paths, the source app/window, time and dimensions. Marked regions are not a privacy crop. Hide private windows and notifications before capturing, and inspect the whole image before sharing it.
-- Chrome Automation uses Apple Events to read the foreground standalone Chrome tab ID and URL and derive a page identity digest. Public metadata and logs should avoid the original URL and tab token; screenshot pixels can still contain them.
+- A reference stores the entire selected display as a static image, plus regions/paths, notes, the source app/window, time and dimensions. Each appended shot has its own image and source context. Marked regions are not a privacy crop. Hide private windows and notifications before capturing, and inspect the whole image before sharing it.
+- Optional Chrome Automation uses Apple Events to read foreground standalone Chrome window/tab properties and derive a page identity digest. The digest does not remove capture-time metadata: reference responses and Details can include `page_url` and `window_title` when available. Screenshot pixels may show URLs, titles and account information. Treat images, notes and metadata as potentially private before sharing a link or giving a tool access. Unused broader browser properties are discarded rather than logged or persisted.
 
 ## Storage, deletion and expiration
 
@@ -28,4 +28,4 @@ Public GitHub technical issue and fix records may be retained. You can request r
 
 The public [privacy policy](https://github.com/amingclawdev/seethis/blob/main/PRIVACY.md) applies to the documented support practices above. App versions that provide **Privacy Policy…** in the menu open this same page. App Store privacy-label declarations are separate from this policy.
 
-The current GitHub release is v0.1.1-beta.1. SeeThis 0.1.1 is now available on the [Mac App Store](https://apps.apple.com/us/app/seethis-visual-context/id6818581322). See [seethis.dev](https://seethis.dev) to choose between the Store release and the GitHub beta.
+See the [0.1.5 release notes](docs/RELEASE.md) for distribution status and verification limits. SeeThis 0.1.1 is now available on the [Mac App Store](https://apps.apple.com/us/app/seethis-visual-context/id6818581322). See [seethis.dev](https://seethis.dev) to choose between the Store release and the GitHub beta.

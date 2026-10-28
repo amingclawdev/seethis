@@ -1,93 +1,43 @@
-# v0.1.1-beta.1 release provenance
+# SeeThis v0.1.5
 
-Public repository: [amingclawdev/seethis](https://github.com/amingclawdev/seethis). Distribution: [v0.1.1-beta.1 prerelease](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1), Apple Silicon / macOS 14.2+.
+[GitHub release](https://github.com/amingclawdev/seethis/releases/tag/v0.1.5) · Apple Silicon · macOS 14.2+
 
-This patch adds Chrome Automation consent from the configured capture shortcut, asynchronous permission handling, and current Inspector exclusion from new captures. After a Chrome permission decision, release the original capture key and use a fresh gesture. Existing capture, page-scoped marks, copying, deletion and explicit Chrome recovery remain available.
+## Changes
 
-## Exact source and production build
+- Append later captures as separate shots in one reference, with continuous numbering and notes bound to their marks.
+- Freeze each new shot to page, window or app scope from reliable evidence available at capture start. Inspector explains the scope. Automation is optional for basic Chrome capture; page association uses it only when authorized and ready.
+- Preserve saved marks through temporary context unavailability, and keep drawing, badges, notes and hit testing under the same visibility rules. App scope follows the same running app and display, including apps without a Launch Services launch date.
+- Keep native Chrome work off the UI thread, bound physical operations and reject superseded or late results. Preserve explicit consent and fresh-gesture requirements.
+- Separate renewable drawing idle time from screenshot/save deadlines, and retain indexed presentation lookup for large histories.
 
-This release is rebuilt from the clean public source commit identified by the tag and `RELEASE-MANIFEST.json`; it does not reuse the previous executable. Product and automated-test changes come from the accepted implementation. The release mapping records exact source-file equivalence, with version and public-documentation changes called out separately.
+## Source provenance
 
-- Bundle identifier: `local.seethis.overlay`.
-- Internal version/build: `0.1.1` / `0.1.1`.
-- Build: Release, arm64 only, minimum macOS 14.2, selected Apple clang and macOS SDK.
-- Production entitlement: `com.apple.security.automation.apple-events`; this GitHub distribution is not an App Store sandbox package.
-- Signature: existing Developer ID Application team `GLHUR8CC29`, hardened runtime, established production designated requirement.
+The frozen implementation is `d2d9054bed1df4066f05454aaf12fd7304a86d58` (tree `ba283e5b18be1c0a715270b6c8e26b72d956ca6e`). This repository exports its runtime, build, asset, script, test and license files with identical bytes and executable modes while retaining the public repository's history. No private development history is imported. [SOURCE-MAPPING.json](../SOURCE-MAPPING.json) lists every mapped file. Public documentation is maintained separately; the final release manifest identifies the public commit used for distribution.
 
-The published release is gated on the serial seven-test suite, independent source/package QA, actual Apple notarization **Accepted**, App and DMG stapling, strict signatures and Gatekeeper checks. `RELEASE-MANIFEST.json` records exact commit, final hashes, toolchain and submission/check results. The packaging provenance’s `notarized=false` describes its initial signing stage; final notarization is established by those ticket and release checks.
+## Downloads and distribution checks
 
-## Downloads and validation
+Expected release attachments:
 
-The release provides `SeeThis-0.1.1-beta.1-macos-arm64-release.dmg`, `SeeThis-0.1.1-beta.1-macos-arm64-release.zip`, `RELEASE-MANIFEST.json` and `SHA256SUMS`. Check the downloaded files against checksums from this same release.
+- `SeeThis-0.1.5-macos-arm64-release.dmg`
+- `SeeThis-0.1.5-macos-arm64-release.zip`
+- `SHA256SUMS`, `RELEASE-MANIFEST.json` and source mapping
 
-The DMG contains SeeThis.app, an Applications symlink, LICENSE and THIRD_PARTY_NOTICES.md; the ZIP contains the same stapled app and notices. No custom Finder background is used. App, embedded DMG app and ZIP-extracted app parity, signatures, tickets and Gatekeeper are verified before publication.
+The ordinary GitHub app uses bundle identifier `local.seethis.overlay` and the established Developer ID distribution identity, with hardened runtime. It is separate from the sandboxed Mac App Store app and its data container. No automatic data migration or permission continuity is promised.
 
-## Verification limits
+**Release preparation status:** final signing, Apple notarization, stapling, Gatekeeper and archive-parity receipts are pending at the time of this source update. This document does not claim that notarization has succeeded. Publication requires those checks to pass and their results to be recorded in `RELEASE-MANIFEST.json`. Check the final manifest and `SHA256SUMS` from the same release before installation.
 
-Automated tests cover interaction, references, loopback HTTP, input/Inspector state, injected native consent scheduling and capture-exclusion assembly. They do not reproduce every physical OS dialog or certify every assistant’s image handling. A user reported successful fresh-identity authorization and tab/deletion acceptance of the accepted development candidate; this is user-reported acceptance, not an independent telemetry claim for the final production artifact.
+## Validation and limits
 
-The new production build is not launched or installed during release preparation. First-download permissions, Finder drag installation, update/rollback/uninstall residues, another Mac, broader OS versions and the complete physical page/window/Inspector lifecycle matrix remain unverified. Reusing the production identifier, Developer ID team and designated requirement does not guarantee TCC grant continuity. The original demo shows an earlier workflow.
+The user accepted the remaining manual checks on the frozen candidate, reporting one transient flicker followed by stable behavior. Independent source/offline QA passed, including the 13-test suite, targeted context-scope and process-identity regressions, serialization compatibility and the final test teardown correction. These results are distinct from the final GitHub package's signing/notarization checks.
 
-Intel/universal builds, automatic updates and App Store delivery remain outside this beta.
+User acceptance is not exhaustive telemetry for individual gestures or all machines. First-download permissions, update/rollback, other macOS releases and every display/app combination are not universally certified. Earlier physical failures remain part of the development history; this release does not promise that flicker can never recur. The demo shows an earlier workflow. Inspect a safe capture and its scope before relying on it.
 
-## Developer packaging
-
-```sh
-bash scripts/package_macos.sh package --source "$PWD" --commit "$(git rev-parse HEAD)" --configuration Release --mode development --output /tmp/seethis-development-package
-```
-
-This makes an ad-hoc development package. Production signing requires an explicitly selected Developer ID identity. This release uses the script’s fresh stable-bootstrap build path, then checks the actual production identifier, team, entitlements and designated requirement against the prior notarized app. The prior app’s initial embedded development flags are preserved. Notarization is a separate release step. CI uploads development artifacts only; it does not publish release assets. Source archives can build/test without Git metadata, while packaging requires exact Git provenance.
-
----
-
-# Historical v0.1.0-beta.1 release provenance
-
-Public repository: [amingclawdev/seethis](https://github.com/amingclawdev/seethis). Distribution: [v0.1.0-beta.1 prerelease](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1), Apple Silicon / macOS 14.2+.
-
-## Source and build identity
-
-The public tag identifies the source, documentation, license and development tests for this release. Runtime/build inputs (`src/`, `web/settings/`, icon assets, CMake files and the icon-generation script) are byte-identical to the original app build source:
-
-- Original runtime build commit: `70135abec8ea9d7260646165e31ecfcd5d6328c3`.
-- Original runtime build tree: `4aff6460ddf1b21f690fbf1053319a03ca5fa4c4`.
-- Released executable SHA-256: `660e5b9465c382364f723fa2f950b318e339929fc5b2ec9ec2b0f6dead92a5d4`.
-- Bundle identifier: `local.seethis.overlay`; internal version/build: `0.1.0` / `0.1.0`.
-
-The release app was built from that original source, then Developer ID signed and notarized. It was **not rebuilt from the later public documentation commit**. The release attachment `RELEASE-MANIFEST.json` records the exact public commit and file hashes that map this snapshot to the original build.
-
-The embedded `seethis-delivery-provenance.v1` records the initial packaging stage; its ad-hoc/notarized=false flags precede final signing. Current signing and notarization are established by the final signature/ticket checks below, not those historical flags. The signed app is preserved intact.
-
-## Distribution identity
-
-| Item | Value |
-| --- | --- |
-| Signature | Developer ID Application: YING ZHANG (GLHUR8CC29), hardened runtime, secure timestamp |
-| Accepted app submission | `bee3ff1d-4699-4cb6-9706-a370bf3c85dc`, Accepted |
-| Stapling | Final App, ZIP-extracted App, DMG and embedded-App ticket checks are recorded in RELEASE-MANIFEST.json; all must pass before publication |
-| Gatekeeper | App, DMG and ZIP-extracted app accepted as Notarized Developer ID on release host |
-| DMG | `SeeThis-0.1.0-beta.1-macos-arm64-release.dmg` |
-| DMG SHA-256 | See the final Release attachment SHA256SUMS |
-| ZIP | `SeeThis-0.1.0-beta.1-macos-arm64-release.zip` |
-| ZIP SHA-256 | See the final Release attachment SHA256SUMS |
-
-Check SHA256SUMS against the downloaded file. The DMG mounts with SeeThis.app and an Applications symlink. The embedded app and ZIP-extracted app preserve the original executable, signature and validated ticket. No custom Finder background is used.
-
-Build toolchain: CMake 4.4.3, Apple clang 21.0.0 (clang-2100.1.1.101), macOS SDK 26.5, arm64, Release, minimum macOS 14.2. Dynamic dependencies are system macOS frameworks/libraries; see [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md).
-
-## Verification limits
-
-Automated tests cover reference lifecycle, interaction, HTTP authorization/images, Inspector and permission states with synthetic fixtures. Distribution checks verify signatures, tickets and app content parity. These checks do not certify every remote assistant's image handling.
-
-Final DMG Finder drag installation, first-download/first-TCC authorization, update/rollback/uninstall residues, another Mac and broader OS versions remain unverified. Technical mounting, layout, payload/signature and Gatekeeper checks do not establish Finder drag success. The demo shows an earlier workflow.
-
-Intel/universal distribution, automatic updates and App Store delivery are outside this beta.
-
-## Developer packaging
-
-A fresh development package can be made from a clean checkout at an exact commit:
+## Development package
 
 ```sh
 bash scripts/package_macos.sh package --source "$PWD" --commit "$(git rev-parse HEAD)" --configuration Release --mode development --output /tmp/seethis-development-package
 ```
 
-This builds and ad-hoc signs a new app; it does not reproduce the Developer ID/notarized release identity or submit notarization. CI likewise creates clearly labeled development artifacts. Stable signing paths require an explicitly selected Developer ID identity and the script's continuity checks. Source archives can build/test without Git metadata; packaging requires Git commit provenance.
+This builds an ad-hoc development package. It does not reproduce the Developer ID release or submit notarization. See [CONTRIBUTING](../CONTRIBUTING.md).
+
+Earlier release assets and their manifests remain attached to their original tags: [v0.1.1-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1) and [v0.1.0-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.0-beta.1).

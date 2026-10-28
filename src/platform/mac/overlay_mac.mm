@@ -944,12 +944,13 @@ using STNoteSave = std::function<STNoteSaveResult(
 
 // This production boundary is shared with native tests. It publishes the same
 // MarkController observations used by ink/badges, then reconciles the explicitly
-// opened pair against uncached metadata. Inspector selection is never authority.
+// opened pair against revision-bound metadata. Inspector selection is never authority.
 struct STNoteVisibilitySource {
   seethis::core::MarkController* marks = nullptr;
   std::function<std::optional<seethis::core::ReferenceJobSnapshot>(std::string_view)> lookup;
   std::function<seethis::core::MarkNotesSnapshot(std::string_view)> snapshots;
   std::function<seethis::core::ReferenceCollection(std::string_view)> collection;
+  std::function<bool(std::string_view,std::size_t,std::string_view)> markIdentity;
   std::function<std::vector<seethis::core::FrozenDisplay>()> displays;
   std::function<std::int64_t()> foregroundPID;
   std::function<bool()> screenReady;
@@ -996,6 +997,7 @@ struct STInspectorNoteAdmission {std::string root,mark;std::uint64_t generation;
 - (void)applicationActivated:(std::int64_t)pid;
 - (void)publishWindow:(seethis::core::WindowObservation)observation;
 - (void)publishPage:(seethis::core::PageObservation)observation;
+- (void)publishWindow:(seethis::core::WindowObservation)window page:(seethis::core::PageObservation)page;
 - (BOOL)acceptPage:(seethis::core::PageObservation)observation
           request:(seethis::platform::ChromeObservationRequest)request
         lifecycle:(seethis::platform::ChromeObservationLifecycle&)lifecycle
@@ -1034,7 +1036,7 @@ static bool STPublishOwnUIPresentation(seethis::core::MarkController& marks,
     bool owned,std::uint64_t permission,std::uint64_t currentPermission) {
   const auto active=marks.own_ui_presentation_source();
   if(!active||active->generation!=target.generation)return false;
-  if(!owned||permission!=currentPermission){marks.RetireLiveShot();return false;}
+  if(!owned||((target.page||!target.context.scope.policy_present)&&permission!=currentPermission)){marks.RetireLiveShot();return false;}
   return marks.PublishOwnUIPresentationObservation(target,std::move(window),std::move(page));
 }
 
@@ -1075,7 +1077,8 @@ static bool STPublishOwnUIPresentation(seethis::core::MarkController& marks,
   const auto mark=std::find_if(snapshot.marks.begin(),snapshot.marks.end(),
       [&](const auto& item){return item.id==markID;});
   if(mark==snapshot.marks.end() || !mark->anchor.IsValid() || mark->number!=mark->slot+1 ||
-     mark->id!=StableMarkId(referenceID,mark->slot))return NO;
+     !(_source.markIdentity?_source.markIdentity(referenceID,mark->slot,mark->id):
+       mark->id==StableMarkId(referenceID,mark->slot)))return NO;
   auto owner=*job;
   if(_source.collection && job->state==ReferenceJobState::kReady) {
     const auto collection=_source.collection(referenceID);
@@ -1166,6 +1169,11 @@ static bool STPublishOwnUIPresentation(seethis::core::MarkController& marks,
   _source.marks->SetPageObservation(std::move(observation));
   [self reconcile];
 }
+- (void)publishWindow:(seethis::core::WindowObservation)window page:(seethis::core::PageObservation)page {
+  _source.marks->SetWindowObservation(std::move(window));
+  _source.marks->SetPageObservation(std::move(page));
+  [self reconcile];
+}
 - (BOOL)acceptPage:(seethis::core::PageObservation)observation
           request:(seethis::platform::ChromeObservationRequest)request
         lifecycle:(seethis::platform::ChromeObservationLifecycle&)lifecycle
@@ -1210,16 +1218,22 @@ struct STNoteBadge {
   std::uint32_t number = 0;
   seethis::core::DisplayPoint anchor;
 };
+static bool STPublishedMarkIdentity(const seethis::core::MarkNotesSnapshot& snapshot,
+    std::size_t slot,std::string_view id) {
+  return (snapshot.status==seethis::core::MarkNotesStatus::kReady||snapshot.status==seethis::core::MarkNotesStatus::kPending)&&slot<snapshot.marks.size()&&
+      snapshot.marks[slot].slot==slot&&snapshot.marks[slot].id==id;
+}
 static std::vector<STNoteBadge> STReferenceNoteBadges(
     const std::string& id,const seethis::core::MarkNotesSnapshot& snapshot,
-    const seethis::core::GlobalVisibilitySnapshot& visibility) {
+    const seethis::core::GlobalVisibilitySnapshot& visibility,
+    const seethis::core::MarkNotesSnapshot* published=nullptr) {
   using namespace seethis::core;
   std::vector<STNoteBadge> badges;
   if(!visibility.permits_presentation() ||
      (snapshot.status!=MarkNotesStatus::kReady && snapshot.status!=MarkNotesStatus::kPending))
     return badges;
   for(const auto& mark:snapshot.marks)
-    if(mark.anchor.IsValid() && mark.id==StableMarkId(id,mark.slot))
+    if(mark.anchor.IsValid() && (published?STPublishedMarkIdentity(*published,mark.slot,mark.id):mark.id==StableMarkId(id,mark.slot)))
       badges.push_back({id,mark.id,mark.number,mark.anchor});
   return badges;
 }
@@ -1290,22 +1304,44 @@ static bool STNoteBadgeHit(const STNoteBadge& badge,
 @end
 
 namespace {
+seethis::core::MarkNotesSnapshot STPresentationNotes(
+    const seethis::core::ReferenceStore& references,std::string_view id) {
+  const auto entry=references.ReadPresentation(id);
+  return entry?entry->notes:seethis::core::MarkNotesSnapshot{};
+}
+seethis::core::MarkNotesSnapshot STPresentationNotesForReference(
+    const seethis::core::ReferenceStore& references,const seethis::core::Reference& ref) {
+  const auto entry=references.ReadPresentation(ref.id);if(!entry)return {};
+  const auto member=entry->source_membership.find(std::to_string(ref.first_mark_slot)+":"+ref.source.sha256);
+  if(member==entry->source_membership.end())return {};
+  const auto notes=entry->shot_notes.find(entry->collection.shots[member->second].id);
+  return notes==entry->shot_notes.end()?seethis::core::MarkNotesSnapshot{}:notes->second;
+}
 std::vector<seethis::core::ReferenceRegion> STVisibleReferenceRegions(
     const seethis::core::Reference& reference,
     const seethis::core::MarkNotesSnapshot& snapshot,
-    const seethis::core::GlobalVisibilitySnapshot& visibility) {
+    const seethis::core::GlobalVisibilitySnapshot& visibility,
+    const seethis::core::MarkNotesSnapshot* published=nullptr) {
   const auto regions=seethis::core::EffectiveRegions(reference);
   std::vector<seethis::core::ReferenceRegion> visible;
   // If metadata cannot be read, do not accidentally reveal a hidden stroke.
   if(!visibility.permits_presentation() ||
-     snapshot.status!=seethis::core::MarkNotesStatus::kReady ||
-     snapshot.marks.size()<reference.first_mark_slot+regions.size())return visible;
-  for(std::size_t slot=0;slot<regions.size();++slot)
-    if(reference.first_mark_slot+slot<snapshot.marks.size() &&
-       snapshot.marks[reference.first_mark_slot+slot].slot==reference.first_mark_slot+slot &&
-       snapshot.marks[reference.first_mark_slot+slot].id==seethis::core::StableMarkId(reference.id,reference.first_mark_slot+slot))
+     snapshot.status!=seethis::core::MarkNotesStatus::kReady)return visible;
+  for(std::size_t slot=0;slot<regions.size();++slot) {
+    const auto global=reference.first_mark_slot+slot;
+    const auto mark=std::lower_bound(snapshot.marks.begin(),snapshot.marks.end(),global,
+        [](const auto& item,std::size_t value){return item.slot<value;});
+    if(mark!=snapshot.marks.end()&&mark->slot==global&&
+       (published?STPublishedMarkIdentity(*published,global,mark->id):mark->id==seethis::core::StableMarkId(reference.id,global)))
       visible.push_back(regions[slot]);
+  }
   return visible;
+}
+static std::vector<seethis::core::ReferenceRegion> STVisiblePublishedRegions(
+    const seethis::core::ReferenceStore& references,const seethis::core::Reference& reference,
+    const seethis::core::GlobalVisibilitySnapshot& visibility) {
+  const auto entry=references.ReadPresentation(reference.id);if(!entry)return {};
+  return STVisibleReferenceRegions(reference,STPresentationNotesForReference(references,reference),visibility,&entry->notes);
 }
 static void STObservePresentationInput(seethis::platform::ViewportContinuity& continuity,
     seethis::core::MarkController& marks,seethis::platform::ViewportInput event,
@@ -1315,7 +1351,16 @@ static void STObservePresentationInput(seethis::platform::ViewportContinuity& co
 }
 static bool STSourceFocusPermissionCurrent(const seethis::core::Context& source,
     std::uint64_t expected,std::uint64_t current) {
-  return source.bundle_id!="com.google.Chrome"||expected==current;
+  return source.bundle_id!="com.google.Chrome"||
+      (source.scope.policy_present&&source.scope.kind!=seethis::core::CaptureScopeKind::kPage)||expected==current;
+}
+static const seethis::core::Context* STSourceFocusObservationContext(
+    const seethis::core::Context& candidate,
+    const std::optional<seethis::core::OwnUIPresentationSourceTarget>& target,bool owned) {
+  if(!owned||!target)return &candidate;
+  const auto& source=target->context;
+  if(candidate.pid!=source.pid||candidate.window_id!=source.window_id||candidate.bundle_id!=source.bundle_id)return nullptr;
+  return &source; // source availability is judged after the shared dual sample
 }
 // Presentation continuity only: this never claims input or creates admission.
 // Judge current eligibility before invoking either fresh native query.
@@ -1327,7 +1372,8 @@ static bool STSourceFocusPreservesPresentation(
     const seethis::core::GlobalVisibilitySnapshot& visibility,
     const std::vector<seethis::core::FrozenDisplay>& displays,
     const std::vector<std::uint64_t>& passThroughPanels,
-    Destination destinationAt,Source observeSource) {
+    Destination destinationAt,Source observeSource,
+    std::function<bool(const seethis::core::Context&)> sourceAllowed={}) {
   using namespace seethis::core;
   if(event!=seethis::platform::ViewportInput::kPrimaryDown||!healthy||!point||
      !point->IsValid()||point->unit!=CoordinateUnit::kLogicalPoints||
@@ -1339,9 +1385,9 @@ static bool STSourceFocusPreservesPresentation(
   std::vector<Reference> eligible;
   for(const auto& item:marks.marks()) {
     const auto& ref=item.value;
-    if(ref.context.native_window.version==1&&DisplayTopologyMatches(ref.context.displays,displays)&&
+    if((!sourceAllowed||sourceAllowed(ref.context))&&(ref.context.native_window.version==1||ref.context.native_window.version==2)&&DisplayTopologyMatches(ref.context.displays,displays)&&
        marks.PresentedReferenceVisible(ref)&&
-       !STVisibleReferenceRegions(ref,references.MarkSnapshots(ref.id),visibility).empty())eligible.push_back(ref);
+       !STVisiblePublishedRegions(references,ref,visibility).empty())eligible.push_back(ref);
   }
   if(eligible.empty())return false;
   std::uint64_t destination=0,below=0;
@@ -1354,14 +1400,16 @@ static bool STSourceFocusPreservesPresentation(
     below=destination;destination=0;
   }
   if(!destination)return false;
+  std::optional<WindowObservation> observation;
   for(const auto& ref:eligible) {
     if(destination!=ref.context.window_id)continue;
-    const auto fresh=observeSource(ref.context);
+    // One destination/current-process sample serves every candidate, including
+    // a failed sample. Never issue one kernel/native query per historical shot.
+    if(!observation)observation=observeSource(ref.context);
+    const auto& fresh=*observation;
     if(!WindowObservationMatchesContext(ref.context,fresh)||
        !marks.PresentedReferenceVisible(ref))continue;
-    if(ref.context.bundle_id=="com.google.Chrome") {
-      if(!ref.page_identity)continue; // Existing predicate owns page freshness.
-    } else if(!TitleContextVisible(ref.context,fresh))continue;
+    if(!ReferenceVisible(ref.context,ref.page_identity,fresh,marks.page_observation()))continue;
     return true;
   }
   return false;
@@ -1414,30 +1462,32 @@ static std::optional<STStrokeHit> STVisibleStrokeHit(
   using namespace seethis::core;
   if((!ownPanels.empty()&&STOwnPanelCoversPoint(point,displays,ownPanels))||!marks.PresentationHitsAllowed()||!visibility.permits_presentation() || !point.IsValid() ||
      point.unit!=CoordinateUnit::kLogicalPoints || !std::isfinite(radius) || radius<0)return {};
-  const auto jobs=references.Jobs();
+  const auto jobs=marks.presentation_jobs();
   for(auto it=jobs.rbegin();it!=jobs.rend();++it) {
     if(it->state==ReferenceJobState::kDeleted || it->state==ReferenceJobState::kExpired)continue;
     Reference reference;
     std::string shotID=it->id;
     if(it->state==ReferenceJobState::kReady) {
-      const auto collection=references.Collection(it->id);
+      const auto entry=references.ReadPresentation(it->id);if(!entry)continue;
+      const auto& collection=entry->collection;
       if(collection.status!=MarkNotesStatus::kReady)continue;
       auto candidates=collection.multi()?marks.LiveShots(it->id):std::vector<ReferenceShot>{};
       if(!collection.multi()) {
         if(!it->metadata||!marks.PresentedReferenceVisible(*it->metadata))continue;
         candidates.push_back({it->id,0,it->metadata});
       }
-      const auto snapshot=references.MarkSnapshots(it->id);
-      if(snapshot.status!=MarkNotesStatus::kReady)continue;
+      if(entry->notes.status!=MarkNotesStatus::kReady)continue;
       // Newer admitted shots paint above older ones; local ties keep old order.
       for(auto shot=candidates.rbegin();shot!=candidates.rend();++shot) {
         reference=*shot->metadata;shotID=shot->id;
         const auto regions=EffectiveRegions(reference);
-        if(snapshot.marks.size()<reference.first_mark_slot+regions.size())continue;
+        const auto notes=entry->shot_notes.find(shotID);if(notes==entry->shot_notes.end())continue;
+        const auto& snapshot=notes->second;
+        if(snapshot.marks.size()<regions.size())continue;
         for(std::size_t local=0;local<regions.size();++local) {
           const auto global=reference.first_mark_slot+local;
-          const auto& mark=snapshot.marks[global];
-          if(mark.slot!=global || mark.id!=StableMarkId(it->id,global) ||
+          const auto& mark=snapshot.marks[local];
+          if(mark.slot!=global || !STPublishedMarkIdentity(entry->notes,global,mark.id) ||
              mark.number!=global+1 || mark.shot_id!=shotID || mark.local_slot!=local)continue;
           if(STRegionsHit(reference.context,{regions[local]},point,radius,displays))
             return STStrokeHit{it->id,shotID,mark.id,local,global,mark.number};
@@ -1464,22 +1514,15 @@ static std::vector<STNoteBadge> STPresentedNoteBadges(
     const std::vector<seethis::core::FrozenDisplay>& displays) {
   using namespace seethis::core;
   if(!visibility.permits_presentation())return {};
-  auto snapshot=references.MarkSnapshots(root);const auto collection=references.Collection(root);
-  if(collection.status!=MarkNotesStatus::kReady)return {};
-  if(collection.multi()) {
-    const auto live=marks.LiveShots(root);
-    std::erase_if(snapshot.marks,[&](const auto& mark) {
-      return std::none_of(live.begin(),live.end(),[&](const auto& shot) {
-        return shot.id==mark.shot_id&&DisplayTopologyMatches(shot.metadata->context.displays,displays);
-      });
+  auto snapshot=marks.LiveMarkSnapshots(root);
+  const auto live=marks.LiveShots(root);
+  std::erase_if(snapshot.marks,[&](const auto& mark) {
+    return std::none_of(live.begin(),live.end(),[&](const auto& shot) {
+      return shot.id==mark.shot_id&&DisplayTopologyMatches(shot.metadata->context.displays,displays);
     });
-  } else {
-    const auto job=references.LookupMetadata(root);
-    if(!job||!(job->metadata?marks.PresentedReferenceVisible(*job->metadata):
-        ReferenceVisible(job->context,job->page_identity,marks.window_observation(),marks.page_observation()))||
-       !DisplayTopologyMatches(job->context.displays,displays))return {};
-  }
-  return STReferenceNoteBadges(root,snapshot,visibility);
+  });
+  const auto entry=references.ReadPresentation(root);
+  return entry?STReferenceNoteBadges(root,snapshot,visibility,&entry->notes):std::vector<STNoteBadge>{};
 }
 static bool STOwnStrokeSelectionInput(bool acceptingOverlayDestination,
     seethis::core::ReferenceStore& references,seethis::core::MarkController& marks,
@@ -1524,7 +1567,9 @@ static STCaptureSelectionStart STBeginModeCapture(
 static std::optional<std::string> STValidateAppendMode(
     seethis::platform::AppendCaptureMode& mode,seethis::core::ReferenceStore& references,
     seethis::core::MarkController& marks) {
-  if(!mode.enabled()||references.Collection(mode.root).status==seethis::core::MarkNotesStatus::kReady)return {};
+  if(!mode.enabled())return {};
+  const auto entry=references.ReadPresentation(mode.root);
+  if(entry&&entry->collection.status==seethis::core::MarkNotesStatus::kReady)return {};
   const auto previous=mode.root;mode.Disable();marks.RetireReferencePresentation(previous);return previous;
 }
 // The native checkbox and no-show component tests share the full mode,
@@ -1568,6 +1613,13 @@ static bool STObserveAndScheduleCapture(
   if(currentGeneration!=capturedGeneration||
      !interaction.Snapshot().captures_pointer()||!marks.Pending()||!marks.AllowsDrawing())return false;
   schedule();return true;
+}
+template<class Abort>
+static void STReconcileCaptureDeadline(seethis::core::InteractionController& interaction,
+    seethis::core::MarkController& marks,seethis::core::Stamp now,Abort&& abort) {
+  marks.Expire(now);
+  if(!marks.AllowsDrawing()&&interaction.Snapshot().captures_pointer()&&
+     marks.phase()==seethis::core::ReferencePhase::kAborted)abort();
 }
 static bool STCompleteCaptureAttempt(seethis::core::MarkController& marks,
     const std::uint64_t& currentGeneration,std::uint64_t deliveredGeneration,
@@ -1995,6 +2047,8 @@ struct STDeleteChord { bool key_down = false; bool exact_modifiers = false; };
   seethis::platform::ChromeObservationLifecycle _chromeLifecycle;
   std::uint64_t _chromePermissionGeneration;
   std::optional<seethis::core::Context> _captureContext;
+  std::optional<seethis::core::PageIdentity> _capturePageIdentity;
+  std::optional<seethis::core::WindowObservation> _chromeForegroundTarget;
   bool _ownSourcePagePending;
   std::uint64_t _ownSourceRequestGeneration;
 #endif
@@ -2109,6 +2163,7 @@ struct STDeleteChord { bool key_down = false; bool exact_modifiers = false; };
 - (void)stopChromePageRefresh;
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
 - (void)refreshForegroundWindow;
+- (void)publishForegroundObservation:(seethis::core::WindowObservation)current;
 - (BOOL)ownsPresentationInput;
 - (void)refreshOwnUIPresentationSource;
 - (void)publishForegroundUnavailable;
@@ -2509,9 +2564,16 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     STNoteVisibilitySource visibilitySource;
     visibilitySource.marks=_marks.get();
     visibilitySource.visibility=[settings] {return settings->Visibility();};
-    visibilitySource.lookup=[references](std::string_view id){return references->LookupMetadata(id);};
-    visibilitySource.snapshots=[references](std::string_view id){return references->MarkSnapshots(id);};
-    visibilitySource.collection=[references](std::string_view id){return references->Collection(id);};
+    visibilitySource.lookup=[references](std::string_view id)->std::optional<seethis::core::ReferenceJobSnapshot> {
+      const auto entry=references->ReadPresentation(id);return entry?std::optional(entry->job):std::nullopt;
+    };
+    visibilitySource.snapshots=[references](std::string_view id){return STPresentationNotes(*references,id);};
+    visibilitySource.collection=[references](std::string_view id) {
+      const auto entry=references->ReadPresentation(id);return entry?entry->collection:seethis::core::ReferenceCollection{};
+    };
+    visibilitySource.markIdentity=[references](std::string_view root,std::size_t slot,std::string_view id) {
+      const auto entry=references->ReadPresentation(root);return entry&&STPublishedMarkIdentity(entry->notes,slot,id);
+    };
     visibilitySource.displays=[weakVisibilitySelf] {
       STOverlayCoordinator* owner=weakVisibilitySelf;
       return owner?owner->_displays:std::vector<seethis::core::FrozenDisplay>{};
@@ -2919,7 +2981,9 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   const auto source=active==collection.shots.end()?seethis::core::SourceContextProjection{}:
       seethis::core::ProjectSourceContext(*active->metadata);
   const auto contextText=source.page_url?*source.page_url:source.window_title?*source.window_title:std::string{};
-  _inspectorView.text=selectedMarkText?:[NSString stringWithUTF8String:contextText.c_str()];
+  NSString* captureText=selectedMarkText?:[NSString stringWithUTF8String:contextText.c_str()];
+  NSString* scopeText=[NSString stringWithUTF8String:source.scope_label.c_str()];
+  _inspectorView.text=scopeText.length?[NSString stringWithFormat:@"%@\n\n%@",scopeText,captureText?:@""]:captureText;
   [self layoutInspectorText];
 }
 - (void)layoutInspectorText {
@@ -3360,7 +3424,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   seethis::platform::CancelCaptureAttempt(*self.controller,*_marks,reason.UTF8String?:"Capture cancelled");
   _previousState=self.controller->Snapshot().state;
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
-  _captureContext.reset();
+  _captureContext.reset();_capturePageIdentity.reset();
 #endif
   _inspectorActionStatus=reason;
   for(STOverlayPanel* panel in self.panels){panel.ignoresMouseEvents=YES;[panel.contentView setNeedsDisplay:YES];}
@@ -3410,7 +3474,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
       seethis::core::Now(),std::nullopt}];
   if(_marks->Pending())
     [self abortPending:@"foreground application changed"];
-  _captureContext.reset();
+  _captureContext.reset();_capturePageIdentity.reset();
   [self invalidateVisibilityPresentation];
   if([self inspectorVisible])[self refreshInspector];
 }
@@ -3429,7 +3493,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   if(![self ownsPresentationInput]){_marks->RetireLiveShot();return;}
   if(_ownSourcePagePending)return;
   auto window=seethis::platform::ObserveOwnUIPresentationSource(target->context,++_windowObservationGeneration);
-  if(window.availability!=seethis::core::WindowAvailability::kReady) {
+  if(window.availability!=seethis::core::WindowAvailability::kReady&&!window.application_available) {
     _marks->RetireLiveShot();[self invalidateVisibilityPresentation];return;
   }
   if(!target->page) {
@@ -3459,9 +3523,6 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   });
 }
 - (void)refreshForegroundWindow {
-  // Missing display inventory is absence, not coordinate loss. Re-sample on
-  // normal refresh so temporary inventory failure can recover without a new
-  // display-change notification; known valid changes are classified in core.
   _marks->SetDisplayObservation(seethis::platform::SnapshotDisplays());
   const bool owned=[self ownsPresentationInput];
   if(owned)STBeginOwnUIPresentation(*_marks);
@@ -3470,123 +3531,105 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   const auto connection=seethis::platform::RefreshChromeConnection();
   if(connection.authorization_generation!=_chromePermissionGeneration) {
     _chromePermissionGeneration=connection.authorization_generation;
-    _marks->RetireLiveShot();
-    [_noteVisibility retire];
-    const auto page_generation=_chromeLifecycle.Invalidate();
-    [_noteVisibility publishPage:{seethis::core::PageAvailability::kUnavailable,
-        page_generation,seethis::core::Now(),std::nullopt}];
+    const auto generation=_chromeLifecycle.Invalidate();
+    [_noteVisibility publishPage:{seethis::core::PageAvailability::kUnavailable,generation,seethis::core::Now(),std::nullopt}];
     [self invalidateVisibilityPresentation];
   }
-  if(owned) {
-    [self refreshOwnUIPresentationSource];return;
-  }
-  const auto previous=_marks->window_observation();
-  auto current=seethis::platform::ObserveForegroundWindow(
-      ++_windowObservationGeneration);
-  const bool changed=!STSameWindowIdentity(previous,current);
-  [_noteVisibility publishWindow:current];
-
-  if(_marks->Pending() && _captureContext &&
-     (!seethis::core::WindowObservationMatchesContext(*_captureContext,current) ||
-      (_captureContext->bundle_id!="com.google.Chrome" &&
-       seethis::core::CapturedTitleAvailable(*_captureContext) &&
-       !seethis::core::TitleContextVisible(*_captureContext,current))))
-    [self abortPending:@"foreground window changed"];
-
-  if(changed) {
-    const auto page_generation=_chromeLifecycle.Invalidate();
-    [_noteVisibility publishPage:{
-        seethis::core::PageAvailability::kUnavailable,page_generation,
-        seethis::core::Now(),std::nullopt}];
-    [self invalidateVisibilityPresentation];
-    if([self inspectorVisible])[self refreshInspector];
-  }
-
-  const bool chrome=current.availability==
-          seethis::core::WindowAvailability::kReady &&
-      current.bundle_id=="com.google.Chrome";
-  seethis::platform::PublishChromeObservation(current.pid,
-      chrome && _marks->NeedsChromePageObservation(),
-      _marks->page_observation().availability);
-  if(chrome && _marks->NeedsChromePageObservation()) {
-    [self refreshChromePage];
-  } else if(_chromeLifecycle.pending() ||
-            _marks->page_observation().availability!=
-                seethis::core::PageAvailability::kUnavailable) {
-    const auto page_generation=_chromeLifecycle.Invalidate();
-    [_noteVisibility publishPage:{
-        seethis::core::PageAvailability::kUnavailable,page_generation,
-        seethis::core::Now(),std::nullopt}];
-    [self invalidateVisibilityPresentation];
-  }
-  if(const auto target=_marks->own_ui_presentation_source()) {
-    if(seethis::core::ReferenceVisible(target->context,target->page,current,_marks->page_observation()))
-      _marks->EndOwnUIPresentationSource();
-    else if(!seethis::core::WindowObservationMatchesContext(target->context,current))_marks->RetireLiveShot();
-  }
-  if(!_marks->Pending())_captureContext.reset();
-  [_noteVisibility reconcile];
+  if(owned){[self refreshOwnUIPresentationSource];return;}
+  [self publishForegroundObservation:seethis::platform::ObserveForegroundWindow(++_windowObservationGeneration)];
 }
+- (void)publishForegroundObservation:(seethis::core::WindowObservation)current {
+  const auto previous=_marks->window_observation();
+  _windowObservationGeneration=std::max(_windowObservationGeneration,current.generation);
+  current.application_observed=current.observed;
+  const bool chrome=current.application_available&&current.bundle_id=="com.google.Chrome";
+  if(chrome) {
+    const bool same=previous.pid==current.pid&&previous.bundle_id==current.bundle_id&&
+        previous.application_start_identity_us==current.application_start_identity_us;
+    const bool sameRaw=_chromeForegroundTarget&&STSameWindowIdentity(*_chromeForegroundTarget,current);
+    if(!same||!sameRaw)(void)_chromeLifecycle.Invalidate();
+    const auto connection=seethis::platform::ChromeConnectionStatus();
+    const bool allowed=connection.target.pid==current.pid&&connection.permission.consent==seethis::platform::ChromeConsent::kGranted&&!connection.consent_pending;
+    _chromeForegroundTarget=current;
+    // Only an unchanged raw foreground tuple previously bracketed by a positive
+    // provider observation can reuse that observation's original freshness.
+    // A different raw window withdraws page/window projection before async work.
+    auto published=current;
+    if(same&&sameRaw&&allowed&&previous.browser_content&&
+       seethis::core::PageIdentityVisible(_marks->page_observation().identity,_marks->page_observation())) {
+      published=previous;published.generation=current.generation;
+      published.application_available=current.application_available;
+      published.application_observed=current.application_observed;
+      published.kernel_application_start_identity_us=current.kernel_application_start_identity_us;
+      if(published.kernel_native_window.process_start_identity_us!=current.kernel_application_start_identity_us)
+        published.kernel_native_window={2,current.kernel_application_start_identity_us,{},0};
+    }
+    [_noteVisibility publishWindow:published];
+    if(_marks->Pending()&&_captureContext&&
+       (_captureContext->pid!=current.pid||_captureContext->scope.process_start_identity_us!=seethis::core::ApplicationIdentityForContext(*_captureContext,current)))
+      [self abortPending:@"foreground application changed"];
+    seethis::platform::PublishChromeObservation(current.pid,allowed,_marks->page_observation().availability);
+    if(allowed)[self refreshChromePage];
+    else {
+      const auto generation=_chromeLifecycle.Invalidate();
+      [_noteVisibility publishPage:{seethis::core::PageAvailability::kUnavailable,generation,seethis::core::Now(),std::nullopt}];
+    }
+  } else {
+    _chromeForegroundTarget.reset();
+    const auto generation=_chromeLifecycle.Invalidate();
+    [_noteVisibility publishWindow:current page:{seethis::core::PageAvailability::kUnavailable,generation,seethis::core::Now(),std::nullopt}];
+    if(_marks->Pending()&&_captureContext&&
+       (!seethis::core::WindowObservationMatchesContext(*_captureContext,current)||
+        (_captureContext->scope.kind!=seethis::core::CaptureScopeKind::kApplication&&
+         _captureContext->bundle_id!="com.google.Chrome"&&seethis::core::CapturedTitleAvailable(*_captureContext)&&
+         !seethis::core::TitleContextVisible(*_captureContext,current))))
+      [self abortPending:@"foreground window changed"];
+  }
+  if(!_marks->Pending()){_captureContext.reset();_capturePageIdentity.reset();}
+  [self invalidateVisibilityPresentation];
+}
+
 #endif
 - (void)refreshChromePage {
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
-  if(_chromeLifecycle.pending() || !_marks->NeedsChromePageObservation())return;
-  const auto foreground=_marks->window_observation();
-  if(foreground.availability!=seethis::core::WindowAvailability::kReady ||
-     foreground.bundle_id!="com.google.Chrome")return;
+  if(_chromeLifecycle.pending()||!_chromeForegroundTarget)return;
+  const auto foreground=*_chromeForegroundTarget;
+  const auto connection=seethis::platform::ChromeConnectionStatus();
+  if(foreground.availability!=seethis::core::WindowAvailability::kReady||
+     connection.target.pid!=foreground.pid||connection.permission.consent!=seethis::platform::ChromeConsent::kGranted||connection.consent_pending)return;
   const auto request=_chromeLifecycle.BeginRequest();
-  const auto capture_generation=_generation;
-  const auto permission_generation=seethis::platform::ChromeConnectionStatus().authorization_generation;
+  const auto permission=connection.authorization_generation;
   __weak STOverlayCoordinator* weakSelf=self;
-  seethis::platform::AcquireChromePageAsync(
-      [foreground] {
-        return seethis::platform::AcquireCurrentChromePage(foreground);
-      }, request.generation,
-      [weakSelf,foreground,request,capture_generation,permission_generation](
-          seethis::core::PageObservation observation) {
-    STOverlayCoordinator* owner=weakSelf;
-    if(!owner || ![owner->_noteVisibility acceptPage:std::move(observation)
-        request:request lifecycle:owner->_chromeLifecycle foreground:foreground
-        permission:permission_generation
-        currentPermission:seethis::platform::ChromeConnectionStatus().authorization_generation])return;
-    const auto published=owner->_marks->page_observation();
-    if(const auto target=owner->_marks->own_ui_presentation_source()) {
-      if(seethis::core::ReferenceVisible(target->context,target->page,owner->_marks->window_observation(),published))
-        owner->_marks->EndOwnUIPresentationSource();
-      else owner->_marks->RetireLiveShot();
-    }
-    seethis::platform::PublishChromeObservation(foreground.pid,true,
-        published.availability,true);
-    if(published.availability==seethis::core::PageAvailability::kReady &&
-       published.identity) {
-      (void)owner->_marks->BindPageIdentity(capture_generation,
-                                            *published.identity,published.captured_page);
-      if(capture_generation==owner->_generation)[owner selectAcceptedInspectorCapture];
-    } else if(published.availability!=
-                  seethis::core::PageAvailability::kReady &&
-              owner->_marks->AwaitingPageIdentity(capture_generation)) {
-      const char* category=published.availability==
-          seethis::core::PageAvailability::kDenied?"denied":
-          published.availability==seethis::core::PageAvailability::kAmbiguous?
-              "ambiguous":
-          published.availability==seethis::core::PageAvailability::kTimedOut?
-              "timed-out":"unavailable";
-      os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_INFO,
-          "seethis chrome phase=mark-binding cause=page-not-ready category=%{public}s generation=%{public}llu capture-generation=%{public}llu pid=%{public}lld window=%{public}llu",
-          category,static_cast<unsigned long long>(request.generation),
-          static_cast<unsigned long long>(capture_generation),
-          static_cast<long long>(foreground.pid),
-          static_cast<unsigned long long>(foreground.window_id));
-      NSString* reason=published.availability==
-          seethis::core::PageAvailability::kDenied
-          ? @"Chrome Automation permission unavailable; choose Connect Chrome or enable SeeThis > Google Chrome in System Settings > Privacy & Security > Automation, then choose Retry Chrome"
-          : published.availability==seethis::core::PageAvailability::kAmbiguous
-          ? @"Chrome window identity ambiguous; retry with Chrome frontmost"
-          : published.availability==seethis::core::PageAvailability::kTimedOut
-          ? @"Chrome page identity timed out; retry with Chrome frontmost"
-          : @"Chrome page identity unavailable; retry with Chrome frontmost";
-      [owner abortPending:reason];
-    }
+  seethis::platform::AcquireChromeContentAsync([foreground] {
+    return seethis::platform::AcquireCurrentChromeContent(foreground);
+  },request.generation,[weakSelf,request,permission,foreground](seethis::platform::ChromeContentObservation result) {
+    STOverlayCoordinator* owner=weakSelf;if(!owner||!owner->_chromeLifecycle.Accepts(request))return;
+    owner->_chromeLifecycle.Complete(request);
+    const auto connection=seethis::platform::ChromeConnectionStatus();
+    if(permission!=connection.authorization_generation||!owner->_chromeForegroundTarget||
+       owner->_chromeForegroundTarget->pid!=foreground.pid||
+       owner->_chromeForegroundTarget->application_start_identity_us!=foreground.application_start_identity_us||
+       !STSameWindowIdentity(foreground,*owner->_chromeForegroundTarget))return;
+    auto window=result.page.availability==seethis::core::PageAvailability::kReady?result.window:*owner->_chromeForegroundTarget;
+    window.generation=++owner->_windowObservationGeneration;
+    window.application_available=owner->_chromeForegroundTarget->application_available;
+    window.application_start_identity_us=owner->_chromeForegroundTarget->application_start_identity_us;
+    window.kernel_application_start_identity_us=owner->_chromeForegroundTarget->kernel_application_start_identity_us;
+    if(window.kernel_native_window.process_start_identity_us!=window.kernel_application_start_identity_us)
+      window.kernel_native_window={2,window.kernel_application_start_identity_us,{},0};
+    window.application_observed=owner->_chromeForegroundTarget->observed;
+    const bool ready=result.page.availability==seethis::core::PageAvailability::kReady&&result.page.identity;
+    const auto identity=result.page;
+    [owner->_noteVisibility publishWindow:std::move(window) page:std::move(result.page)];
+    // Missing page evidence hides only page-bound marks. It neither rebinds a
+    // basic shot nor cancels it. A positively observed switch cancels a pending
+    // page capture before it can accept another page's drawing.
+    if(ready&&owner->_captureContext&&owner->_marks->Pending()&&
+       owner->_captureContext->scope.kind==seethis::core::CaptureScopeKind::kPage&&
+       !seethis::core::ReferenceVisible(*owner->_captureContext,owner->_capturePageIdentity,
+           owner->_marks->window_observation(),identity))
+      [owner abortPending:@"Chrome page changed"];
+    seethis::platform::PublishChromeObservation(foreground.pid,true,owner->_marks->page_observation().availability,true);
     [owner invalidateVisibilityPresentation];
   });
 #else
@@ -3594,12 +3637,16 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   const auto captured=*_chromeContext;
   const auto capture_generation=_generation;
   const auto provider_generation=++_chromeObservationGeneration;
+  const auto permission_generation=seethis::platform::ChromeConnectionStatus().authorization_generation;
   __weak STOverlayCoordinator* weakSelf=self;
   seethis::platform::AcquireChromePageAsync(
       [captured] { return seethis::platform::AcquireCurrentChromePage(captured); },
       provider_generation,
-      [weakSelf,capture_generation](seethis::core::PageObservation observation) {
-    STOverlayCoordinator* owner=weakSelf;if(!owner)return;
+      [weakSelf,capture_generation,provider_generation,permission_generation](seethis::core::PageObservation observation) {
+    STOverlayCoordinator* owner=weakSelf;
+    if(!owner || capture_generation!=owner->_generation ||
+        provider_generation!=owner->_chromeObservationGeneration ||
+        permission_generation!=seethis::platform::ChromeConnectionStatus().authorization_generation)return;
     owner->_marks->SetPageObservation(observation);
     if(observation.availability==seethis::core::PageAvailability::kReady&&
        observation.identity)
@@ -3623,7 +3670,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
       seethis::core::Now(),std::nullopt}];
   [self invalidateVisibilityPresentation];
 #else
-  _chromeObservationGeneration=0;
+  ++_chromeObservationGeneration;
 #endif
 }
 - (BOOL)beginCapturePrefix {
@@ -3676,17 +3723,16 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
               seethis::core::WindowObservation unavailable;
               const auto currentDisplays=seethis::platform::SnapshotDisplays();
               _marks->SetDisplayObservation(currentDisplays);
-              if(!seethis::core::DisplayTopologyMatches(source.displays,currentDisplays)||
-                 !STSourceFocusPermissionCurrent(source,_chromePermissionGeneration,
-                     seethis::platform::ChromeConnectionStatus().authorization_generation))return unavailable;
               const auto target=_marks->own_ui_presentation_source();
               if(target&&[self ownsPresentationInput]) {
-                if(source.pid!=target->context.pid||source.window_id!=target->context.window_id||
-                   source.bundle_id!=target->context.bundle_id)return unavailable;
-                auto fresh=seethis::platform::ObserveOwnUIPresentationSource(source,++_windowObservationGeneration);
+                const auto* request=STSourceFocusObservationContext(source,target,true);if(!request)return unavailable;
+                auto fresh=seethis::platform::ObserveOwnUIPresentationSource(*request,++_windowObservationGeneration);
                 return [self ownsPresentationInput]&&seethis::core::WindowObservationMatchesContext(target->context,fresh)?fresh:unavailable;
               }
               return seethis::platform::ObserveForegroundWindow(++_windowObservationGeneration);
+            },[&](const seethis::core::Context& source) {
+              return STSourceFocusPermissionCurrent(source,_chromePermissionGeneration,
+                  seethis::platform::ChromeConnectionStatus().authorization_generation);
             });
       }
       break;
@@ -3703,6 +3749,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
 - (void)refresh {
   [self validateAppendMode];
   using namespace seethis::core;
+  const auto previousState=_previousState;
   STRefreshCaptureTransition(*self.controller,_previousState,_generation,
       [&](const auto& snapshot,std::uint64_t& ownedGeneration) {
 #if !defined(SEETHIS_WINDOW_OBSERVATION_API)
@@ -3749,6 +3796,13 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     std::string error;auto context=seethis::platform::SnapshotContext(snapshot.session_origin,excluded,error);
     if(!context){[self abortPending:[NSString stringWithUTF8String:error.c_str()]];return;}
     else {
+#if defined(SEETHIS_WINDOW_OBSERVATION_API)
+      const auto connection=seethis::platform::ChromeConnectionStatus();
+      context=seethis::platform::FreezeCaptureScope(*context,snapshot.session_origin,
+          _marks->window_observation(),_marks->page_observation(),
+          connection.permission.consent==seethis::platform::ChromeConsent::kGranted&&!connection.consent_pending);
+      if(!context){[self abortPending:@"Capture context unavailable."];return;}
+#endif
       _originalPID=context->pid;
       [self activateInspectorChromeContext:context->bundle_id=="com.google.Chrome"];
       if(_marks->BindContext(_generation,*context)) {
@@ -3757,6 +3811,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
         STObserveAndScheduleCapture(*self.controller,*_marks,_generation,generation,[&] {
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
         _captureContext=*context;
+        _capturePageIdentity=context->scope.kind==seethis::core::CaptureScopeKind::kPage?_marks->page_observation().identity:std::nullopt;
         [self refreshForegroundWindow];
         if(context->bundle_id=="com.google.Chrome")[self refreshChromePage];
 #else
@@ -3812,14 +3867,14 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
     _inspectorCaptureSelectionPending=false;
     _marks->Abort(CancelReasonDescription(reason));_appendCapture=false;
 #if defined(SEETHIS_WINDOW_OBSERVATION_API)
-    _captureContext.reset();
+    _captureContext.reset();_capturePageIdentity.reset();
 #endif
     os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_INFO,
         "seethis capture stage=reference-cancel result=%{public}s",
         CancelReasonName(reason));
   });
   for(STOverlayPanel* panel in self.panels)[panel.contentView setNeedsDisplay:YES];
-  if([self inspectorVisible])[self refreshInspector];
+  if(previousState!=_previousState&&[self inspectorVisible])[self refreshInspector];
 }
 - (void)refreshGlobalVisibilityPresentation {
   const auto visibility=_settings->Visibility();
@@ -3845,7 +3900,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   if(!visibility.permits_presentation()) {
     [self invalidateNoteBadges];return;
   }
-  std::string fingerprint;
+  std::string fingerprint=std::to_string(_references->ReadPresentation()->revision)+":";
   std::vector<std::string> references;
   std::set<std::string> seen;
   const auto add=[&](const std::string& id,int state) {
@@ -3964,9 +4019,10 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   [self validateAppendMode];
   using namespace seethis::core;
   _lastPointer=pointer;
-  const auto before=_marks->phase();_marks->Expire(Now());
-  if(!_marks->AllowsDrawing()&&self.controller->Snapshot().captures_pointer()&&
-     _marks->phase()==ReferencePhase::kAborted)[self abortPending:@"Capture attempt ended. Release and press the shortcut again."];
+  const auto before=_marks->phase();
+  STReconcileCaptureDeadline(*self.controller,*_marks,Now(),[&] {
+    [self abortPending:@"Capture attempt ended. Release and press the shortcut again."];
+  });
   if(_marks->Pending() && _originalPID!=NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier)[self abortPending:@"foreground application changed"];
   const bool drawing=self.controller->Snapshot().captures_pointer() && _marks->AllowsDrawing();
   const bool pending=_marks->Pending();
@@ -3978,9 +4034,8 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
       std::optional<STNoteBadge>{};
   const std::string pointer_id=badge?badge->reference_id:
       hit?*hit:"";
-  const auto hit_metadata=!pointer_id.empty()?
-      _references->LookupMetadata(pointer_id):
-      std::optional<seethis::core::ReferenceJobSnapshot>{};
+  const auto hit_entry=!pointer_id.empty()?_references->ReadPresentation(pointer_id):nullptr;
+  const auto* hit_metadata=hit_entry?&hit_entry->job:nullptr;
   const std::string next_hover=pointer_id;
   const bool hover_changed=next_hover!=_hoveredID;
   const std::string previous_hover=_hoveredID;
@@ -4069,7 +4124,7 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   if(visibility.permits_presentation()) {
   for(const auto& stored:_marks->marks()) {
     const auto& r=stored.value;if(!seethis::core::DisplayTopologyMatches(r.context.displays,_displays))continue;
-    const auto visible=STVisibleReferenceRegions(r,_references->MarkSnapshots(r.id),visibility);
+    const auto visible=STVisiblePublishedRegions(*_references,r,visibility);
     bool paintedHere=false;
     for(const auto& region:visible)seethis::core::ForEachSubpath(region,[&](const auto& path) {
       if(std::any_of(path.begin(),path.end(),[&](const auto& point){return point.display_id==display;}))paintedHere=true;
@@ -4148,7 +4203,9 @@ const char* JobStateName(seethis::core::ReferenceJobState state) {
   const auto settings=_settings->Get();
   const auto hit=STVisibleStrokeHit(*_references,*_marks,_settings->Visibility(),
       _displays,point,settings.mark_hit_radius_points,[self ownPresentationPanelBounds]);
-  if(!hit||hit->rootID!=_hoveredID)return NO;
+  // A delivered click owns fresh coordinates. Hover is replaceable presentation
+  // and may lag; it cannot veto or retarget this exact current-source hit.
+  if(!hit)return NO;
   const auto chord=[self physicalDeleteChord];
   const bool claimed=_deletion->ConsumeDeleteClick(
       chord.key_down,chord.exact_modifiers);

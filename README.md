@@ -2,62 +2,44 @@
 
 **Mark what you mean on your Mac, then share it with your assistant.**
 
-Website: **[seethis.dev](https://seethis.dev)**
+[Website](https://seethis.dev) · [Download v0.1.5](https://github.com/amingclawdev/seethis/releases/tag/v0.1.5) · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
 
-SeeThis is a macOS menu bar tool. Hold **Option+A** and draw around one or more areas of your screen. It copies a local reference immediately, and prepares a marked image you can paste into an AI conversation or any app that accepts images.
+SeeThis is a macOS menu bar tool. Hold **Option+A**, draw around one or more areas, then release the shortcut. It copies a local reference immediately and prepares a marked image you can paste into a conversation.
 
-## Demo
+The GitHub distribution uses Developer ID signing and Apple notarization. Publication requires the final signature, notarization and checksum checks in the release's `RELEASE-MANIFEST.json`; those checks are pending during preparation of this source update. Choose `SeeThis-0.1.5-macos-arm64-release.dmg` or the matching ZIP and verify it against `SHA256SUMS`. The Mac App Store distribution is separate.
 
-https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba
+## Mark, keep context, share
 
-A 76-second walkthrough of marking screen areas and sharing a visual reference.
+- Draw several separate regions during one shortcut hold. With **Append screenshots** off, release creates a new reference; with it on, later holds add shots with continuous mark numbers.
+- Each shot freezes its context when capture starts. Inspector shows **Follows this page**, **Follows this window** or **Follows this app**. App-scoped marks can appear across windows of the same running app on the captured display. Later observations do not silently change a shot's scope.
+- Chrome Automation is **optional**. Reliable page context uses page scope; without it, basic window or app capture remains available. Input Monitoring and Screen Recording are required. **Connect Chrome** is an explicit permission action; release all capture keys after it and begin a fresh gesture.
+- Notes stay with their numbered marks. The note window's close button saves and copies the owning reference link. Inspector lets you select references and shots, copy their images, and delete an entire reference.
+- Return to the matching context to restore eligible marks. A temporary observation failure hides marks without deleting their saved data. **Hide Marks** affects marks globally.
 
-**[Download GitHub beta v0.1.1-beta.1](https://github.com/amingclawdev/seethis/releases/tag/v0.1.1-beta.1)** · Apple Silicon · macOS 14.2+ · [MIT](LICENSE)
+The defaults are **Option+A** for capture and **Option+D** plus a click on a mark boundary to delete its whole reference. Settings and Inspector show any customized shortcuts. See [usage](docs/USAGE.md).
 
-The GitHub release app is Developer ID signed and Apple notarized. Choose the DMG or ZIP from the release page and verify it with the accompanying SHA256SUMS.
+## Start safely
 
-SeeThis 0.1.1 is now available on the [Mac App Store](https://apps.apple.com/us/app/seethis-visual-context/id6818581322). See [seethis.dev](https://seethis.dev) to choose between the Store release and the GitHub beta.
+1. Install the verified app in Applications and open it. SeeThis lives in the menu bar and has no main window.
+2. Allow **Input Monitoring** and **Screen Recording** for that exact copy. Use the menu's permission settings and retry actions, and reopen manually if macOS requires it.
+3. On safe test content, hold Option+A and draw. Release to submit. Open **Show Inspector…**, wait for the image, then choose **Copy marked image**.
+4. Inspect the whole image before pasting it. A `127.0.0.1` reference URL works only on the same Mac while SeeThis is running; web chats and remote tools need an attached image.
 
-## How it works
+**The screenshot includes the entire selected display. Marks are not a privacy crop.** Hide private windows and notifications first. Capture metadata may include app/window information and, when authorized, the Chrome page URL. SeeThis keeps references locally and does not upload screenshots itself. [Privacy](PRIVACY.md) · [Security](SECURITY.md)
 
-- **Mark several areas at once.** Keep the capture shortcut held while drawing separate regions; release it to create one reference.
-- **Choose a reference in Inspector.** Its dropdown shows a name and time. New captures select the newest reference; deleting one selects the newest remaining item.
-- **Share a local reference or an image.** Copy JSON URL for a tool on the same Mac. Choose Copy marked image to copy the annotated image explicitly.
-- **Return to the right context.** Live marks belong to their original app/window and, in standalone Google Chrome, their tab/page.
-- **Delete with Option+D.** Hold the delete shortcut and click mark boundaries, or delete the selected reference in Inspector.
+## 0.1.5 validation
 
-Option+A and Option+D are the defaults. If you change them in Open Settings…, use the shortcuts shown in Inspector.
-
-## Quick start
-
-These installation steps apply to the GitHub release.
-
-1. Download the DMG or ZIP and SHA256SUMS from the release page, and compare the downloaded file's SHA-256 with the published checksum. Put SeeThis.app in Applications and open it.
-2. Allow **Input Monitoring** and **Screen Recording** for that copy of SeeThis in System Settings → Privacy & Security. Use the menu's permission-settings shortcuts and Retry Input Monitoring as needed; quit and reopen the exact app if macOS requires it.
-3. On a screen with safe test content, hold **Option+A**, drag around an area with the left mouse button, then release the shortcut. A local JSON URL is copied immediately; the image finishes in the background.
-4. Open **Show Inspector…** from the menu. Once the image is ready, choose **Copy marked image**, inspect it, and paste or attach it to your conversation.
-
-For Chrome page context, activate standalone Google Chrome. When Automation is missing, pressing the configured capture shortcut (default **Option+A**) requests permission to control Chrome without blocking SeeThis’s main UI. Allow access in the system dialog, then release the original capture key and make a fresh gesture; granting permission does not resume the interrupted capture. **Connect Chrome**, **Retry Chrome** and **Automation Settings…** remain available for recovery. Background observation and opening Inspector do not request Automation.
-
-The app lives in the menu bar; there is no main window. Inspector is a movable panel with a fixed 470 × 430-point size. Feedback… opens an email draft; you decide whether to send it.
-
-## Sharing and privacy
-
-A `127.0.0.1` reference URL works only for tools on the **same Mac**, while SeeThis is running and the reference is valid. Web chats, remote assistants and other computers need an explicitly pasted or attached image. SeeThis does not upload your screen to a cloud service.
-
-**A capture includes the entire selected display. Marks are not a privacy crop.** Hide private windows and notifications before capturing, and inspect the whole image before sharing it. Deleting a reference cannot retract images already shared, clipboard copies or backups. Do not post capability URLs or settings access addresses in public issues. [Privacy details](PRIVACY.md) · [Security reports](SECURITY.md)
+The user accepted the remaining manual checks on the frozen candidate, including reporting one transient flicker followed by stable behavior. Independent source review and automated tests cover capture, context recovery, per-shot scope, Append, notes, deletion, permission handling and storage compatibility. This does not establish every macOS, display, first-download or permission configuration, or that flicker can never recur. The GitHub package's distribution checks are separate; see [release notes](docs/RELEASE.md).
 
 ## Guides and development
 
-See the guides for detailed instructions:
-
 - [Installation and permissions](docs/INSTALL.md)
-- [Capture, Inspector, copying and deletion](docs/USAGE.md)
-- [Google Chrome and Automation](docs/CHROME.md)
-- [Recovery, manual updates, uninstalling and feedback](docs/TROUBLESHOOTING.md)
-- [Building and contributing](CONTRIBUTING.md)
-- [Building the sandboxed Mac App Store variant](docs/APP_STORE_BUILD.md)
+- [Capture, Inspector, notes and deletion](docs/USAGE.md)
+- [Chrome and optional Automation](docs/CHROME.md)
+- [Recovery, updates and uninstalling](docs/TROUBLESHOOTING.md)
+- [Build and contribute](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md) · [Release provenance](docs/RELEASE.md) · [Source mapping](SOURCE-MAPPING.json) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
-[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Release notes and checksums](docs/RELEASE.md) · [Dependency and media notices](THIRD_PARTY_NOTICES.md)
+The GitHub app has no automatic updater. Intel builds are not provided. The demo below shows an earlier workflow.
 
-This GitHub beta is for Apple Silicon on macOS 14.2 or later. Intel builds are not available, and the GitHub app has no automatic updater. See the release notes for known verification limits.
+https://github.com/user-attachments/assets/7a865105-26e0-4f27-844e-9c71b79335ba

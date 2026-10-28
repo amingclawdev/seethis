@@ -104,9 +104,14 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
       [this]{overlay_->CancelCapturePrefix();},
       [this]{overlay_->ObserveViewportInput(seethis::platform::ViewportInput::kInterrupted);},
       [this]{SchedulePrefixDeadline();}});
+    seethis::platform::SetChromeConsentInterruptionHandler(this,[this] {
+      Cancel(seethis::core::CancelReason::kShortcutInterrupted);
+      ResetCaptureReleaseTracking();foreground_process_=0;active_key_code_.reset();
+      overlay_->UpdatePointerPolicy({});
+    });
   }
 
-  ~MacInputAdapter() override { Stop(); }
+  ~MacInputAdapter() override { seethis::platform::ClearChromeConsentInterruptionHandler(this);Stop(); }
 
 #if defined(SEETHIS_CHROME_CONSENT_TESTING)
   struct TestPhysicalInput {
@@ -454,20 +459,9 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
           if(self->capture_hold_.Begin(self->active_capture_key_))
             self->capture_hold_evidence_=CaptureHoldEvidence{++self->next_capture_hold_id_,
                 self->active_capture_key_,carbon_provenance};
-          if (const auto target =
-                  seethis::platform::GetChromeCaptureConsentTarget()) {
-            // Authorization is a separate intent: no mark/context/pixels may be
-            // started, resumed, or completed by this interrupted physical hold.
-            self->Cancel(seethis::core::CancelReason::kShortcutInterrupted);
-            self->ResetCaptureReleaseTracking();
-            self->foreground_process_ = 0;
-            self->active_key_code_.reset();
-            self->overlay_->UpdatePointerPolicy({});
-            seethis::platform::ConnectChromeForCaptureExplicit(*target);
-            self->LogCaptureStage("capture-consent", "fresh-gesture-required",
-                                  observed_ms);
-            return noErr;
-          }
+          // Capture is a basic screen operation. Optional Chrome Automation is
+          // requested only by an explicit Connect action, never by this hold.
+
         }
         if(exact_chord&&self->CapturePressEligible(carbon_provenance)&&pointer) {
           self->prefix_ingress_.Confirm(self->PrefixReadinessSnapshot(),observed_ms);
@@ -1443,25 +1437,16 @@ class MacInputAdapter final : public seethis::platform::InputAdapter {
   const auto now=MonotonicMilliseconds();
   if(_chromeLastCheckMs==0 || now-_chromeLastCheckMs>=5000) {
     _chromeLastCheckMs=now;
-    NSRunningApplication* chrome=[NSRunningApplication
-        runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].firstObject;
-    if(!chrome) {
+    const auto connection=seethis::platform::RefreshChromeConnection();
+    if(connection.target.pid<=0) {
       _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kNotRunning;
       _chromeStatus=@"Google Chrome is not running. Optional.";
-    } else if(seethis::platform::ChromeAutomationPreflight(
-                  chrome.processIdentifier)) {
+    } else if(connection.target.valid() && connection.permission.consent==
+        seethis::platform::ChromeConsent::kGranted) {
       _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kAutomationAllowedPageUnchecked;
       _chromeStatus=@"Automation is allowed for running Google Chrome. The current page and provider identity have not been verified. Optional.";
       // This is a display of an existing observation, never a page check.
-      const auto connection=seethis::platform::ChromeConnectionStatus();
-      const auto start=chrome.launchDate
-          ? seethis::platform::ChromeProcessStartIdentity(
-              chrome.launchDate.timeIntervalSince1970)
-          : std::optional<std::int64_t>{};
-      if(start && connection.target==seethis::platform::ChromeRunningTarget{
-            chrome.processIdentifier,*start} &&
-          connection.permission.consent==seethis::platform::ChromeConsent::kGranted &&
-          connection.observation_active &&
+      if(connection.observation_active &&
           connection.provider==seethis::platform::ChromeProviderState::kReady &&
           connection.page==seethis::core::PageAvailability::kReady) {
         _chromeCompactStatus=seethis::platform::ChromeCompactStatus::kReady;

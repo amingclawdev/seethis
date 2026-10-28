@@ -1,0 +1,370 @@
+{
+  "schema": "seethis-public-source-mapping.v1",
+  "release": "v0.1.5",
+  "frozen_source_commit": "d2d9054bed1df4066f05454aaf12fd7304a86d58",
+  "frozen_source_tree": "ba283e5b18be1c0a715270b6c8e26b72d956ca6e",
+  "public_parent_commit": "2d3d1e0dd53cbef00469846f48d997d06b0521ae",
+  "mapping_rule": "All runtime, build, asset, script, test and license files listed here have identical bytes and executable modes to the frozen source. Public documentation is maintained separately. No private Git history is imported.",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "mode": "100644",
+      "sha256": "3935ae4b928cdf8ccbb41ca8d32dac7b05cd94ee4c18dc09a0569f3e7c3f0201",
+      "git_blob": "cc6c4a039db5a7eba28a99dbdf9f45802d50d396"
+    },
+    {
+      "path": "CMakePresets.json",
+      "mode": "100644",
+      "sha256": "9804db37f099e7796ec8b9b7d6f1048ccf5867f2efd742f76c1b2a9f968e72c6",
+      "git_blob": "d288fabd71eb03f854836f235c98a7c272e39900"
+    },
+    {
+      "path": "LICENSE",
+      "mode": "100644",
+      "sha256": "ca686b99f826de2bf289439b75245a16b7f6a6837ee7eca6ef856de1a10571f6",
+      "git_blob": "5d33f96d3729f1de10258e3b91a84fa5e253b8b0"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "mode": "100644",
+      "sha256": "065ece9eae86e0640b491acd08e59b5d0381f9708bfc58faf31560661f4d58d3",
+      "git_blob": "78e03338e21e78aa94d841c47c89f29316cff15f"
+    },
+    {
+      "path": "assets/app-icon/SeeThis.icns",
+      "mode": "100644",
+      "sha256": "6c10f576d1935b63e2778dfe05476c2e31a00d96016546e74b3ea2b0083d397e",
+      "git_blob": "f09bbbd08601d6653b1890a2ebf45a32e0efbe6e"
+    },
+    {
+      "path": "assets/app-icon/SeeThis.png",
+      "mode": "100644",
+      "sha256": "abc6ffe2152f0169f2cd8293ba852deb9288672c8a98cc1b967523dabcd8df15",
+      "git_blob": "b44387316f84a6e192b7abc478dd991f1c3e4617"
+    },
+    {
+      "path": "assets/app-icon/SeeThis.svg",
+      "mode": "100644",
+      "sha256": "b9bfc6a47088df8a9472efd9d6aaf1dc97f6b6076ab46a461ea669c5520b46c2",
+      "git_blob": "52dcb6ed137f257aae05874fb55011c14c0fc3dc"
+    },
+    {
+      "path": "cmake/CompileSettingsAssets.cmake",
+      "mode": "100644",
+      "sha256": "6b56e004d030d8efc661f329ad37ac456615b9bed41cb9a8cef6f64bdb013008",
+      "git_blob": "1d19620ffdc862b30ae3a308249d09b4105c0ee9"
+    },
+    {
+      "path": "cmake/compile_settings_assets.py",
+      "mode": "100644",
+      "sha256": "4e9045a0b8050962c02d08ca0960cd021fef4531742d0f2af7cc84654a6de43d",
+      "git_blob": "f25a3b073cbe2c83ec6a788f22ae338d123315b2"
+    },
+    {
+      "path": "cmake/test_compile_settings_assets.py",
+      "mode": "100644",
+      "sha256": "48be2e4c134621bb9d058d6c0bd6fe272b096dd9453aaef8cfccd79c0265ffa4",
+      "git_blob": "f547695904460cc3621e96526db7f4f1ca58fdff"
+    },
+    {
+      "path": "scripts/generate_app_icon.swift",
+      "mode": "100644",
+      "sha256": "65e1fe611b8bded0c12639b056c3dc14955890360b2ad874584280240c045f6c",
+      "git_blob": "a30947a45262f985ab407bf1639e5c1d11c9c2fe"
+    },
+    {
+      "path": "scripts/package_app_store.py",
+      "mode": "100644",
+      "sha256": "93ad6d559a6dae3227874cad81be7b3770a17f3fc6893676a1adefbc37cdc091",
+      "git_blob": "578b3287c92d51fefc63c865bd61c20b29de2a48"
+    },
+    {
+      "path": "scripts/package_macos.sh",
+      "mode": "100755",
+      "sha256": "0df8c5e152574bb07a77d277478323edcd7ccbcc2782fbd0937f72aa1fd1d284",
+      "git_blob": "0721337db903123565f9dbd196232c4f085ad57b"
+    },
+    {
+      "path": "src/core/geometry.h",
+      "mode": "100644",
+      "sha256": "2247ce7d17e8230e99f537e26fa15665fae7d35fd8abecc8d7408fb710e1aa95",
+      "git_blob": "6528bb378bcf23a7cf92dc376303445e9cbd6755"
+    },
+    {
+      "path": "src/core/interaction.cc",
+      "mode": "100644",
+      "sha256": "6b699ea3e3988d54400e27e3b0375c268bcdcc24f9ca81d7e2de2d5adcdd5c02",
+      "git_blob": "ddebae2f072bd6edcb3c28efb5f4e36c8969dea8"
+    },
+    {
+      "path": "src/core/interaction.h",
+      "mode": "100644",
+      "sha256": "fea54bcc8ebfc1f38b32ad13a43cae86daa70d1cb141017b3df92eaff68d572b",
+      "git_blob": "6e062db2971a8bcf9f8f6b4d791472067cbe6637"
+    },
+    {
+      "path": "src/core/mark_controller.cc",
+      "mode": "100644",
+      "sha256": "1bf79da1ef41f3a442e4acfbfe91ff500caaf8dcfac71b1e873363a13542db16",
+      "git_blob": "f3b87f24d9f22213d13df1cf03df8f50bfbbc020"
+    },
+    {
+      "path": "src/core/reference.h",
+      "mode": "100644",
+      "sha256": "9edea6b37efba1de4efe4a005964b9644b7ebfc6b1241713298db43696337078",
+      "git_blob": "bf5a19ef327f73479f51244cf93d64cddfab178e"
+    },
+    {
+      "path": "src/core/reference_store.cc",
+      "mode": "100644",
+      "sha256": "9fdab02a177a55f9c6cd81f7b67d2cdb74192ac8c4f7061a41dcf365936e8e32",
+      "git_blob": "c8ff479995bd253bf88373c681f813602a12c39b"
+    },
+    {
+      "path": "src/core/settings.cc",
+      "mode": "100644",
+      "sha256": "4db14db3bdaa179fec70a0f18be500e14b0a5398fe69688c097f80bebc809ddb",
+      "git_blob": "7460e7bc0e24305665847975f3b13b3e2eb0f574"
+    },
+    {
+      "path": "src/core/settings.h",
+      "mode": "100644",
+      "sha256": "595d1c758054306d00e204d217b6d34d3f1d4851fd1072a5ec6b9953132e1ce6",
+      "git_blob": "db019bce0f267200c67f650acbadb12b2ebd40bf"
+    },
+    {
+      "path": "src/main_mac.mm",
+      "mode": "100644",
+      "sha256": "e7092f7d532f57aa06ddac2a8972ac434af018282dcc9f363c41261c951394f7",
+      "git_blob": "c7dfb60a4ac95ce2363b7daf47fc6c4da0ac921c"
+    },
+    {
+      "path": "src/platform/build_config.h.in",
+      "mode": "100644",
+      "sha256": "990462f7b0ee52db6700e84c0d352bf065b19833288de5c9bc2ade2c67a1ac5d",
+      "git_blob": "2f7de4f00e69a943efe289b68a16c4d764e26a84"
+    },
+    {
+      "path": "src/platform/mac/Info-app-store.plist.in",
+      "mode": "100644",
+      "sha256": "529e90200f633c4144dfa8da02ade42bc4fee7263187b7954a2ddcb04896bb1b",
+      "git_blob": "eb815957d779f5a036116e5c0395836af1533848"
+    },
+    {
+      "path": "src/platform/mac/Info.plist.in",
+      "mode": "100644",
+      "sha256": "7178844ad15f73542b1e06a99756fb78c7d464c50c121a2b0886ac2f58e5fb5f",
+      "git_blob": "e685f2ef09adcce7bd9d8c7848b8ec04469b6f8d"
+    },
+    {
+      "path": "src/platform/mac/PrivacyInfo.xcprivacy",
+      "mode": "100644",
+      "sha256": "b3012594fa96b3846a630639f9ec8e614404c430f77508e2363327cb45718051",
+      "git_blob": "fe840a043e13029b341c4512e2b1ca7c08bc8e06"
+    },
+    {
+      "path": "src/platform/mac/capture_mac.mm",
+      "mode": "100644",
+      "sha256": "8db4e0af8955eb3bf405c3ce6b66ad3b3db643308f453fad9a2319210ae7741a",
+      "git_blob": "ee8270e48834aab3429b75829b5a3a4096f56c58"
+    },
+    {
+      "path": "src/platform/mac/clipboard_mac.mm",
+      "mode": "100644",
+      "sha256": "31096c64e329b41f3ca9d944d09fda8737093239c790092a5d4e79f8f12c2510",
+      "git_blob": "966c9d1b6eafaf8421639f317d2220612b3c1394"
+    },
+    {
+      "path": "src/platform/mac/context_mac.mm",
+      "mode": "100644",
+      "sha256": "49f113de822b2234cecc95ee42a3aec1ae2bb7432d0477768235cd4788657cbf",
+      "git_blob": "0dfa036fc1aedba599907637b42edb72d2c3f278"
+    },
+    {
+      "path": "src/platform/mac/input_mac.mm",
+      "mode": "100644",
+      "sha256": "159d9bca500425a3f8bd578b362611c7a46f771e4c0ce99d50d6015cf2413942",
+      "git_blob": "d2790d5b606386ea9814ab3a03ddf5aa6c5e7889"
+    },
+    {
+      "path": "src/platform/mac/overlay_mac.mm",
+      "mode": "100644",
+      "sha256": "6ed2f67f0ff132e4b9e35676df6706fd59655ec8c7400fb75b9397f4a2a3d10d",
+      "git_blob": "15cd04ebf4569ae57d5989299388803919591ca5"
+    },
+    {
+      "path": "src/platform/mac/privacy_action_mac.h",
+      "mode": "100644",
+      "sha256": "7c5a2149b08ebbfc9c1771e642027c5d045ece87448c91b03abfe0afe2d629bc",
+      "git_blob": "f0bd98952bffc6118eef2bcd9095d004405f3838"
+    },
+    {
+      "path": "src/platform/mac/seethis-app-store.entitlements",
+      "mode": "100644",
+      "sha256": "a695e99cc94a60a10fea46cd986f02f9aa4a36dccb57d6f5e98c9575e803faf6",
+      "git_blob": "b7597f60395d62e4d92f63aa6b56653154264e7a"
+    },
+    {
+      "path": "src/platform/mac/seethis.entitlements",
+      "mode": "100644",
+      "sha256": "23cfd2daf204c9fd2ed50df0e2ae58723d4a2a8b022953dc7697e55c1c25646b",
+      "git_blob": "e8c25f75cd8632abe17ffcde017240c6df0513cc"
+    },
+    {
+      "path": "src/platform/platform.h",
+      "mode": "100644",
+      "sha256": "35a87a808965aa2f817c5629200892126f88a49bcc889cf874f37dba23fd655e",
+      "git_blob": "db3efec1213d02455494674edbb0bdf418680c25"
+    },
+    {
+      "path": "src/service/reference_server.cc",
+      "mode": "100644",
+      "sha256": "e04cbb2c4bd9ba7268696529f7e3c769bc717a6891d5770200d07fa330ecb201",
+      "git_blob": "b400d9ba7b96dd4ee8e3b2a720977e9a635aa0d2"
+    },
+    {
+      "path": "src/service/reference_server.h",
+      "mode": "100644",
+      "sha256": "c865ac7d6dc61f1e35dd63d97dd2981b1ef082163e50ea2c5913a5d9e835f93c",
+      "git_blob": "96757ef9c0787d31810d705dfc7dfe3ca28d865d"
+    },
+    {
+      "path": "tests/app_store_package_test.py",
+      "mode": "100644",
+      "sha256": "034257dfaad9c6be990642df195bd1f27924f7349af1b19687277dd067bdda08",
+      "git_blob": "0e2dcc78446cdefc538ba145c42d99142dd50aeb"
+    },
+    {
+      "path": "tests/capture_exclusion_test.mm",
+      "mode": "100644",
+      "sha256": "9efbf28b2a1372270ff50ff3a801abe29f39bdb05e34ec8b56eeb5d0472b6868",
+      "git_blob": "8fd78b247feca924c851b365fdbc0d392ba61f8a"
+    },
+    {
+      "path": "tests/chrome_consent_async_test.mm",
+      "mode": "100644",
+      "sha256": "33a79cfefd978ca6f4255b538b8fc16f4a441a2bea657c9649596830b2bdd6df",
+      "git_blob": "b65bf04184ed8e23158905eba702bde23c18b199"
+    },
+    {
+      "path": "tests/compact_ready_acceptance.md",
+      "mode": "100644",
+      "sha256": "5719733be44228f5414dc5adcaaaa20a3787be1a193e90aa251c7369905d68cf",
+      "git_blob": "822ed16036570473866f8acd2ba80caa66fd772b"
+    },
+    {
+      "path": "tests/input_permission_test.mm",
+      "mode": "100644",
+      "sha256": "ad855563cb2a442b84b651adc3ae18c924b76860a417610bef88f4f35bc1968f",
+      "git_blob": "1f05ddc5a51a69bd718ac45bd2a2595d988858ea"
+    },
+    {
+      "path": "tests/inspector_delete_all_acceptance.md",
+      "mode": "100644",
+      "sha256": "73e28821deecd28f1ece97c417f8ae800856c10d4efe9bafceffe5b585054345",
+      "git_blob": "9f74c4febb2542493111879ea680459035c44c4b"
+    },
+    {
+      "path": "tests/inspector_feedback_test.mm",
+      "mode": "100644",
+      "sha256": "468090aaf8cb21b60cc9b1062bf0a3365c24b1f0b4a3bb2b7ab8a1a4bf2bad1a",
+      "git_blob": "07f6885a7ae16584b8c543c042e6727fc5ff0fa8"
+    },
+    {
+      "path": "tests/inspector_mark_notes_test.mm",
+      "mode": "100644",
+      "sha256": "99c5feee9fef9dcb2f7607acc32f3d8c86d38873703c2ca70109e48a11731889",
+      "git_blob": "f62afd817d16f12d4e39557fc50d6c27c60cba8f"
+    },
+    {
+      "path": "tests/inspector_mark_visibility_test.mm",
+      "mode": "100644",
+      "sha256": "0cf4255296d591685250d6745d5e75579067954f0e6eed5ca91dba057349cb70",
+      "git_blob": "5e4bf651d4b1e9f084650e8f4c101318fda3ffe9"
+    },
+    {
+      "path": "tests/inspector_reference_actions_test.mm",
+      "mode": "100644",
+      "sha256": "e641c068ca6791b78428de57358a63910f3004fe5b5d9973704b95e2da3501ec",
+      "git_blob": "15223b704b0ec07da4450bd99ca6ab79881e0d55"
+    },
+    {
+      "path": "tests/interaction_test.cc",
+      "mode": "100644",
+      "sha256": "52dd9a33af5d53ff496fd201925a5694c5230682323df5ee2c3d80c4c03b24dd",
+      "git_blob": "a367b0daf765624b1d5ec683554037f35ad9c15e"
+    },
+    {
+      "path": "tests/macos_end_to_end_acceptance.md",
+      "mode": "100644",
+      "sha256": "14b6f2d609b486a2e78173cd066766c1b163b81d3e1c40a3977b30aa355a9dcd",
+      "git_blob": "3a7feb2fc08a7969c45e45904ea9f92901965f67"
+    },
+    {
+      "path": "tests/macos_inspector_feedback_acceptance.md",
+      "mode": "100644",
+      "sha256": "f602cba11e125e8b7c5d48cc891eaddb0704115a8415c1d8e6770bd74d121d98",
+      "git_blob": "8e8bb3a664dacc989655f44ac8de358623bbbeae"
+    },
+    {
+      "path": "tests/macos_overlay_acceptance.md",
+      "mode": "100644",
+      "sha256": "127c476093cea398dcf92fd504b76a59b2dfdfb350eb595bfafa828b293afe44",
+      "git_blob": "42fa5ee22e95942e7214da2c4d4ae9acf3c5d9cc"
+    },
+    {
+      "path": "tests/mark_visibility_acceptance.md",
+      "mode": "100644",
+      "sha256": "a1fbeb84d636722fdb6e9b8cade89a5c93de9ac5ce600a2dc9fd8bfc9be548a4",
+      "git_blob": "323a4af4883f60c8c22696b24b4b6b2a2273684a"
+    },
+    {
+      "path": "tests/numbered_notes_acceptance.md",
+      "mode": "100644",
+      "sha256": "66e54ee764f2e17056f7b5349c8ec94a7ec38ee87e1ea216f69a156151c237a1",
+      "git_blob": "ae83b816dc83652651d1a4c4fafa56d348c3df35"
+    },
+    {
+      "path": "tests/package_macos_test.sh",
+      "mode": "100755",
+      "sha256": "0c7191ac952ff45924cb94082b8510d3396fe6e79e085cc5fe093302e38fd0e3",
+      "git_blob": "57b71346f157c0d84bf2103cffa26b1b4daf3101"
+    },
+    {
+      "path": "tests/privacy_action_test.mm",
+      "mode": "100644",
+      "sha256": "133a934727b204eb6285cb875eb48e7321f7b2ee97508bc32871f9f34e31666c",
+      "git_blob": "8626b80866ce9597851b938b785425b725c5333d"
+    },
+    {
+      "path": "tests/reference_flow_acceptance.md",
+      "mode": "100644",
+      "sha256": "bdf938c4c6af6a020666dbb521f28122ab71ef49c5a55fb134ae5f1df48bb94d",
+      "git_blob": "499133f5e24cc2bd0bfd7fbf27d2df1606fa5e10"
+    },
+    {
+      "path": "tests/reference_server_test.cc",
+      "mode": "100644",
+      "sha256": "cbab7b362902db98ab6a215f9c24388ca17c156d860902d12812c82862569dd8",
+      "git_blob": "6691ea361857d61b85c0f0f5dac4ad5e718b36b8"
+    },
+    {
+      "path": "tests/reference_store_test.cc",
+      "mode": "100644",
+      "sha256": "226664b9db3df79661e7d5587e7cd46f4d6a3fdc9d5261ede497409bfc559cfc",
+      "git_blob": "e86df3fda8a238f2bb03f36e8781f2e917e54535"
+    },
+    {
+      "path": "web/settings/index.html",
+      "mode": "100644",
+      "sha256": "f3bde7bb03d390fa6e6f398083c5ea3eb1542413f0ef59b77c971124016294c9",
+      "git_blob": "cd484421b70c051d433188e3cdc284acc5f4517f"
+    },
+    {
+      "path": "web/settings/settings.js",
+      "mode": "100644",
+      "sha256": "fa6de1b75891a84294c8db04f0051d1f3183804e3cdf7dcbec9b79146f114483",
+      "git_blob": "239acf8e3a22652ea814a56677c337dda0709c57"
+    }
+  ]
+}

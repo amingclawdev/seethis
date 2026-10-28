@@ -143,6 +143,7 @@ const std::string kReferenceViewerScript = std::string(R"JS((() => {
       `Reference ID: ${id}`,
       "Historical capture facts (captured metadata only):",
       `Application name: ${historicalText(context && context.app_name)}`,
+      `Scope: ${historicalText(context && context.scope && context.scope.label)}`,
       `Window title: ${historicalText(context && context.window_title)}`,
       `Bundle identifier: ${historicalText(context && context.bundle_id)}`,
       `Context observed (UTC microseconds): ${timestampText(timestamps && timestamps.context_utc_us)}`,
@@ -439,6 +440,7 @@ const std::string kReferenceViewerScript = std::string(R"JS((() => {
         identity.textContent=[`Reference ID: ${id}`,`Captured shot ID: ${shotID}`,
           `Collection revision: ${snapshot.revision}; notes revision: ${snapshot.notes_revision}`,
           `Application name: ${historicalText(source?.app_name)}`,
+          `Scope: ${historicalText(source?.scope?.label)}`,
           `Window title: ${historicalText(source?.window_title)}`,
           `Bundle identifier: ${historicalText(source?.bundle_id)}`,
           `Context observed (UTC microseconds): ${timestampText(source?.context_observed_utc_us)}`,
@@ -1037,6 +1039,11 @@ std::string SourceContextJson(const core::Reference& reference) {
   };
   text("app_name",source.app_name,source.app_name_availability);
   text("bundle_id",source.bundle_id,source.bundle_id_availability);
+  out << ",\"scope\":{\"version\":" << source.scope.version
+      << ",\"kind\":\"" << core::CaptureScopeKindName(source.scope.kind)
+      << "\",\"display_id\":" << source.scope.display_id
+      << ",\"process_source\":\"" << core::ProcessStartSourceName(source.process_source)
+      << "\",\"label\":\"" << Escape(source.scope_label) << "\"}";
   number("window_id",source.window_id);
   text("window_title",source.window_title,source.window_title_availability);
   number("context_observed_utc_us",source.context_observed_utc_us);
@@ -1225,7 +1232,12 @@ std::string ReferenceJson(const core::Reference& reference,
       << Escape(reference.context.executable) << "\",\"window_title\":\""
       << Escape(reference.context.window_title) << "\",\"selection_method\":\""
       << Escape(reference.context.selection_method)
-      << "\",\"window_layer\":" << reference.context.window_layer
+      << "\",\"scope\":{\"version\":" << reference.context.scope.version
+      << ",\"kind\":\"" << core::CaptureScopeKindName(reference.context.scope.kind)
+      << "\",\"display_id\":" << reference.context.scope.display_id
+      << ",\"process_source\":\"" << core::ProcessStartSourceName(core::CaptureProcessSource(reference.context))
+      << "\",\"label\":\"" << Escape(core::CaptureScopeName(reference.context)) << "\"}"
+      << ",\"window_layer\":" << reference.context.window_layer
       << ",\"window\":" << RectJson(reference.context.window)
       << ",\"quartz_to_appkit_top\":"
       << reference.context.quartz_to_appkit_top

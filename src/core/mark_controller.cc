@@ -53,12 +53,15 @@ struct MarkController::Transaction {
   std::optional<CaptureResult> capture;
   std::string capture_error;
   Stamp began;
+  // Technical waits are independent of the user's renewable interaction idle
+  // clock and of immutable capture provenance.
+  std::int64_t capture_deadline_us=0,release_deadline_us=0,append_deadline_us=0;
   std::int64_t key_down_monotonic_ms=0;
   std::int64_t key_up_monotonic_ms=0;
   std::uint64_t copy_generation=0;
   std::optional<std::int64_t> pasteboard_change_count;
   bool released=false;
-  bool submitted=false;
+  bool submitted=false,status_action_only=false;
   std::string append_root;
   std::uint64_t expected_revision=0,input_epoch=0;
   bool input_healthy=false,ordinary_source_authorized=false;
@@ -73,25 +76,35 @@ struct MarkController::Transaction {
   std::shared_ptr<std::atomic<int>> coordinate_loss=std::make_shared<std::atomic<int>>(0);
 };
 
-MarkController::MarkController(ReferenceStore& store,Clipboard clipboard)
+MarkController::MarkController(ReferenceStore& store,Clipboard clipboard,Clock clock)
     :store_(store),clipboard_(std::move(clipboard)),
-     dispatcher_([](std::function<void()> task){task();}) {}
+     dispatcher_([](std::function<void()> task){task();}),clock_(clock?std::move(clock):Clock{Now}) {}
 
 MarkController::MarkController(ReferenceStore& store,
     PendingClipboard pending_clipboard,ReadyClipboard ready_clipboard,
-    Dispatcher dispatcher)
+    Dispatcher dispatcher,Clock clock)
     :store_(store),pending_clipboard_(std::move(pending_clipboard)),
-     ready_clipboard_(std::move(ready_clipboard)),dispatcher_(std::move(dispatcher)) {}
+     ready_clipboard_(std::move(ready_clipboard)),dispatcher_(std::move(dispatcher)),
+     clock_(clock?std::move(clock):Clock{Now}) {}
 
 MarkController::~MarkController(){lifetime_.reset();}
 
 std::uint64_t MarkController::Begin(std::string id,double crop_margin,
                                     std::int64_t key_down_monotonic_ms) {
   if(current_)Abort("superseded drawing attempt");
+  if(std::any_of(accepted_.begin(),accepted_.end(),[](const auto& transaction) {return transaction->status_action_only;})) {
+    // One snapshot prunes the store once, independent of retained custody count.
+    std::set<std::string> failed;
+    for(const auto& job:store_.MetadataJobs())if(job.state==ReferenceJobState::kFailed)failed.insert(job.id);
+    std::erase_if(accepted_,[&](const auto& transaction) {
+      return transaction->status_action_only&&!failed.contains(transaction->reference.id);
+    });
+  }
   ++generation_;current_=std::make_unique<Transaction>();
   current_->generation=generation_;current_->reference.id=id;
   current_->reference.mark_id=std::move(id);current_->reference.crop_margin=crop_margin;
-  current_->began=Now();current_->reference.operation_started=current_->began;
+  current_->began=clock_();current_->reference.operation_started=current_->began;
+  current_->capture_deadline_us=current_->began.monotonic_us+30'000'000;
   current_->key_down_monotonic_ms=key_down_monotonic_ms;
   current_->input_epoch=input_epoch_;current_->input_healthy=input_healthy_;
   current_->presentation_generation=presentation_generation_;
@@ -112,7 +125,7 @@ std::uint64_t MarkController::BeginAppend(std::string root,std::string mark,
 }
 std::uint64_t MarkController::BeginAppendReference(std::string root,
     std::uint64_t expected,std::string operation,double margin,std::int64_t key_down) {
-  if(accepted_.size()>=ReferenceStore::kMaximumUnfinishedJobs) {status_="Append busy; wait for capture completion";return 0;}
+  if(std::count_if(accepted_.begin(),accepted_.end(),[](const auto& transaction) {return !transaction->status_action_only;})>=ReferenceStore::kMaximumUnfinishedJobs) {status_="Append busy; wait for capture completion";return 0;}
   const auto collection=store_.Collection(root);
   if(collection.status!=MarkNotesStatus::kReady||collection.revision!=expected) {
     status_="Append reference unavailable or changed";return 0;
@@ -150,9 +163,10 @@ std::optional<OwnUIPresentationSourceTarget> MarkController::BeginOwnUIPresentat
             ref.page_identity->opaque_tab_id==identity.page->opaque_tab_id&&
             ref.page_identity->navigation_digest==identity.page->navigation_digest);
         if(state!=SavedProjectionState::kTerminal&&state!=SavedProjectionState::kCoordinateInvalid&&page&&
-           a.pid==b.pid&&a.window_id==b.window_id&&a.bundle_id==b.bundle_id&&a.window_title==b.window_title&&
-           a.native_window.version==1&&a.native_window.process_start_identity_us==b.native_window.process_start_identity_us&&
-           a.native_window.observation_session==b.native_window.observation_session&&a.native_window.incarnation==b.native_window.incarnation) {
+           a.scope==b.scope&&a.pid==b.pid&&a.window_id==b.window_id&&a.bundle_id==b.bundle_id&&a.window_title==b.window_title&&
+           (a.scope.kind==CaptureScopeKind::kApplication||
+            ((a.native_window.version==1||a.native_window.version==2)&&a.native_window.process_start_identity_us==b.native_window.process_start_identity_us&&
+             a.native_window.observation_session==b.native_window.observation_session&&a.native_window.incarnation==b.native_window.incarnation))) {
           own_ui_source_=OwnUIPresentationSourceTarget{++own_ui_generation_,input_epoch_,a,ref.page_identity};
           return own_ui_source_; // No observation/timestamp is carried or created.
         }
@@ -165,7 +179,7 @@ std::optional<OwnUIPresentationSourceTarget> MarkController::BeginOwnUIPresentat
     if(collection.status!=MarkNotesStatus::kReady)continue;
     for(const auto& shot:collection.shots) {
       const auto& ref=*shot.metadata;
-      if(ref.context.native_window.version==1&&PresentedReferenceVisible(ref)&&
+      if((ref.context.native_window.version==1||ref.context.native_window.version==2||ref.context.scope.kind==CaptureScopeKind::kApplication)&&PresentedReferenceVisible(ref)&&
          ReferenceVisible(ref.context,ref.page_identity,window_observation_,page_observation_)) {
         own_ui_source_=OwnUIPresentationSourceTarget{++own_ui_generation_,input_epoch_,ref.context,ref.page_identity};break;
       }
@@ -198,17 +212,22 @@ bool MarkController::PublishOwnUIPresentationObservation(
   // source. Bounds and native lifetime may change, so they are judged only
   // after the requested pid/bundle/window and observer session are associated.
   const auto& context=required.context;
-  const bool requestedSource=window.pid==context.window_pid&&window.bundle_id==context.bundle_id&&
-      window.window_id==context.window_id&&window.native_window.version==context.native_window.version&&
-      window.native_window.observation_session==context.native_window.observation_session;
+  const auto& native=WindowIdentityForContext(context,window);
+  const bool requestedSource=context.scope.kind==CaptureScopeKind::kApplication?
+      window.application_available&&window.pid==context.pid&&window.bundle_id==context.bundle_id&&
+          ApplicationIdentityForContext(context,window)==context.scope.process_start_identity_us:
+      window.pid==context.window_pid&&window.bundle_id==context.bundle_id&&window.window_id==context.window_id&&
+      native.version==context.native_window.version&&native.observation_session==context.native_window.observation_session;
   if(!requestedSource){RetireLiveShot();return false;}
   ObserveSavedWindowGeometry(window);
   const bool valid=
-      window.native_window.observation_session==required.context.native_window.observation_session&&
-      window.native_window.incarnation==required.context.native_window.incarnation&&
+      (context.scope.kind==CaptureScopeKind::kApplication||
+       (native.observation_session==required.context.native_window.observation_session&&
+        native.incarnation==required.context.native_window.incarnation))&&
       ReferenceVisible(required.context,required.page,window,page);
   if(!valid){RetireLiveShot();return false;}
   own_ui_window_=std::move(window);own_ui_page_=std::move(page);
+  presentation_state_.reset();
   PrunePresentations();return own_ui_source_.has_value();
 }
 namespace {
@@ -226,7 +245,7 @@ bool SameSavedSource(const Reference& a,const Reference& b) {
       a.page_identity->bundle_id==b.page_identity->bundle_id&&a.page_identity->browser_pid==b.page_identity->browser_pid&&
       a.page_identity->window_id==b.page_identity->window_id&&a.page_identity->process_start_identity_us==b.page_identity->process_start_identity_us&&
       a.page_identity->opaque_tab_id==b.page_identity->opaque_tab_id&&a.page_identity->navigation_digest==b.page_identity->navigation_digest);
-  return page&&x.pid==y.pid&&x.window_id==y.window_id&&x.bundle_id==y.bundle_id&&x.window_title==y.window_title&&
+  return page&&x.scope==y.scope&&x.pid==y.pid&&x.window_id==y.window_id&&x.bundle_id==y.bundle_id&&x.window_title==y.window_title&&
       x.window.x==y.window.x&&x.window.y==y.window.y&&x.window.width==y.window.width&&x.window.height==y.window.height&&
       x.native_window.version==y.native_window.version&&x.native_window.process_start_identity_us==y.native_window.process_start_identity_us&&
       x.native_window.observation_session==y.native_window.observation_session&&x.native_window.incarnation==y.native_window.incarnation&&
@@ -247,14 +266,14 @@ bool KnownTopology(const std::vector<FrozenDisplay>& displays) {
 }
 }
 SavedProjectionState MarkController::SavedProjection(const Reference& ref) const {
-  const auto job=store_.LookupMetadata(ref.id);
-  if(!job||job->state!=ReferenceJobState::kReady)return SavedProjectionState::kTerminal;
-  const auto collection=store_.Collection(ref.id);
-  if(collection.status!=MarkNotesStatus::kReady)return SavedProjectionState::kTerminal;
-  const auto member=std::find_if(collection.shots.begin(),collection.shots.end(),[&](const auto& shot) {
-    return shot.metadata&&shot.first_mark_slot==ref.first_mark_slot&&shot.metadata->source.sha256==ref.source.sha256;
-  });
-  if(member==collection.shots.end())return SavedProjectionState::kTerminal;
+  const auto entry=store_.ReadPresentation(ref.id);
+  if(!entry||entry->job.state!=ReferenceJobState::kReady)return SavedProjectionState::kTerminal;
+  const auto& collection=entry->collection;
+  if(collection.status!=MarkNotesStatus::kReady||entry->notes.status!=MarkNotesStatus::kReady)return SavedProjectionState::kTerminal;
+  const auto membership=entry->source_membership.find(std::to_string(ref.first_mark_slot)+":"+ref.source.sha256);
+  if(membership==entry->source_membership.end())return SavedProjectionState::kTerminal;
+  const auto* member=&collection.shots[membership->second];
+  if(!member->metadata||!SameSavedSource(ref,*member->metadata))return SavedProjectionState::kTerminal;
   for(const auto& blocked:coordinate_exclusions_)if(blocked.root==ref.id&&blocked.shot==member->id&&blocked.source_sha256==ref.source.sha256)
     return blocked.reason==SavedCoordinateLoss::kNativeLifetime?SavedProjectionState::kTerminal:SavedProjectionState::kCoordinateInvalid;
   // A successful store publication may precede its dispatched completion.
@@ -269,6 +288,7 @@ SavedProjectionState MarkController::SavedProjection(const Reference& ref) const
   if(!loss)for(const auto& transaction:accepted_)if((loss=pendingLoss(transaction)))break;
   if(loss)return *loss==SavedCoordinateLoss::kNativeLifetime?SavedProjectionState::kTerminal:SavedProjectionState::kCoordinateInvalid;
   if(!input_healthy_||!presentation_permitted_||
+     (ref.context.scope.kind==CaptureScopeKind::kApplication&&!display_observation_)||
      (display_observation_&&(!KnownTopology(*display_observation_)||
       !DisplayTopologyMatches(ref.context.displays,*display_observation_))))return SavedProjectionState::kTemporarilyHidden;
   if(ReferenceVisible(ref.context,ref.page_identity,window_observation_,page_observation_))return SavedProjectionState::kVisible;
@@ -294,17 +314,17 @@ void MarkController::SetDisplayObservation(std::vector<FrozenDisplay> displays) 
   // Geometry describes current display eligibility, not permanent loss of the
   // saved screen coordinates. Missing/mismatched topology hides until an exact
   // fresh original topology is available again.
-  display_observation_=std::move(displays);
+  display_observation_=std::move(displays);presentation_state_.reset();
 }
 void MarkController::ObserveSavedWindowGeometry(const WindowObservation& observation) {
   const auto age=Now().monotonic_us-observation.observed.monotonic_us;
   if(observation.availability!=WindowAvailability::kReady||!observation.generation||
      observation.observed.monotonic_us<=0||age<0||age>2'000'000||!PositiveRect(observation.bounds))return;
   const auto lossFor=[&](const Context& context)->std::optional<SavedCoordinateLoss> {
-    if(context.window_pid!=observation.pid)return {};
-    const auto& old=context.native_window;const auto& fresh=observation.native_window;
-    if(old.version==1) {
-      if(fresh.version!=1||fresh.process_start_identity_us<=0||fresh.process_start_identity_us>observation.observed.utc_us||
+    if(context.scope.kind==CaptureScopeKind::kApplication || context.window_pid!=observation.pid)return {};
+    const auto& old=context.native_window;const auto& fresh=WindowIdentityForContext(context,observation);
+    if(old.version==1||old.version==2) {
+      if(fresh.version!=old.version||fresh.process_start_identity_us<=0||fresh.process_start_identity_us>observation.observed.utc_us||
          fresh.observation_session.empty()||!fresh.incarnation)return {};
       if(old.process_start_identity_us!=fresh.process_start_identity_us||
          (context.window_id==observation.window_id&&old.observation_session==fresh.observation_session&&old.incarnation!=fresh.incarnation))
@@ -314,9 +334,9 @@ void MarkController::ObserveSavedWindowGeometry(const WindowObservation& observa
     // positively observed native lifetime replacement is irreversible.
     return {};
   };
-  for(const auto& job:store_.MetadataJobs())if(job.state==ReferenceJobState::kReady) {
-    const auto collection=store_.Collection(job.id);if(collection.status!=MarkNotesStatus::kReady)continue;
-    for(const auto& shot:collection.shots)if(const auto loss=lossFor(shot.metadata->context))ExcludeSavedShot(shot,*loss);
+  for(const auto& saved:store_.ReadPresentation()->jobs)if(saved->job.state==ReferenceJobState::kReady) {
+    if(saved->collection.status!=MarkNotesStatus::kReady)continue;
+    for(const auto& shot:saved->collection.shots)if(const auto loss=lossFor(shot.metadata->context))ExcludeSavedShot(shot,*loss);
   }
   const auto pending=[&](const auto& transaction) {
     if(transaction)if(const auto loss=lossFor(transaction->reference.context))
@@ -379,7 +399,8 @@ void MarkController::RecordPresentedSingle(const Reference& reference,
         entry.shot.metadata->source.sha256==reference.source.sha256;
   });
   if(witness==fresh_singles_.end())return; // Repaint/history cannot manufacture fresh lineage.
-  const auto collection=store_.Collection(reference.id);
+  const auto entry=store_.ReadPresentation(reference.id);if(!entry)return;
+  const auto& collection=entry->collection;
   if(collection.status!=MarkNotesStatus::kReady||collection.multi()||collection.shots.empty()||
      collection.shots.front().metadata->source.sha256!=reference.source.sha256)return;
   std::erase_if(presented_singles_,[&](const auto& entry){return entry.shot.metadata->id==reference.id;});
@@ -387,9 +408,10 @@ void MarkController::RecordPresentedSingle(const Reference& reference,
 }
 std::vector<ReferenceShot> MarkController::LiveShots(std::string_view root) const {
   std::vector<ReferenceShot> result;
-  const auto collection=store_.Collection(root);
-  if(collection.status!=MarkNotesStatus::kReady)return result;
-  for(const auto& shot:collection.shots)if(shot.metadata&&PresentedReferenceVisible(*shot.metadata))result.push_back(shot);
+  PrepareCurrentPresentation();
+  const auto candidates=presentation_shots_.find(std::string(root));
+  if(candidates==presentation_shots_.end())return result;
+  for(const auto& shot:candidates->second)if(shot.metadata&&PresentedReferenceVisible(*shot.metadata))result.push_back(shot);
   return result;
 }
 bool MarkController::IsShotAdmitted(std::string_view root,std::string_view shot) const {
@@ -415,10 +437,9 @@ void MarkController::PrunePresentations() {
   const auto prune=[&](auto& entries) {
     std::erase_if(entries,[&](const auto& entry) {
       const auto& reference=*entry.shot.metadata;
-      const auto job=store_.LookupMetadata(reference.id);
-      const auto collection=job&&job->state==ReferenceJobState::kReady?store_.Collection(reference.id):ReferenceCollection{};
-      const bool remove=entry.epoch!=input_epoch_||!job||job->state!=ReferenceJobState::kReady||
-          collection.status!=MarkNotesStatus::kReady||
+      const auto saved=store_.ReadPresentation(reference.id);
+      const bool remove=entry.epoch!=input_epoch_||!saved||saved->job.state!=ReferenceJobState::kReady||
+          saved->collection.status!=MarkNotesStatus::kReady||
           !PresentedReferenceVisible(reference);
       invalid=invalid||remove;return remove;
     });
@@ -441,12 +462,19 @@ void MarkController::BindCaptureDisplay(std::uint64_t generation,DisplayId id) {
 }
 bool MarkController::BindContext(std::uint64_t generation,Context context) {
   if(!Current(generation)||current_->reference.context.pid!=0)return false;
-  if(context.pid<=0||context.pid!=context.window_pid||context.pid==context.self_pid||
-     context.window_id==0||context.displays.empty()) {
+  const bool app=context.scope.kind==CaptureScopeKind::kApplication;
+  if(!ValidCaptureScope(context)||context.pid<=0||context.pid==context.self_pid||
+     (!app&&(context.pid!=context.window_pid||context.window_id==0))||context.displays.empty()) {
     current_->capture_error="context_unavailable";status_="Original window context unavailable";
     return false;
   }
   if(context.bundle_id=="com.google.Chrome")context.window_title.clear();
+  if(context.scope.kind==CaptureScopeKind::kPage) {
+    if(!page_observation_.identity || !PageIdentityVisible(page_observation_.identity,page_observation_) ||
+       !PageIdentityMatchesContext(*page_observation_.identity,context))return false;
+    current_->reference.page_identity=page_observation_.identity;
+    current_->reference.captured_page=page_observation_.captured_page;
+  }
   current_->reference.context=std::move(context);
   current_->ordinary_source_authorized=ReferenceVisible(current_->reference.context,
       current_->reference.page_identity,window_observation_,page_observation_);
@@ -457,7 +485,8 @@ bool MarkController::BindContext(std::uint64_t generation,Context context) {
 bool MarkController::BindPageIdentity(std::uint64_t generation,
                                       PageIdentity identity,
                                       std::optional<CapturedPageMetadata> captured_page) {
-  if (!Current(generation) || current_->reference.page_identity) return false;
+  Expire(clock_());
+  if (!Current(generation) || current_->reference.page_identity || current_->reference.context.scope.policy_present) return false;
   if (!ValidPageIdentity(identity) ||
       !PageIdentityMatchesContext(identity,current_->reference.context)) {
     status_="Chrome page identity unavailable";
@@ -488,6 +517,7 @@ bool MarkController::BindPageIdentity(std::uint64_t generation,
 }
 
 void MarkController::Captured(std::uint64_t generation,CaptureResult result) {
+  Expire(clock_());
   Transaction* transaction=Current(generation)?current_.get():nullptr;
   if(!transaction)for(auto& accepted:accepted_)
     if(accepted->generation==generation){transaction=accepted.get();break;}
@@ -532,7 +562,7 @@ void MarkController::Release(std::uint64_t generation,
     std::vector<DisplayPoint> path,Stamp time,
     std::int64_t key_up_monotonic_ms) {
   if(!Current(generation)||current_->released)return;
-  if (current_->reference.page_identity ||
+  if (current_->reference.page_identity || current_->reference.context.scope.policy_present ||
       current_->reference.context.bundle_id=="com.google.Chrome") {
     current_->reference.schema=2;
     current_->reference.capture_api="ScreenCaptureKit.SCScreenshotManager.selected-display";
@@ -549,11 +579,14 @@ void MarkController::Release(std::uint64_t generation,
 
 void MarkController::ReleasePrepared(Stamp time,
     std::int64_t key_up_monotonic_ms) {
+  Expire(clock_());
+  if(!current_)return;
   current_->released=true;
+  current_->release_deadline_us=clock_().monotonic_us+30'000'000;
   current_->reference.circle_completed=time;
   current_->key_up_monotonic_ms=key_up_monotonic_ms;
   if(current_->reference.context.bundle_id=="com.google.Chrome"&&
-     !current_->reference.page_identity) {
+     !current_->reference.context.scope.policy_present && !current_->reference.page_identity) {
     phase_=ReferencePhase::kReleasedPendingCapture;
     status_="Resolving Chrome page identity…";
     return;
@@ -565,6 +598,7 @@ void MarkController::AcceptReleased() {
   if(!current_||!current_->released)return;
   if(!current_->append_root.empty()) {
     const auto generation=current_->generation;
+    current_->append_deadline_us=clock_().monotonic_us+30'000'000;
     accepted_.push_back(std::move(current_));
     phase_=ReferencePhase::kReleasedPendingCapture;status_="Adding screenshot…";
     SubmitIfReady(generation);return;
@@ -671,7 +705,7 @@ void MarkController::SubmitIfReady(std::uint64_t generation) {
         }
         if(append_completion_)append_completion_(result,generation);
       });
-    });
+    },transaction.append_deadline_us);
     return;
   }
   if(!transaction.capture_error.empty()) {
@@ -688,6 +722,7 @@ void MarkController::SubmitIfReady(std::uint64_t generation) {
 void MarkController::Completed(ReferenceJobSnapshot job) {
   auto transaction=std::find_if(accepted_.begin(),accepted_.end(),[&](const auto& item){
     return item->reference.id==job.id;});
+  if(transaction!=accepted_.end()&&(*transaction)->status_action_only)return; // Duplicate completion has no publication authority.
   const bool owns_ui=transaction!=accepted_.end()&&
       (*transaction)->copy_generation==copy_generation_;
   if(transaction!=accepted_.end()&&job.state==ReferenceJobState::kReady&&(*transaction)->coordinate_loss->load()) {
@@ -735,7 +770,22 @@ void MarkController::Completed(ReferenceJobSnapshot job) {
       if(fresh_singles_.size()<500)fresh_singles_.push_back({{job.id,0,job.metadata},input_epoch_});
     }
   }
-  if(transaction!=accepted_.end())accepted_.erase(transaction);
+  if(transaction!=accepted_.end()) {
+    if(job.state==ReferenceJobState::kFailed&&pending_clipboard_&&(*transaction)->append_root.empty()) {
+      // Keep only this controller's accepted root-source custody for explicit
+      // failure status actions. No pixels, submission or completion is retained.
+      (*transaction)->status_action_only=true;(*transaction)->submitted=true;
+      (*transaction)->capture.reset();(*transaction)->single_checkpoint.reset();
+      (*transaction)->pasteboard_change_count.reset();(*transaction)->copy_generation=0;
+      Bytes{}.swap((*transaction)->reference.source.bytes);Bytes{}.swap((*transaction)->reference.crop.bytes);
+      (*transaction)->start_window={};(*transaction)->start_page={};
+      // Retain the newest bounded metadata witnesses in acceptance order.
+      while(std::count_if(accepted_.begin(),accepted_.end(),[](const auto& item) {return item->status_action_only;})>500) {
+        const auto oldest=std::find_if(accepted_.begin(),accepted_.end(),[](const auto& item) {return item->status_action_only;});
+        accepted_.erase(oldest);
+      }
+    } else accepted_.erase(transaction);
+  }
 }
 
 void MarkController::Abort(std::string reason) {
@@ -752,11 +802,22 @@ void MarkController::Abort(std::string reason) {
 
 void MarkController::Expire(Stamp now) {
   PrunePresentations();
-  if(current_&&now.monotonic_us-current_->began.monotonic_us>30'000'000)
-    Abort("drawing transaction timed out");
+  const auto capture_wait_expired=[&](const auto& transaction) {
+    return !transaction->submitted&&!transaction->capture&&transaction->capture_error.empty()&&
+        now.monotonic_us>transaction->capture_deadline_us;
+  };
+  if(current_&&capture_wait_expired(current_))Abort("screenshot service timed out");
+  else if(current_&&current_->released&&now.monotonic_us>current_->release_deadline_us)
+    Abort("released capture/page wait timed out");
   std::vector<std::pair<AppendResult,std::uint64_t>> expired;
+  std::vector<std::uint64_t> failed_captures;
   std::erase_if(accepted_,[&](const auto& transaction) {
-    if(transaction->append_root.empty()||now.monotonic_us-transaction->began.monotonic_us<=30'000'000)return false;
+    if(transaction->status_action_only)return false;
+    if(transaction->append_root.empty()) {
+      if(capture_wait_expired(transaction))failed_captures.push_back(transaction->generation);
+      return false;
+    }
+    if(!capture_wait_expired(transaction)&&now.monotonic_us<=transaction->append_deadline_us)return false;
     store_.CancelAppend(transaction->reference.id);
     expired.push_back({{AppendStatus::kUnavailable,transaction->append_root,transaction->reference.id,0},transaction->generation});
     if(transaction->generation==generation_) {
@@ -764,6 +825,13 @@ void MarkController::Expire(Stamp now) {
     }
     return true;
   });
+  // Store callbacks may synchronously remove accepted entries; never invoke
+  // them while iterating/erasing that vector.
+  for(const auto generation:failed_captures) {
+    const auto found=std::find_if(accepted_.begin(),accepted_.end(),[&](const auto& item){return item->generation==generation;});
+    if(found==accepted_.end())continue;
+    (*found)->capture_error="capture_timeout";SubmitIfReady(generation);
+  }
   for(const auto& [result,generation]:expired)if(append_completion_)append_completion_(result,generation);
 }
 
@@ -779,7 +847,7 @@ void MarkController::CheckPendingWindowContinuity(const WindowObservation& obser
     bool continuous=false;
     if(captured.pid>0) {
       continuous=WindowObservationMatchesContext(captured,observation) &&
-          (captured.bundle_id=="com.google.Chrome"||TitleContextVisible(captured,observation));
+          (captured.scope.kind==CaptureScopeKind::kApplication||(captured.scope.kind==CaptureScopeKind::kWindow&&!captured.scope.title_required)||captured.bundle_id=="com.google.Chrome"||TitleContextVisible(captured,observation));
     } else {
       const auto& first=transaction->start_window;
       Context baseline;baseline.pid=baseline.window_pid=first.pid;baseline.bundle_id=first.bundle_id;
@@ -804,7 +872,7 @@ void MarkController::CheckPendingPageContinuity(const PageObservation& observati
     const auto& reference=transaction->reference;
     const bool chrome=reference.context.bundle_id=="com.google.Chrome" ||
         (reference.context.pid==0 && transaction->start_window.bundle_id=="com.google.Chrome");
-    if(!chrome)return;
+    if(!chrome || (reference.context.scope.policy_present && reference.context.scope.kind!=CaptureScopeKind::kPage))return;
     const auto& required=reference.page_identity?reference.page_identity:transaction->start_page.identity;
     if(observation.availability!=PageAvailability::kReady||!required||
        !PageIdentityVisible(required,observation))transaction->context_continuous->store(false);
@@ -814,6 +882,31 @@ void MarkController::CheckPendingPageContinuity(const PageObservation& observati
   check(current_);for(const auto& transaction:accepted_)check(transaction);
 }
 bool MarkController::LiveActionVisible(const ReferenceJobSnapshot& job) const {
+  if(job.state==ReferenceJobState::kPending||job.state==ReferenceJobState::kFailed) {
+    // A status URL is an explicit live action, never a saved-shot projection.
+    // Recheck current source evidence even if capture continuity was lost;
+    // completion still retains its own irreversible continuity/ownership gates.
+    if(!job.metadata||job.metadata->id!=job.id||job.code=="invalid"||!input_healthy_||
+       !presentation_permitted_||presentation_prefix_||
+       !KnownTopology(job.context.displays)||
+       (display_observation_&&(!KnownTopology(*display_observation_)||
+        !DisplayTopologyMatches(job.context.displays,*display_observation_)))||
+       !ReferenceVisible(job.metadata->context,job.metadata->page_identity,
+                         window_observation_,page_observation_))return false;
+    {
+      const auto captured=std::find_if(accepted_.begin(),accepted_.end(),[&](const auto& transaction) {
+        return transaction->append_root.empty()&&transaction->reference.id==job.id;
+      });
+      // Only this controller's accepted source owns Pending/Failed actions. A
+      // fresh observation cannot manufacture health or undo native replacement.
+      if(captured==accepted_.end()||!(*captured)->input_healthy||
+         (*captured)->input_epoch!=input_epoch_||
+         (*captured)->presentation_generation!=presentation_generation_||(*captured)->coordinate_loss->load()||
+         !SameSavedSource((*captured)->reference,*job.metadata))return false;
+    }
+    return true;
+  }
+  if(job.state!=ReferenceJobState::kReady)return false;
   if(job.state==ReferenceJobState::kReady) {
     const auto collection=store_.Collection(job.id);
     if(collection.multi())return collection.status==MarkNotesStatus::kReady&&LiveShot(job.id).has_value();
@@ -829,7 +922,8 @@ void MarkController::SetWindowObservation(WindowObservation observation) {
   PreparePresentationObservation();
   if(own_ui_source_&&observation.availability==WindowAvailability::kReady&&
      (!WindowObservationMatchesContext(own_ui_source_->context,observation)||
-      (own_ui_source_->context.bundle_id!="com.google.Chrome"&&
+      (own_ui_source_->context.scope.kind!=CaptureScopeKind::kApplication&&
+       (!own_ui_source_->context.scope.policy_present||own_ui_source_->context.scope.title_required)&&own_ui_source_->context.bundle_id!="com.google.Chrome"&&
        !TitleContextVisible(own_ui_source_->context,observation))))RetireLiveShot();
   ObserveSavedWindowGeometry(observation);
   CheckPendingWindowContinuity(observation);
@@ -851,24 +945,87 @@ void MarkController::SetPageObservation(PageObservation observation) {
       (observation.availability!=PageAvailability::kReady&&observation.availability!=PageAvailability::kUnavailable)))RetireLiveShot();
   CheckPendingPageContinuity(observation);
   page_observation_=std::move(observation);
+  presentation_state_.reset();
   PrunePresentations();
 }
 
+void MarkController::PrepareCurrentPresentation() const {
+  const auto state=store_.ReadPresentation();
+  if(state==presentation_state_&&presentation_window_generation_==window_observation_.generation&&
+     presentation_own_window_generation_==own_ui_window_.generation&&presentation_own_generation_==own_ui_generation_)return;
+  presentation_state_=state;presentation_window_generation_=window_observation_.generation;
+  presentation_own_window_generation_=own_ui_window_.generation;presentation_own_generation_=own_ui_generation_;
+  presentation_candidates_.clear();presentation_shots_.clear();
+  // This history walk happens only on a store publication or source observation,
+  // never once per pointer sample. Current evidence is still judged at use time.
+  const auto currentSource=[&](const Reference& ref) {
+    return ReferenceVisible(ref.context,ref.page_identity,window_observation_,page_observation_)||
+        (own_ui_source_&&ReferenceVisible(ref.context,ref.page_identity,own_ui_window_,own_ui_page_));
+  };
+  std::vector<std::shared_ptr<const ReferencePresentation>> sourceEntries;
+  std::set<std::string> seen;
+  const auto append=[&](const auto& index,const std::string& key) {
+    const auto found=index.find(key);if(found==index.end())return;
+    for(const auto& entry:found->second)if(seen.insert(entry->job.id).second)sourceEntries.push_back(entry);
+  };
+  const auto select=[&](const WindowObservation& observation) {
+    if(observation.window_id)append(state->by_window,WindowSourceKey(observation.pid,observation.window_id));
+    if(observation.application_available&&display_observation_)
+      for(const auto& display:*display_observation_)append(state->by_application,
+          ApplicationSourceKey(observation.pid,observation.application_start_identity_us,display.id));
+    if(observation.application_available&&display_observation_&&observation.kernel_application_start_identity_us>0)
+      for(const auto& display:*display_observation_)append(state->by_application,
+          ApplicationSourceKey(observation.pid,observation.kernel_application_start_identity_us,display.id,ProcessStartSource::kKernelBSDStart));
+  };
+  select(window_observation_);if(own_ui_source_)select(own_ui_window_);
+  std::sort(sourceEntries.begin(),sourceEntries.end(),[](const auto& a,const auto& b) {
+    return a->job.accepted_utc_us==b->job.accepted_utc_us?a->job.id<b->job.id:a->job.accepted_utc_us<b->job.accepted_utc_us;
+  });
+  for(const auto& entry:sourceEntries) {
+    bool candidate=false;
+    if(entry->job.state==ReferenceJobState::kReady) {
+      for(const auto& shot:entry->collection.shots)if(shot.metadata&&currentSource(*shot.metadata)) {
+        presentation_shots_[entry->job.id].push_back(shot);candidate=true;
+      }
+    } else if(entry->job.metadata)candidate=currentSource(*entry->job.metadata);
+    if(candidate)presentation_candidates_.push_back(entry);
+  }
+}
+std::vector<ReferenceJobSnapshot> MarkController::presentation_jobs() const {
+  PrepareCurrentPresentation();std::vector<ReferenceJobSnapshot> result;
+  for(const auto& entry:presentation_candidates_) {
+    if(!store_.ReadPresentation(entry->job.id))continue;
+    if(entry->job.state==ReferenceJobState::kReady) {
+      const auto& shots=presentation_shots_.at(entry->job.id);
+      if(std::none_of(shots.begin(),shots.end(),
+          [&](const auto& shot){return shot.metadata&&PresentedReferenceVisible(*shot.metadata);}))continue;
+    } else if(!VisibleJob(entry->job,window_observation_,page_observation_))continue;
+    result.push_back(entry->job);
+  }
+  return result;
+}
 std::vector<ReferenceMark> MarkController::marks() const {
-  std::vector<ReferenceMark> result;
-  for(const auto& job:store_.MetadataJobs())if(job.state==ReferenceJobState::kReady)
-    for(const auto& shot:LiveShots(job.id))result.push_back(LightweightMark(*shot.metadata));
+  PrepareCurrentPresentation();std::vector<ReferenceMark> result;
+  for(const auto& entry:presentation_candidates_)if(entry->job.state==ReferenceJobState::kReady)
+    for(const auto& shot:presentation_shots_.at(entry->job.id))if(shot.metadata&&PresentedReferenceVisible(*shot.metadata))
+      result.push_back(LightweightMark(*shot.metadata));
+  return result;
+}
+
+MarkNotesSnapshot MarkController::LiveMarkSnapshots(std::string_view root) const {
+  MarkNotesSnapshot result;
+  const auto entry=store_.ReadPresentation(root);if(!entry)return result;
+  result.status=entry->notes.status;result.revision=entry->notes.revision;
+  for(const auto& shot:LiveShots(root)) {
+    const auto notes=entry->shot_notes.find(shot.id);
+    if(notes!=entry->shot_notes.end())result.marks.insert(result.marks.end(),notes->second.marks.begin(),notes->second.marks.end());
+  }
   return result;
 }
 
 std::vector<ReferenceJobSnapshot> MarkController::jobs() const {
-  auto result=store_.Jobs();result.erase(std::remove_if(result.begin(),result.end(),
-    [](const auto& job){return job.state==ReferenceJobState::kExpired||
-      job.state==ReferenceJobState::kDeleted||
-      job.state==ReferenceJobState::kReady;}),result.end());
-  result.erase(std::remove_if(result.begin(),result.end(),[&](const auto& job) {
-    return !VisibleJob(job,window_observation_,page_observation_);
-  }),result.end());
+  auto result=presentation_jobs();
+  std::erase_if(result,[](const auto& job){return job.state==ReferenceJobState::kReady;});
   return result;
 }
 
@@ -883,19 +1040,11 @@ std::vector<ReferenceJobSnapshot> MarkController::inspector_jobs() const {
 bool MarkController::NeedsChromePageObservation() const {
   if(current_&&current_->reference.context.bundle_id=="com.google.Chrome")
     return true;
-  for(const auto& job:store_.MetadataJobs()) {
-    const auto collection=store_.Collection(job.id);
-    for(const auto& shot:collection.shots)
-      if(shot.metadata->context.bundle_id=="com.google.Chrome")return true;
-    if(job.context.bundle_id=="com.google.Chrome"&&
-       job.state!=ReferenceJobState::kDeleted&&
-       job.state!=ReferenceJobState::kExpired)return true;
-  }
-  return false;
+  return store_.ReadPresentation()->has_chrome_context;
 }
 
 bool MarkController::AwaitingPageIdentity(std::uint64_t generation) const {
-  return Current(generation)&&current_->released&&
+  return Current(generation)&&!current_->reference.context.scope.policy_present&&current_->released&&
       current_->reference.context.bundle_id=="com.google.Chrome"&&
       !current_->reference.page_identity;
 }
@@ -921,7 +1070,7 @@ bool MarkController::RecopyJob(std::string_view id) {
   }
   if(pending_clipboard_) {
     auto receipt=pending_clipboard_(id);for(auto& accepted:accepted_)
-      if(accepted->reference.id==id){accepted->copy_generation=copy_generation_;
+      if(accepted->reference.id==id&&!accepted->status_action_only){accepted->copy_generation=copy_generation_;
         accepted->pasteboard_change_count=receipt;}
     copy_result_=receipt?CopyResult::kCopied:CopyResult::kFailed;
     status_=receipt?"Reference URL copied":"Reference URL could not be copied";
@@ -1033,12 +1182,13 @@ std::optional<std::string> MarkController::HitIdentity(
     const std::vector<FrozenDisplay>& displays) const {
   if(!PresentationHitsAllowed()||!point.IsValid()||point.unit!=CoordinateUnit::kLogicalPoints||
      !std::isfinite(radius)||radius<0)return {};
-  auto snapshots=store_.Jobs();
+  auto snapshots=presentation_jobs();
   for(auto job=snapshots.rbegin();job!=snapshots.rend();++job) {
     if(job->state==ReferenceJobState::kExpired||
        job->state==ReferenceJobState::kDeleted)continue;
     if(job->state==ReferenceJobState::kReady) {
-      const auto collection=store_.Collection(job->id);
+      const auto entry=store_.ReadPresentation(job->id);if(!entry)continue;
+      const auto& collection=entry->collection;
       if(collection.status!=MarkNotesStatus::kReady)continue;
       if(collection.multi()) {
         const auto live=LiveShots(job->id);
