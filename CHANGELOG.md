@@ -9,7 +9,7 @@
 - Bound asynchronous Chrome work and late results; separate drawing idle time from screenshot/save deadlines.
 - Retain local reference delivery, image sharing and separate ordinary/Store distribution paths.
 
-The user accepted the remaining manual checks, reporting one transient flicker followed by stable behavior. Independent source/offline verification passed; final GitHub package signing/notarization checks are separately recorded in its release manifest and are pending during source preparation. See [release notes](docs/RELEASE.md) for limits.
+The user accepted the remaining manual checks, reporting one transient flicker followed by stable behavior. Independent source/offline verification passed; the separate ordinary GitHub package passed signing, Apple notarization, stapling and distribution checks recorded in its release manifest. That package was not launched for an additional physical UI acceptance run. See [release notes](docs/RELEASE.md) for limits.
 
 ## v0.1.1-beta.1 — 2026-10-02
 

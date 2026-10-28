@@ -6,7 +6,7 @@
 
 SeeThis is a macOS menu bar tool. Hold **Option+A**, draw around one or more areas, then release the shortcut. It copies a local reference immediately and prepares a marked image you can paste into a conversation.
 
-The GitHub distribution uses Developer ID signing and Apple notarization. Publication requires the final signature, notarization and checksum checks in the release's `RELEASE-MANIFEST.json`; those checks are pending during preparation of this source update. Choose `SeeThis-0.1.5-macos-arm64-release.dmg` or the matching ZIP and verify it against `SHA256SUMS`. The Mac App Store distribution is separate.
+The GitHub app is **Developer ID signed, Apple notarized and stapled**. Strict signatures, Gatekeeper and DMG/ZIP app parity checks passed. Choose `SeeThis-0.1.5-macos-arm64.dmg` or the matching ZIP and verify it against `SHA256SUMS` and `RELEASE-MANIFEST.json` from the same release. The ordinary GitHub package was not launched for a separate physical UI acceptance run; it uses the frozen accepted implementation. The Mac App Store distribution is separate.
 
 ## Mark, keep context, share
 
